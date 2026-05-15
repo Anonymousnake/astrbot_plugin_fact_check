@@ -1,0 +1,9 @@
+name: astrbot_plugin_fact_check
+display_name: QQ Fact Check
+desc: QQ-friendly /事实核查 command with Gemini multimodal claim extraction and fallback models.
+version: 0.1.0
+author: local
+repo: ""
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.20.0"

@@ -1,0 +1,70 @@
+{
+  "enable_fact_check": {
+    "type": "bool",
+    "description": "Enable /事实核查 command",
+    "hint": "Supports quoted text, inline claims, and quoted/inline images on OneBot/AstrBot message chains.",
+    "default": true
+  },
+  "gemini_api_key": {
+    "type": "string",
+    "description": "Gemini API key for fact-checking",
+    "hint": "Leave empty to use GEMINI_API_KEY environment variable.",
+    "default": ""
+  },
+  "gemini_base_url": {
+    "type": "string",
+    "description": "Gemini API base URL",
+    "default": "https://generativelanguage.googleapis.com/v1beta/models"
+  },
+  "fact_check_pre_model": {
+    "type": "string",
+    "description": "Pre-processing model for extracting checkable claims",
+    "default": "gemini-3.1-flash-lite-preview"
+  },
+  "fact_check_main_models": {
+    "type": "list",
+    "description": "Main fact-check model fallback order",
+    "hint": "The first model is tried first. Later models are used on rate-limit/server errors.",
+    "default": [
+      "gemini-3-flash-preview",
+      "gemini-2.5-flash",
+      "gemini-3.1-flash-lite-preview"
+    ]
+  },
+  "fact_check_max_images": {
+    "type": "int",
+    "description": "Max images to inspect per fact-check request",
+    "default": 2
+  },
+  "fact_check_max_image_bytes": {
+    "type": "int",
+    "description": "Max bytes per image download",
+    "default": 2097152
+  },
+  "fact_check_total_timeout_seconds": {
+    "type": "int",
+    "description": "Total timeout seconds for one fact-check request",
+    "hint": "Prevents image extraction or Gemini grounding from making the QQ command look unresponsive.",
+    "default": 180
+  },
+  "fact_check_image_download_timeout_seconds": {
+    "type": "int",
+    "description": "Timeout seconds for downloading each QQ image",
+    "default": 10
+  },
+  "fact_check_pre_timeout_seconds": {
+    "type": "int",
+    "description": "Timeout seconds for claim extraction requests",
+    "default": 35
+  },
+  "fact_check_main_timeout_seconds": {
+    "type": "int",
+    "description": "Timeout seconds for the main grounded fact-check request",
+    "default": 70
+  },
+  "fact_check_show_failure_reason": {
+    "type": "bool",
+    "description": "Reply with a short reason when fact-checking fails",
+    "default": true
+  }
+}

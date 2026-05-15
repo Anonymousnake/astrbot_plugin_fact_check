@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local secrets and machine-specific config
+.env
+.env.*
+*.token
+*.session
+cookies/
+
+# Runtime/cache output
+cache/
+.cache/
+tmp/
+temp/
+runtime/
+logs/
+*.log
+
+# Local databases and generated indexes
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.faiss
+
+# Large/generated media caches
+image_cache/
+downloads/
+output/
+outputs/
+generated/
