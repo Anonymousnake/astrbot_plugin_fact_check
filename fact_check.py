@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import random
@@ -13,6 +14,7 @@ from urllib import request
 from urllib.error import HTTPError, URLError
 
 import httpx
+from PIL import Image
 
 
 TRIGGER_RE = re.compile(
@@ -93,7 +95,10 @@ def run_fact_check(
     base_url: str,
     pre_model: str,
     main_models: list[str],
-    max_image_bytes: int = 2 * 1024 * 1024,
+    max_image_bytes: int = 5 * 1024 * 1024,
+    long_image_chunk_height: int = 2200,
+    long_image_max_parts: int = 8,
+    long_image_max_width: int = 1280,
     image_download_timeout: int = 10,
     pre_request_timeout: int = 25,
     main_request_timeout: int = 45,
@@ -131,6 +136,9 @@ def run_fact_check(
                 api_key=api_key,
                 base_url=base_url,
                 max_image_bytes=max_image_bytes,
+                long_image_chunk_height=long_image_chunk_height,
+                long_image_max_parts=long_image_max_parts,
+                long_image_max_width=long_image_max_width,
                 image_download_timeout=image_download_timeout,
                 request_timeout=pre_request_timeout,
             ),
@@ -158,6 +166,9 @@ def run_fact_check(
     main_image_parts = build_inline_image_parts(
         request_data.images,
         max_image_bytes=max_image_bytes,
+        long_image_chunk_height=long_image_chunk_height,
+        long_image_max_parts=long_image_max_parts,
+        long_image_max_width=long_image_max_width,
         image_download_timeout=image_download_timeout,
         stage="main-reference",
     )
@@ -271,6 +282,9 @@ def extract_claims_from_images(
     api_key: str,
     base_url: str,
     max_image_bytes: int,
+    long_image_chunk_height: int,
+    long_image_max_parts: int,
+    long_image_max_width: int,
     limit: int = 5,
     image_download_timeout: int = 10,
     request_timeout: int = 25,
@@ -291,10 +305,13 @@ def extract_claims_from_images(
     ]
     for item in images:
         try:
-            parts.append(
-                download_image_as_inline_part(
+            parts.extend(
+                download_image_as_inline_parts(
                     item,
                     max_bytes=max_image_bytes,
+                    long_image_chunk_height=long_image_chunk_height,
+                    long_image_max_parts=long_image_max_parts,
+                    long_image_max_width=long_image_max_width,
                     timeout=image_download_timeout,
                 ),
             )
@@ -433,16 +450,22 @@ def build_inline_image_parts(
     images: list[ImageInput],
     *,
     max_image_bytes: int,
+    long_image_chunk_height: int,
+    long_image_max_parts: int,
+    long_image_max_width: int,
     image_download_timeout: int,
     stage: str,
 ) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
     for item in images:
         try:
-            parts.append(
-                download_image_as_inline_part(
+            parts.extend(
+                download_image_as_inline_parts(
                     item,
                     max_bytes=max_image_bytes,
+                    long_image_chunk_height=long_image_chunk_height,
+                    long_image_max_parts=long_image_max_parts,
+                    long_image_max_width=long_image_max_width,
                     timeout=image_download_timeout,
                 ),
             )
@@ -460,22 +483,107 @@ def build_inline_image_parts(
     return parts
 
 
-def download_image_as_inline_part(item: ImageInput, *, max_bytes: int, timeout: int = 10) -> dict[str, Any]:
+def download_image_as_inline_parts(
+    item: ImageInput,
+    *,
+    max_bytes: int,
+    long_image_chunk_height: int,
+    long_image_max_parts: int,
+    long_image_max_width: int,
+    timeout: int = 10,
+) -> list[dict[str, Any]]:
     ref = item.path or item.url
     print(f"[astrbot-fact-check-image-download] start {item.file_name or ref}", flush=True)
-    body, content_type = read_image_input_bytes(item, max_bytes=max_bytes, timeout=timeout)
+    body, content_type = read_image_input_bytes(item, max_bytes=None, timeout=timeout)
     print(
         f"[astrbot-fact-check-image-download] done bytes={len(body)} source={'local' if item.path else 'remote'}",
         flush=True,
     )
-    if len(body) > max_bytes:
-        raise ValueError(f"image too large after download: {len(body)} bytes > limit {max_bytes}")
+    if len(body) <= max_bytes:
+        return [
+            make_inline_image_part(
+                body,
+                mime_type=guess_mime_type(item.file_name, content_type),
+            ),
+        ]
+    return split_large_image_as_inline_parts(
+        body,
+        source_label=item.file_name or ref,
+        max_bytes=max_bytes,
+        chunk_height=long_image_chunk_height,
+        max_parts=long_image_max_parts,
+        max_width=long_image_max_width,
+    )
+
+
+def make_inline_image_part(body: bytes, *, mime_type: str) -> dict[str, Any]:
     return {
         "inline_data": {
-            "mime_type": guess_mime_type(item.file_name, content_type),
+            "mime_type": mime_type,
             "data": base64.b64encode(body).decode("ascii"),
         },
     }
+
+
+def split_large_image_as_inline_parts(
+    body: bytes,
+    *,
+    source_label: str,
+    max_bytes: int,
+    chunk_height: int,
+    max_parts: int,
+    max_width: int,
+) -> list[dict[str, Any]]:
+    chunk_height = max(800, int(chunk_height or 2200))
+    max_parts = max(1, int(max_parts or 8))
+    max_width = max(320, int(max_width or 1280))
+    with Image.open(io.BytesIO(body)) as image:
+        image.load()
+        width, height = image.size
+        if width > max_width:
+            new_height = max(1, round(height * (max_width / width)))
+            image = image.resize((max_width, new_height), Image.Resampling.LANCZOS)
+            width, height = image.size
+        total_parts = (height + chunk_height - 1) // chunk_height
+        if total_parts > max_parts:
+            chunk_height = (height + max_parts - 1) // max_parts
+            total_parts = max_parts
+        chunks: list[dict[str, Any]] = []
+        for index in range(total_parts):
+            top = index * chunk_height
+            bottom = min(height, top + chunk_height)
+            chunk = image.crop((0, top, width, bottom))
+            encoded = encode_image_chunk_under_limit(chunk, max_bytes=max_bytes)
+            chunks.append(make_inline_image_part(encoded, mime_type="image/jpeg"))
+        print(
+            "[astrbot-fact-check-image-split] "
+            f"{source_label}: original={len(body)} bytes size={image.size[0]}x{image.size[1]} "
+            f"chunks={len(chunks)} chunk_height={chunk_height}",
+            flush=True,
+        )
+        return chunks
+
+
+def encode_image_chunk_under_limit(image: Image.Image, *, max_bytes: int) -> bytes:
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+    for quality in (86, 78, 70, 62, 54, 46):
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=quality, optimize=True)
+        body = output.getvalue()
+        if len(body) <= max_bytes:
+            return body
+    output = io.BytesIO()
+    scale = max(0.35, (max_bytes / max(1, len(body))) ** 0.5 * 0.9)
+    resized = image.resize(
+        (max(1, int(image.size[0] * scale)), max(1, int(image.size[1] * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    resized.save(output, format="JPEG", quality=50, optimize=True)
+    body = output.getvalue()
+    if len(body) > max_bytes:
+        raise ValueError(f"image chunk too large after compression: {len(body)} bytes > limit {max_bytes}")
+    return body
 
 
 def parse_candidates(text: str, *, limit: int) -> list[ClaimCandidate]:
@@ -696,7 +804,7 @@ def post_json_with_timeout(
     raise RuntimeError("HTTP request failed without a specific error")
 
 
-def read_image_input_bytes(item: ImageInput, *, max_bytes: int, timeout: int) -> tuple[bytes, str]:
+def read_image_input_bytes(item: ImageInput, *, max_bytes: int | None, timeout: int) -> tuple[bytes, str]:
     path_value = (item.path or "").strip()
     url_value = (item.url or "").strip()
     if path_value:
@@ -704,7 +812,7 @@ def read_image_input_bytes(item: ImageInput, *, max_bytes: int, timeout: int) ->
         if not path.exists():
             raise FileNotFoundError(f"local image not found: {path}")
         size = path.stat().st_size
-        if size > max_bytes:
+        if max_bytes is not None and size > max_bytes:
             raise ValueError(f"image too large: {size} bytes > limit {max_bytes}")
         return path.read_bytes(), guess_mime_type(item.file_name or path.name, "")
     if url_value.startswith("file://"):
@@ -712,12 +820,12 @@ def read_image_input_bytes(item: ImageInput, *, max_bytes: int, timeout: int) ->
         if not path.exists():
             raise FileNotFoundError(f"local image not found: {path}")
         size = path.stat().st_size
-        if size > max_bytes:
+        if max_bytes is not None and size > max_bytes:
             raise ValueError(f"image too large: {size} bytes > limit {max_bytes}")
         return path.read_bytes(), guess_mime_type(item.file_name or path.name, "")
     if url_value.startswith("base64://"):
         body = base64.b64decode(url_value.removeprefix("base64://"))
-        if len(body) > max_bytes:
+        if max_bytes is not None and len(body) > max_bytes:
             raise ValueError(f"image too large: {len(body)} bytes > limit {max_bytes}")
         return body, guess_mime_type(item.file_name, "")
     if url_value:
@@ -725,13 +833,13 @@ def read_image_input_bytes(item: ImageInput, *, max_bytes: int, timeout: int) ->
     raise ValueError("empty image input")
 
 
-def get_bytes_with_timeout(url: str, *, max_bytes: int, timeout: int) -> tuple[bytes, str]:
+def get_bytes_with_timeout(url: str, *, max_bytes: int | None, timeout: int) -> tuple[bytes, str]:
     http_timeout = httpx.Timeout(float(timeout), connect=min(5.0, float(timeout)), read=float(timeout), write=5.0)
     with httpx.Client(timeout=http_timeout, follow_redirects=True, trust_env=True) as client:
         with client.stream("GET", url, headers={"User-Agent": "AstrBot-QQ-Agent/0.1"}) as response:
             response.raise_for_status()
             content_length = response.headers.get("Content-Length", "")
-            if content_length and int(content_length) > max_bytes:
+            if max_bytes is not None and content_length and int(content_length) > max_bytes:
                 raise ValueError(f"image too large: {content_length} bytes > limit {max_bytes}")
             chunks: list[bytes] = []
             size = 0
@@ -739,7 +847,7 @@ def get_bytes_with_timeout(url: str, *, max_bytes: int, timeout: int) -> tuple[b
                 if not chunk:
                     continue
                 size += len(chunk)
-                if size > max_bytes:
+                if max_bytes is not None and size > max_bytes:
                     raise ValueError(f"image too large while downloading: {size} bytes > limit {max_bytes}")
                 chunks.append(chunk)
             return b"".join(chunks), response.headers.get("Content-Type", "")

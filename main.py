@@ -106,7 +106,16 @@ class FactCheckPlugin(Star):
                         "gemini-2.5-flash",
                         "gemini-3.1-flash-lite-preview",
                     ],
-                    max_image_bytes=int(self.config.get("fact_check_max_image_bytes") or 2 * 1024 * 1024),
+                    max_image_bytes=int(self.config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024),
+                    long_image_chunk_height=int(
+                        self.config.get("fact_check_long_image_chunk_height") or 2200,
+                    ),
+                    long_image_max_parts=int(
+                        self.config.get("fact_check_long_image_max_parts") or 8,
+                    ),
+                    long_image_max_width=int(
+                        self.config.get("fact_check_long_image_max_width") or 1280,
+                    ),
                     image_download_timeout=int(
                         self.config.get("fact_check_image_download_timeout_seconds") or 10,
                     ),
