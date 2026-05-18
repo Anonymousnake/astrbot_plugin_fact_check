@@ -303,9 +303,11 @@ def extract_claims_from_images(
             ),
         },
     ]
+    seen_image_payloads: set[str] = set()
     for item in images:
         try:
-            parts.extend(
+            append_unique_inline_parts(
+                parts,
                 download_image_as_inline_parts(
                     item,
                     max_bytes=max_image_bytes,
@@ -314,6 +316,9 @@ def extract_claims_from_images(
                     long_image_max_width=long_image_max_width,
                     timeout=image_download_timeout,
                 ),
+                seen_image_payloads,
+                stage="preprocess",
+                label=item.file_name or item.url or item.path,
             )
         except Exception as exc:
             print(f"[astrbot-fact-check-image-download-error] {item.file_name or item.url}: {exc!r}", flush=True)
@@ -457,9 +462,11 @@ def build_inline_image_parts(
     stage: str,
 ) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
+    seen_image_payloads: set[str] = set()
     for item in images:
         try:
-            parts.extend(
+            append_unique_inline_parts(
+                parts,
                 download_image_as_inline_parts(
                     item,
                     max_bytes=max_image_bytes,
@@ -468,6 +475,9 @@ def build_inline_image_parts(
                     long_image_max_width=long_image_max_width,
                     timeout=image_download_timeout,
                 ),
+                seen_image_payloads,
+                stage=stage,
+                label=item.file_name or item.url or item.path,
             )
         except Exception as exc:
             print(
@@ -481,6 +491,24 @@ def build_inline_image_parts(
             flush=True,
         )
     return parts
+
+
+def append_unique_inline_parts(
+    target: list[dict[str, Any]],
+    new_parts: list[dict[str, Any]],
+    seen_payloads: set[str],
+    *,
+    stage: str,
+    label: str,
+) -> None:
+    for part in new_parts:
+        payload = ((part.get("inline_data") or {}).get("data") or "").strip()
+        if payload and payload in seen_payloads:
+            print(f"[astrbot-fact-check-image-{stage}-dedupe] skipped duplicate {label}", flush=True)
+            continue
+        if payload:
+            seen_payloads.add(payload)
+        target.append(part)
 
 
 def download_image_as_inline_parts(
