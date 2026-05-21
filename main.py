@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import sys
 import time
+from pathlib import Path
 from typing import Iterable
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Node, Nodes, Plain, Reply
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.utils.quoted_message.extractor import (
     extract_quoted_message_images,
     extract_quoted_message_text,
@@ -25,16 +28,54 @@ from .fact_check import (
     run_fact_check,
 )
 
+try:
+    from astrbot_plugin_access_control.access_control import is_plugin_allowed
+except Exception:
+    try:
+        plugins_dir = Path(__file__).resolve().parents[1]
+        if str(plugins_dir) not in sys.path:
+            sys.path.insert(0, str(plugins_dir))
+        from astrbot_plugin_access_control.access_control import is_plugin_allowed
+    except Exception:
+        is_plugin_allowed = None
+
+
+def _event_text_candidates(event: AstrMessageEvent) -> list[str]:
+    candidates: list[str] = []
+    for value in (
+        getattr(event, "message_str", ""),
+        event.get_message_str() if hasattr(event, "get_message_str") else "",
+    ):
+        text = str(value or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+    try:
+        for comp in event.get_messages():
+            if isinstance(comp, Plain):
+                text = str(getattr(comp, "text", "") or "").strip()
+                if text and text not in candidates:
+                    candidates.append(text)
+    except Exception:
+        pass
+    return candidates
+
+
+def _trigger_text(event: AstrMessageEvent) -> str:
+    for text in _event_text_candidates(event):
+        if is_trigger(text):
+            return text
+    return ""
+
 
 class FactCheckWakeFilter(CustomFilter):
     """Wake only for explicit fact-check triggers."""
 
     def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
         if event.is_private_chat():
-            return is_trigger(event.message_str)
+            return bool(_trigger_text(event))
         return bool(
             getattr(event, "is_at_or_wake_command", False)
-            or is_trigger(event.message_str)
+            or _trigger_text(event)
         )
 
 
@@ -45,18 +86,47 @@ class FactCheckPlugin(Star):
         super().__init__(context)
         self.config = config
 
+    @filter.command("事实核查转发测试")
+    async def fact_check_forward_test(self, event: AstrMessageEvent):
+        event.set_extra("qq_agent_command_handled", True)
+        event.stop_event()
+        label = self._event_label(event)
+        nodes = Nodes(
+            [
+                Node(uin=str(event.get_self_id() or "0"), name="事实核查测试", content=[Plain("合并转发测试 1/2")]),
+                Node(uin=str(event.get_self_id() or "0"), name="事实核查测试", content=[Plain("合并转发测试 2/2")]),
+            ],
+        )
+        logger.info(f"[astrbot-fact-check-forward-test] {label}: start")
+        try:
+            await event.send(event.chain_result([nodes]))
+            logger.info(f"[astrbot-fact-check-forward-test-ok] {label}")
+        except Exception as exc:
+            logger.error(f"[astrbot-fact-check-forward-test-failed] {label}: {exc!r}")
+            yield event.plain_result(f"合并转发测试失败：{exc!r}")
+
     @filter.custom_filter(FactCheckWakeFilter, priority=998_000)
     async def fact_check(self, event: AstrMessageEvent):
         """Run fact-checking when users say /事实核查, factcheck, or fact-check."""
         if not bool(self.config.get("enable_fact_check", True)):
             return
-        if not is_trigger(event.message_str):
+        trigger_text = _trigger_text(event)
+        if not trigger_text:
             return
 
         started_at = time.perf_counter()
         event.set_extra("qq_agent_command_handled", True)
         event.stop_event()
-        request_data = await self._build_fact_check_request(event)
+        if is_plugin_allowed is not None and not is_plugin_allowed(
+            "fact_check",
+            event,
+            default_allow=True,
+            default_allow_private=True,
+        ):
+            yield event.plain_result("这个群没开事实核查。")
+            return
+
+        request_data = await self._build_fact_check_request(event, trigger_text=trigger_text)
         if not request_data.text and not request_data.images:
             reason = "no quoted text or inline claim"
             logger.info(f"[astrbot-fact-check-reason] {self._event_label(event)}: {reason}")
@@ -178,6 +248,12 @@ class FactCheckPlugin(Star):
             f"[astrbot-fact-check-send] {label}: purpose={purpose} len={len(text)}",
         )
         forward_result = self._fact_check_forward_result(event, text)
+        safe_text = self._sanitize_forward_text_for_qq(text)
+        retry_result = (
+            self._fact_check_forward_result(event, safe_text)
+            if safe_text != text
+            else forward_result
+        )
 
         try:
             await event.send(forward_result)
@@ -197,7 +273,12 @@ class FactCheckPlugin(Star):
 
         await asyncio.sleep(1.0)
         try:
-            await event.send(forward_result)
+            if safe_text != text:
+                logger.info(
+                    f"[astrbot-fact-check-send-retry-sanitized] {label}: "
+                    f"len={len(text)}->{len(safe_text)}",
+                )
+            await event.send(retry_result)
             logger.info(
                 f"[astrbot-fact-check-send-ok] {label}: method=event.send.forward retry"
             )
@@ -213,6 +294,7 @@ class FactCheckPlugin(Star):
                 f"[astrbot-fact-check-send-failed] {label}: "
                 f"method=event.send.forward retry error={exc!r}",
             )
+            self._dump_forward_failure(label, text, exc)
 
     async def _send_text_via_onebot(
 
@@ -290,14 +372,78 @@ class FactCheckPlugin(Star):
             and '"errMsg": ""' in text
         )
 
+    def _sanitize_forward_text_for_qq(self, text: str) -> str:
+        replacements = {
+            "翻墙": "翻 墙",
+            "网信办": "网 信 办",
+            "国家网络安全法规": "相关网络安全法规",
+            "违规访问": "不合规访问",
+            "Reddit": "R eddit",
+            "r/China_irl": "r / China_irl",
+            "大纪元": "大 纪 元",
+            "VPN": "V PN",
+            "vpn": "v pn",
+        }
+        safe = str(text or "")
+        for source, target in replacements.items():
+            safe = safe.replace(source, target)
+        return safe
+
     def _fact_check_forward_result(self, event: AstrMessageEvent, text: str):
         chunks = self._split_reply_text(text, max_chars=1200)
+        if len(chunks) == 1:
+            chunk = chunks[0]
+            split_at = self._fact_check_single_node_split_at(chunk)
+            chunks = [chunk[:split_at].strip(), chunk[split_at:].strip()]
+            chunks = [item for item in chunks if item]
         nodes = []
         self_id = str(event.get_self_id() or "0")
         for index, chunk in enumerate(chunks, start=1):
             name = "事实核查" if len(chunks) == 1 else f"事实核查 {index}/{len(chunks)}"
             nodes.append(Node(uin=self_id, name=name, content=[Plain(chunk)]))
+        logger.info(
+            f"[astrbot-fact-check-forward-build] nodes={len(nodes)} "
+            f"lengths={[len(chunk) for chunk in chunks]}",
+        )
         return event.chain_result([Nodes(nodes)])
+
+    def _dump_forward_failure(self, label: str, text: str, exc: Exception) -> None:
+        try:
+            chunks = self._split_reply_text(text, max_chars=1200)
+            path = Path(StarTools.get_data_dir()) / "last_forward_failure.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "label": label,
+                "text": text,
+                "length": len(text),
+                "chunks": chunks,
+                "chunk_lengths": [len(chunk) for chunk in chunks],
+                "error": repr(exc),
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"[astrbot-fact-check-forward-failure-dump] {label}: {path}")
+        except Exception as dump_exc:
+            logger.warning(f"[astrbot-fact-check-forward-failure-dump-error] {label}: {dump_exc!r}")
+
+    def _fact_check_single_node_split_at(self, text: str) -> int:
+        text = str(text or "")
+        midpoint = max(1, len(text) // 2)
+        candidates = [
+            text.find("\n来源", 1),
+            text.find("\n证据", 1),
+            text.find("\n要点", 1),
+            text.find("\n结论", 1),
+        ]
+        candidates = [pos for pos in candidates if pos > 0]
+        if candidates:
+            return min(candidates, key=lambda pos: abs(pos - midpoint))
+        newline_before = text.rfind("\n", 0, midpoint)
+        newline_after = text.find("\n", midpoint)
+        newline_candidates = [pos for pos in (newline_before, newline_after) if pos > 0]
+        if newline_candidates:
+            return min(newline_candidates, key=lambda pos: abs(pos - midpoint))
+        return midpoint
 
     def _split_reply_text(self, text: str, *, max_chars: int) -> list[str]:
         text = str(text or "").strip()
@@ -328,8 +474,13 @@ class FactCheckPlugin(Star):
             "用法：回复一条消息后发送 /事实核查，或者直接发送 /事实核查 要核查的内容。"
         )
 
-    async def _build_fact_check_request(self, event: AstrMessageEvent) -> FactCheckRequest:
-        trigger_text = event.message_str or ""
+    async def _build_fact_check_request(
+        self,
+        event: AstrMessageEvent,
+        *,
+        trigger_text: str | None = None,
+    ) -> FactCheckRequest:
+        trigger_text = trigger_text or _trigger_text(event) or event.message_str or ""
         inline_text = remove_trigger(trigger_text)
         if re.fullmatch(r"(?:@\S+\s*)+", inline_text or ""):
             inline_text = ""
