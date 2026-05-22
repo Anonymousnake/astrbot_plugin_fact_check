@@ -71,12 +71,7 @@ class FactCheckWakeFilter(CustomFilter):
     """Wake only for explicit fact-check triggers."""
 
     def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
-        if event.is_private_chat():
-            return bool(_trigger_text(event))
-        return bool(
-            getattr(event, "is_at_or_wake_command", False)
-            or _trigger_text(event)
-        )
+        return bool(_trigger_text(event))
 
 
 class FactCheckPlugin(Star):
@@ -470,6 +465,7 @@ class FactCheckPlugin(Star):
     async def factcheck_help(self, event: AstrMessageEvent):
         """Show fact-check usage when the bare command is used."""
         event.set_extra("qq_agent_command_handled", True)
+        event.stop_event()
         yield event.plain_result(
             "用法：回复一条消息后发送 /事实核查，或者直接发送 /事实核查 要核查的内容。"
         )
