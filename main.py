@@ -39,6 +39,18 @@ except Exception:
     except Exception:
         is_plugin_allowed = None
 
+try:
+    from astrbot_plugin_qq_agent_core.media_send import is_confirm_timeout, send_chain_result
+except Exception:
+    try:
+        plugins_dir = Path(__file__).resolve().parents[1]
+        if str(plugins_dir) not in sys.path:
+            sys.path.insert(0, str(plugins_dir))
+        from astrbot_plugin_qq_agent_core.media_send import is_confirm_timeout, send_chain_result
+    except Exception:
+        is_confirm_timeout = None
+        send_chain_result = None
+
 
 def _event_text_candidates(event: AstrMessageEvent) -> list[str]:
     candidates: list[str] = []
@@ -250,8 +262,18 @@ class FactCheckPlugin(Star):
             else forward_result
         )
 
+        outcome = await send_chain_result(event, forward_result) if send_chain_result else None
         try:
-            await event.send(forward_result)
+            if outcome is None:
+                await event.send(forward_result)
+            elif outcome.assumed_ok:
+                logger.info(
+                    f"[astrbot-fact-check-send-assume-ok] {label}: "
+                    f"method=event.send.forward kind={outcome.kind} error={outcome.error}",
+                )
+                return
+            elif not outcome.ok:
+                raise RuntimeError(f"{outcome.kind}: {outcome.error}")
             logger.info(f"[astrbot-fact-check-send-ok] {label}: method=event.send.forward")
             return
         except Exception as exc:
@@ -263,17 +285,27 @@ class FactCheckPlugin(Star):
                 return
             logger.warning(
                 f"[astrbot-fact-check-send-error] {label}: "
-                f"method=event.send.forward error={exc!r}",
+                f"method=event.send.forward kind={getattr(outcome, 'kind', None) or 'unknown'} error={exc!r}",
             )
 
         await asyncio.sleep(1.0)
+        outcome = await send_chain_result(event, retry_result) if send_chain_result else None
         try:
             if safe_text != text:
                 logger.info(
                     f"[astrbot-fact-check-send-retry-sanitized] {label}: "
                     f"len={len(text)}->{len(safe_text)}",
                 )
-            await event.send(retry_result)
+            if outcome is None:
+                await event.send(retry_result)
+            elif outcome.assumed_ok:
+                logger.info(
+                    f"[astrbot-fact-check-send-assume-ok] {label}: "
+                    f"method=event.send.forward retry kind={outcome.kind} error={outcome.error}",
+                )
+                return
+            elif not outcome.ok:
+                raise RuntimeError(f"{outcome.kind}: {outcome.error}")
             logger.info(
                 f"[astrbot-fact-check-send-ok] {label}: method=event.send.forward retry"
             )
@@ -287,7 +319,7 @@ class FactCheckPlugin(Star):
                 return
             logger.error(
                 f"[astrbot-fact-check-send-failed] {label}: "
-                f"method=event.send.forward retry error={exc!r}",
+                f"method=event.send.forward retry kind={getattr(outcome, 'kind', None) or 'unknown'} error={exc!r}",
             )
             self._dump_forward_failure(label, text, exc)
 
@@ -360,6 +392,8 @@ class FactCheckPlugin(Star):
         return False
 
     def _looks_like_confirm_timeout(self, exc: Exception) -> bool:
+        if is_confirm_timeout is not None:
+            return bool(is_confirm_timeout(exc))
         text = str(exc)
         return (
             "Timeout: NTEvent" in text
