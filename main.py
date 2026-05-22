@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -92,6 +93,12 @@ class FactCheckPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._fact_check_semaphore = asyncio.Semaphore(
+            max(1, int(self.config.get("fact_check_max_concurrent") or 1)),
+        )
+        self._fact_check_tasks: set[asyncio.Task] = set()
+        self._reply_cache: dict[str, tuple[float, str]] = {}
+        self._cooldown_until = 0.0
 
     @filter.command("事实核查转发测试")
     async def fact_check_forward_test(self, event: AstrMessageEvent):
@@ -140,12 +147,40 @@ class FactCheckPlugin(Star):
             yield event.plain_result(self._failed_fact_check_reply(reason))
             return
 
+        cache_key = self._request_cache_key(request_data)
+        cached_reply = self._get_cached_reply(cache_key)
+        if cached_reply:
+            logger.info(f"[astrbot-fact-check-cache-hit] {self._event_label(event)}: key={cache_key[:12]}")
+            await self._send_fact_check_reply(event, cached_reply, label=self._event_label(event), purpose="cache")
+            return
+
+        cooldown_left = self._cooldown_left()
+        if cooldown_left > 0:
+            logger.warning(
+                f"[astrbot-fact-check-cooldown] {self._event_label(event)}: "
+                f"left={cooldown_left:.1f}s key={cache_key[:12]}",
+            )
+            yield event.plain_result(f"Gemini 刚被限流，先冷却 {int(cooldown_left) + 1} 秒。")
+            return
+
+        max_queue = max(1, int(self.config.get("fact_check_max_queue") or 4))
+        if len(self._fact_check_tasks) >= max_queue:
+            logger.warning(
+                f"[astrbot-fact-check-queue-full] {self._event_label(event)}: "
+                f"tasks={len(self._fact_check_tasks)} max={max_queue}",
+            )
+            yield event.plain_result("事实核查队列满了，等前面的跑完再试一下。")
+            return
+
         logger.info(
             f"[astrbot-fact-check-queue] {self._event_label(event)}: "
-            f"text_len={len(request_data.text)} images={len(request_data.images)}",
+            f"text_len={len(request_data.text)} images={len(request_data.images)} "
+            f"active={len(self._fact_check_tasks)} key={cache_key[:12]}",
         )
         await event.send(event.plain_result("我先查一下。"))
-        asyncio.create_task(self._run_fact_check_job(event, request_data, started_at))
+        task = asyncio.create_task(self._run_fact_check_job(event, request_data, started_at, cache_key))
+        self._fact_check_tasks.add(task)
+        task.add_done_callback(self._fact_check_tasks.discard)
         return
 
     async def _run_fact_check_job(
@@ -153,58 +188,60 @@ class FactCheckPlugin(Star):
         event: AstrMessageEvent,
         request_data: FactCheckRequest,
         started_at: float,
+        cache_key: str,
     ) -> None:
         label = self._event_label(event)
         try:
-            timeout_seconds = max(
-                10.0,
-                float(self.config.get("fact_check_total_timeout_seconds") or 90),
-            )
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    run_fact_check,
-                    request_data=request_data,
-                    api_key=str(self.config.get("gemini_api_key") or ""),
-                    base_url=str(
-                        self.config.get(
-                            "gemini_base_url",
-                            "https://generativelanguage.googleapis.com/v1beta/models",
-                        )
-                        or "https://generativelanguage.googleapis.com/v1beta/models",
+            async with self._fact_check_semaphore:
+                timeout_seconds = max(
+                    10.0,
+                    float(self.config.get("fact_check_total_timeout_seconds") or 90),
+                )
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        run_fact_check,
+                        request_data=request_data,
+                        api_key=str(self.config.get("gemini_api_key") or ""),
+                        base_url=str(
+                            self.config.get(
+                                "gemini_base_url",
+                                "https://generativelanguage.googleapis.com/v1beta/models",
+                            )
+                            or "https://generativelanguage.googleapis.com/v1beta/models",
+                        ),
+                        pre_model=str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite-preview"),
+                        main_models=[
+                            str(model).strip()
+                            for model in self.config.get("fact_check_main_models", [])
+                            if str(model).strip()
+                        ]
+                        or [
+                            "gemini-3-flash-preview",
+                            "gemini-2.5-flash",
+                            "gemini-3.1-flash-lite-preview",
+                        ],
+                        max_image_bytes=int(self.config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024),
+                        long_image_chunk_height=int(
+                            self.config.get("fact_check_long_image_chunk_height") or 2200,
+                        ),
+                        long_image_max_parts=int(
+                            self.config.get("fact_check_long_image_max_parts") or 8,
+                        ),
+                        long_image_max_width=int(
+                            self.config.get("fact_check_long_image_max_width") or 1280,
+                        ),
+                        image_download_timeout=int(
+                            self.config.get("fact_check_image_download_timeout_seconds") or 10,
+                        ),
+                        pre_request_timeout=int(
+                            self.config.get("fact_check_pre_timeout_seconds") or 25,
+                        ),
+                        main_request_timeout=int(
+                            self.config.get("fact_check_main_timeout_seconds") or 45,
+                        ),
                     ),
-                    pre_model=str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite-preview"),
-                    main_models=[
-                        str(model).strip()
-                        for model in self.config.get("fact_check_main_models", [])
-                        if str(model).strip()
-                    ]
-                    or [
-                        "gemini-3-flash-preview",
-                        "gemini-2.5-flash",
-                        "gemini-3.1-flash-lite-preview",
-                    ],
-                    max_image_bytes=int(self.config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024),
-                    long_image_chunk_height=int(
-                        self.config.get("fact_check_long_image_chunk_height") or 2200,
-                    ),
-                    long_image_max_parts=int(
-                        self.config.get("fact_check_long_image_max_parts") or 8,
-                    ),
-                    long_image_max_width=int(
-                        self.config.get("fact_check_long_image_max_width") or 1280,
-                    ),
-                    image_download_timeout=int(
-                        self.config.get("fact_check_image_download_timeout_seconds") or 10,
-                    ),
-                    pre_request_timeout=int(
-                        self.config.get("fact_check_pre_timeout_seconds") or 25,
-                    ),
-                    main_request_timeout=int(
-                        self.config.get("fact_check_main_timeout_seconds") or 45,
-                    ),
-                ),
-                timeout=timeout_seconds,
-            )
+                    timeout=timeout_seconds,
+                )
         except asyncio.TimeoutError:
             elapsed = time.perf_counter() - started_at
             reason = f"timeout after {elapsed:.1f}s"
@@ -221,6 +258,7 @@ class FactCheckPlugin(Star):
             reason = f"exception: {exc!r}"
             logger.error(f"[astrbot-fact-check-error] {label}: {exc!r}")
             logger.info(f"[astrbot-fact-check-reason] {label}: {reason}")
+            self._maybe_start_cooldown(reason)
             await self._send_fact_check_reply(
                 event,
                 self._failed_fact_check_reply(reason),
@@ -235,6 +273,7 @@ class FactCheckPlugin(Star):
             f"[astrbot-fact-check-done] {label}: "
             f"{time.perf_counter() - started_at:.2f}s",
         )
+        self._set_cached_reply(cache_key, result.reply or FAILED_REPLY)
         await self._send_fact_check_reply(
             event,
             result.reply or FAILED_REPLY,
@@ -455,6 +494,60 @@ class FactCheckPlugin(Star):
         except Exception as dump_exc:
             logger.warning(f"[astrbot-fact-check-forward-failure-dump-error] {label}: {dump_exc!r}")
 
+    def _request_cache_key(self, request_data: FactCheckRequest) -> str:
+        payload = {
+            "text": request_data.text.strip(),
+            "speaker": request_data.speaker.strip(),
+            "images": [
+                {
+                    "url": image.url,
+                    "file_name": image.file_name,
+                    "path": image.path,
+                }
+                for image in request_data.images
+            ],
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _get_cached_reply(self, cache_key: str) -> str:
+        ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))
+        if ttl <= 0:
+            return ""
+        cached = self._reply_cache.get(cache_key)
+        if not cached:
+            return ""
+        created_at, reply = cached
+        if time.time() - created_at > ttl:
+            self._reply_cache.pop(cache_key, None)
+            return ""
+        return reply
+
+    def _set_cached_reply(self, cache_key: str, reply: str) -> None:
+        ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))
+        if ttl <= 0:
+            return
+        self._reply_cache[cache_key] = (time.time(), reply)
+        max_entries = max(8, int(self.config.get("fact_check_cache_max_entries") or 32))
+        if len(self._reply_cache) <= max_entries:
+            return
+        stale = sorted(self._reply_cache.items(), key=lambda item: item[1][0])
+        for key, _ in stale[: len(self._reply_cache) - max_entries]:
+            self._reply_cache.pop(key, None)
+
+    def _cooldown_left(self) -> float:
+        return max(0.0, self._cooldown_until - time.time())
+
+    def _maybe_start_cooldown(self, reason: str) -> None:
+        lowered = str(reason or "").lower()
+        if "429" not in lowered and "too many requests" not in lowered and "rate limit" not in lowered:
+            return
+        seconds = max(0, int(self.config.get("fact_check_rate_limit_cooldown_seconds") or 90))
+        if seconds <= 0:
+            return
+        self._cooldown_until = max(self._cooldown_until, time.time() + seconds)
+        logger.warning(f"[astrbot-fact-check-rate-limit-cooldown] seconds={seconds}")
+
     def _fact_check_single_node_split_at(self, text: str) -> int:
         text = str(text or "")
         midpoint = max(1, len(text) // 2)
@@ -674,3 +767,11 @@ class FactCheckPlugin(Star):
     def _short_ref(self, value: str, limit: int = 120) -> str:
         value = str(value or "").replace("\n", " ").strip()
         return value if len(value) <= limit else value[:limit] + "..."
+
+    async def terminate(self):
+        tasks = list(self._fact_check_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("[astrbot-fact-check] terminated")
