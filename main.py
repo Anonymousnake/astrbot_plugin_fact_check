@@ -6,6 +6,8 @@ import json
 import re
 import sys
 import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -22,11 +24,13 @@ from astrbot.core.star.filter.custom_filter import CustomFilter
 from .fact_check import (
     FAILED_REPLY,
     FactCheckRequest,
+    FactCheckResult,
     ImageInput,
     explain_failure,
     is_trigger,
     remove_trigger,
     run_fact_check,
+    run_fact_check_followup,
 )
 
 try:
@@ -87,6 +91,18 @@ class FactCheckWakeFilter(CustomFilter):
         return bool(_trigger_text(event))
 
 
+@dataclass(slots=True)
+class FactCheckSession:
+    session_id: str
+    created_at: float
+    group_id: str
+    user_id: str
+    request_data: FactCheckRequest
+    reply: str
+    candidates: list = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+
+
 class FactCheckPlugin(Star):
     """Standalone QQ-friendly fact-check command."""
 
@@ -98,7 +114,102 @@ class FactCheckPlugin(Star):
         )
         self._fact_check_tasks: set[asyncio.Task] = set()
         self._reply_cache: dict[str, tuple[float, str]] = {}
+        self._fact_check_sessions: dict[str, FactCheckSession] = {}
         self._cooldown_until = 0.0
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=998_500)
+    async def fact_check_followup(self, event: AstrMessageEvent):
+        """Answer follow-up questions by replying to a previous fact-check result."""
+        if not bool(self.config.get("enable_fact_check", True)):
+            return
+        if _trigger_text(event):
+            return
+        question = self._extract_followup_question(event)
+        if not question:
+            return
+        session = await self._find_followup_session(event)
+        if not session:
+            return
+        if not self._session_visible_to_event(session, event):
+            return
+        if is_plugin_allowed is not None and not is_plugin_allowed(
+            "fact_check",
+            event,
+            default_allow=True,
+            default_allow_private=True,
+        ):
+            return
+
+        event.set_extra("qq_agent_command_handled", True)
+        event.stop_event()
+        label = self._event_label(event)
+        started_at = time.perf_counter()
+        await event.send(event.plain_result("我接着查一下。"))
+        try:
+            async with self._fact_check_semaphore:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        run_fact_check_followup,
+                        original_text=session.request_data.text,
+                        candidates=session.candidates,
+                        previous_reply=session.reply,
+                        previous_sources=session.sources,
+                        question=question,
+                        api_key=str(self.config.get("gemini_api_key") or ""),
+                        base_url=str(
+                            self.config.get(
+                                "gemini_base_url",
+                                "https://generativelanguage.googleapis.com/v1beta/models",
+                            )
+                            or "https://generativelanguage.googleapis.com/v1beta/models"
+                        ),
+                        main_models=[
+                            str(model).strip()
+                            for model in self.config.get("fact_check_main_models", [])
+                            if str(model).strip()
+                        ]
+                        or [
+                            "gemini-3-flash-preview",
+                            "gemini-2.5-flash",
+                            "gemini-3.1-flash-lite-preview",
+                        ],
+                        request_timeout=int(self.config.get("fact_check_main_timeout_seconds") or 45),
+                    ),
+                    timeout=max(10.0, float(self.config.get("fact_check_total_timeout_seconds") or 90)),
+                )
+        except asyncio.TimeoutError:
+            reason = f"follow-up timeout after {time.perf_counter() - started_at:.1f}s"
+            logger.error(f"[astrbot-fact-check-followup-error] {label}: {reason}")
+            await self._send_fact_check_reply(
+                event,
+                self._failed_fact_check_reply(reason),
+                label=label,
+                purpose="followup-timeout",
+            )
+            return
+        except Exception as exc:
+            reason = f"follow-up exception: {exc!r}"
+            logger.error(f"[astrbot-fact-check-followup-error] {label}: {exc!r}")
+            self._maybe_start_cooldown(reason)
+            await self._send_fact_check_reply(
+                event,
+                self._failed_fact_check_reply(reason),
+                label=label,
+                purpose="followup-exception",
+            )
+            return
+
+        logger.info(
+            f"[astrbot-fact-check-followup-done] {label}: "
+            f"session={session.session_id} {time.perf_counter() - started_at:.2f}s",
+        )
+        await self._send_fact_check_reply(
+            event,
+            result.reply or FAILED_REPLY,
+            label=label,
+            purpose="followup",
+            session_id=session.session_id,
+        )
 
     @filter.command("事实核查转发测试")
     async def fact_check_forward_test(self, event: AstrMessageEvent):
@@ -274,11 +385,13 @@ class FactCheckPlugin(Star):
             f"{time.perf_counter() - started_at:.2f}s",
         )
         self._set_cached_reply(cache_key, result.reply or FAILED_REPLY)
+        session_id = self._remember_fact_check_session(event, request_data, result)
         await self._send_fact_check_reply(
             event,
             result.reply or FAILED_REPLY,
             label=label,
             purpose="result",
+            session_id=session_id,
         )
 
     async def _send_fact_check_reply(
@@ -288,15 +401,16 @@ class FactCheckPlugin(Star):
         *,
         label: str,
         purpose: str,
+        session_id: str | None = None,
     ) -> None:
         text = str(text or FAILED_REPLY).strip() or FAILED_REPLY
         logger.info(
             f"[astrbot-fact-check-send] {label}: purpose={purpose} len={len(text)}",
         )
-        forward_result = self._fact_check_forward_result(event, text)
+        forward_result = self._fact_check_forward_result(event, text, session_id=session_id)
         safe_text = self._sanitize_forward_text_for_qq(text)
         retry_result = (
-            self._fact_check_forward_result(event, safe_text)
+            self._fact_check_forward_result(event, safe_text, session_id=session_id)
             if safe_text != text
             else forward_result
         )
@@ -457,8 +571,18 @@ class FactCheckPlugin(Star):
             safe = safe.replace(source, target)
         return safe
 
-    def _fact_check_forward_result(self, event: AstrMessageEvent, text: str):
+    def _fact_check_forward_result(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        session_id: str | None = None,
+    ):
         chunks = self._split_reply_text(text, max_chars=1200)
+        if session_id:
+            marker = f"\n\n追问可回复本消息。核查ID：{session_id}"
+            if chunks:
+                chunks[-1] = (chunks[-1].rstrip() + marker).strip()
         if len(chunks) == 1:
             chunk = chunks[0]
             split_at = self._fact_check_single_node_split_at(chunk)
@@ -509,6 +633,112 @@ class FactCheckPlugin(Star):
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _remember_fact_check_session(
+        self,
+        event: AstrMessageEvent,
+        request_data: FactCheckRequest,
+        result: FactCheckResult,
+    ) -> str:
+        self._cleanup_fact_check_sessions()
+        session_id = "fc_" + uuid.uuid4().hex[:8]
+        self._fact_check_sessions[session_id] = FactCheckSession(
+            session_id=session_id,
+            created_at=time.time(),
+            group_id=str(event.get_group_id() or "").strip(),
+            user_id=str(event.get_sender_id() or "").strip(),
+            request_data=request_data,
+            reply=result.reply or FAILED_REPLY,
+            candidates=list(result.candidates or []),
+            sources=list(result.sources or []),
+        )
+        self._cleanup_fact_check_sessions()
+        logger.info(f"[astrbot-fact-check-session-save] {self._event_label(event)}: session={session_id}")
+        return session_id
+
+    def _cleanup_fact_check_sessions(self) -> None:
+        ttl = max(60, int(self.config.get("fact_check_followup_ttl_seconds") or 3600))
+        max_entries = max(8, int(self.config.get("fact_check_followup_max_sessions") or 50))
+        now = time.time()
+        expired = [
+            session_id
+            for session_id, session in self._fact_check_sessions.items()
+            if now - session.created_at > ttl
+        ]
+        for session_id in expired:
+            self._fact_check_sessions.pop(session_id, None)
+        if len(self._fact_check_sessions) <= max_entries:
+            return
+        stale = sorted(self._fact_check_sessions.values(), key=lambda item: item.created_at)
+        for session in stale[: len(self._fact_check_sessions) - max_entries]:
+            self._fact_check_sessions.pop(session.session_id, None)
+
+    def _extract_followup_question(self, event: AstrMessageEvent) -> str:
+        has_reply = any(isinstance(comp, Reply) for comp in event.get_messages())
+        if not has_reply:
+            return ""
+        for text in _event_text_candidates(event):
+            cleaned = re.sub(r"fc_[0-9a-fA-F]{8,16}", " ", text)
+            cleaned = re.sub(r"核查ID[:：]\s*", " ", cleaned)
+            cleaned = cleaned.strip(" \t\r\n:：")
+            if cleaned and not self._is_unusable_quoted_text(cleaned):
+                return cleaned[:800]
+        return ""
+
+    async def _find_followup_session(self, event: AstrMessageEvent) -> FactCheckSession | None:
+        self._cleanup_fact_check_sessions()
+        ids: list[str] = []
+        quoted_looks_like_fact_check = False
+        for text in _event_text_candidates(event):
+            ids.extend(self._extract_fact_check_session_ids(text))
+
+        for comp in event.get_messages():
+            if not isinstance(comp, Reply):
+                continue
+            for text in [str(comp.message_str or "")] + self._plain_texts(comp.chain or []):
+                ids.extend(self._extract_fact_check_session_ids(text))
+                quoted_looks_like_fact_check = quoted_looks_like_fact_check or self._looks_like_fact_check_reply(text)
+            fetched = await self._fetch_reply_payload(event, comp)
+            if fetched:
+                fetched_texts, _, _ = fetched
+                for text in fetched_texts:
+                    ids.extend(self._extract_fact_check_session_ids(text))
+                    quoted_looks_like_fact_check = quoted_looks_like_fact_check or self._looks_like_fact_check_reply(text)
+
+        for session_id in ids:
+            session = self._fact_check_sessions.get(session_id)
+            if session:
+                return session
+
+        # NapCat sometimes exposes a fact-check quote without the marker. Only then use latest session.
+        if not quoted_looks_like_fact_check:
+            return None
+        candidates = [
+            session
+            for session in self._fact_check_sessions.values()
+            if self._session_visible_to_event(session, event)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item.created_at)
+
+    @staticmethod
+    def _extract_fact_check_session_ids(text: str | None) -> list[str]:
+        if not text:
+            return []
+        return [match.group(0).lower() for match in re.finditer(r"fc_[0-9a-fA-F]{8,16}", str(text))]
+
+    @staticmethod
+    def _looks_like_fact_check_reply(text: str | None) -> bool:
+        normalized = str(text or "")
+        return "事实核查" in normalized or "核查ID" in normalized or "追问可回复本消息" in normalized
+
+    @staticmethod
+    def _session_visible_to_event(session: FactCheckSession, event: AstrMessageEvent) -> bool:
+        group_id = str(event.get_group_id() or "").strip()
+        if session.group_id:
+            return bool(group_id and group_id == session.group_id)
+        return str(event.get_sender_id() or "").strip() == session.user_id
 
     def _get_cached_reply(self, cache_key: str) -> str:
         ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))

@@ -83,6 +83,16 @@
     "description": "Max in-memory fact-check cache entries",
     "default": 32
   },
+  "fact_check_followup_ttl_seconds": {
+    "type": "int",
+    "description": "Seconds to keep a fact-check result available for reply follow-ups",
+    "default": 3600
+  },
+  "fact_check_followup_max_sessions": {
+    "type": "int",
+    "description": "Max in-memory fact-check follow-up sessions",
+    "default": 50
+  },
   "fact_check_rate_limit_cooldown_seconds": {
     "type": "int",
     "description": "Cooldown after Gemini reports 429/rate-limit",

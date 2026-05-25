@@ -61,6 +61,7 @@ class FactCheckResult:
     reply: str
     reason: str = ""
     sources: list[str] = field(default_factory=list)
+    candidates: list[ClaimCandidate] = field(default_factory=list)
 
 
 def is_trigger(text: str) -> bool:
@@ -164,6 +165,8 @@ def run_fact_check(
             return FactCheckResult(
                 FAILED_REPLY,
                 f"no checkable factual claims; text={text_context[:120]}; images={len(request_data.images)}",
+                [],
+                [],
             )
 
     deduped = dedupe_candidates(candidates, limit=3)
@@ -232,12 +235,88 @@ def run_fact_check(
             f"{FAILED_REPLY}\n待查点：{claims}" if claims else FAILED_REPLY,
             f"main model returned empty reply; model={used_model}; candidates={len(deduped)}",
             sources,
+            deduped,
         )
     return FactCheckResult(
         reply=reply,
         reason="ok; extracted_claims=" + "; ".join(item.claim[:80] for item in deduped),
         sources=sources,
+        candidates=deduped,
     )
+
+
+def run_fact_check_followup(
+    *,
+    original_text: str,
+    candidates: list[ClaimCandidate],
+    previous_reply: str,
+    previous_sources: list[str],
+    question: str,
+    api_key: str,
+    base_url: str,
+    main_models: list[str],
+    request_timeout: int = 45,
+) -> FactCheckResult:
+    api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return FactCheckResult(FAILED_REPLY, "missing Gemini API key")
+
+    candidate_text = format_candidates(candidates) if candidates else "（上次未保存待核查问题）"
+    source_text = "\n".join(f"- {source}" for source in previous_sources[:5]) or "（上次未提取到来源）"
+    prompt = f"""你是中文事实核查追问助手。用户正在追问上一轮事实核查结果。
+
+原始聊天内容：
+{original_text or "（无文字或主要来自图片）"}
+
+上次待核查问题：
+{candidate_text}
+
+上次核查结果：
+{previous_reply or "（无）"}
+
+上次来源：
+{source_text}
+
+用户追问：
+{question}
+
+要求：
+- 只回答这次追问，不要完整重复上一轮事实核查。
+- 必要时继续使用 Google Search grounding 查证。
+- 如果新增证据会改变上次结论，请明确说“原结论需要修正”；否则说“原结论暂不改变”。
+- 证据不足就说不确定，不要硬判。
+- 不要编造来源。
+
+格式：
+追问结论：...
+补充依据：...
+是否改变原结论：...
+来源：列出实际用到的来源标题或站点，最多 3 个。
+"""
+    body, used_model = generate_with_fallback(
+        prompt=prompt,
+        models=main_models,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0.1,
+        max_output_tokens=640,
+        grounding=True,
+        request_timeout=request_timeout,
+    )
+    reply = extract_text(body).strip()
+    sources = extract_sources(body)
+    if sources and "来源" not in reply:
+        reply += "\n来源：" + "；".join(sources)
+    if used_model in LIGHTWEIGHT_MODELS and reply:
+        reply += "\n（主模型繁忙，已用轻量模型回答追问）"
+    if not reply:
+        return FactCheckResult(
+            FAILED_REPLY,
+            f"follow-up model returned empty reply; model={used_model}",
+            sources,
+            candidates,
+        )
+    return FactCheckResult(reply=reply, reason="ok; follow-up", sources=sources, candidates=candidates)
 
 
 def extract_claims_from_text(

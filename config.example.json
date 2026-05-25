@@ -18,6 +18,8 @@
   "fact_check_max_queue": 4,
   "fact_check_cache_ttl_seconds": 600,
   "fact_check_cache_max_entries": 32,
+  "fact_check_followup_ttl_seconds": 3600,
+  "fact_check_followup_max_sessions": 50,
   "fact_check_rate_limit_cooldown_seconds": 90,
   "fact_check_image_download_timeout_seconds": 10,
   "fact_check_pre_timeout_seconds": 35,
