@@ -26,6 +26,12 @@ FAILED_REPLY = "这条我现在没查成。"
 LIGHTWEIGHT_MODELS = {"gemini-3.1-flash-lite-preview"}
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+META_CLAIM_RE = re.compile(
+    r"(系统自动生成|无需核查|不需要核查|不用核查|无法核查|没有必要核查|"
+    r"此问题|该问题|这个问题|本问题|用户请求|机器人|bot|工具调用|"
+    r"事实核查命令|核查指令|不是事实断言|无事实断言)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -252,6 +258,7 @@ def extract_claims_from_text(
 - 半句话、转述、截图上下文，保留原话和必要背景。
 - 优先保留人名、地点、机构、时间、数据、事件、标题、引用。
 - 只有完全没有可查信息才输出 []。
+- 不要输出关于“是否需要核查”“系统自动生成”“工具/机器人提示”“用户请求事实核查”的元问题。
 
 只输出 JSON 数组：
 [
@@ -297,6 +304,7 @@ def extract_claims_from_images(
                 "请尽量 OCR 图中文字，包括标题、表格、聊天截图、社交媒体截图、水印、来源名。\n"
                 "如果图片是新闻、截图、谣言、通知、数据图、对话记录，通常至少整理出 1 个问题。\n"
                 "只有纯表情包、纯风景、完全看不清、或没有任何可查信息时才输出 []。\n"
+                "不要输出关于“是否需要核查”“系统自动生成”“工具/机器人提示”“用户请求事实核查”的元问题。\n"
                 "只输出 JSON 数组，格式："
                 '[{"question":"给大模型的核查问题","source":"图片OCR/图片含义/用户文字+图片","priority":1-5}]\n'
                 f"用户附带文字：{context_text or '无'}"
@@ -648,7 +656,7 @@ def parse_candidates(text: str, *, limit: int) -> list[ClaimCandidate]:
         else:
             continue
         claim = claim.strip().strip('"“”')
-        if not claim or NO_CHECKABLE_CLAIM in claim:
+        if not claim or NO_CHECKABLE_CLAIM in claim or _is_meta_claim(claim):
             continue
         key = re.sub(r"\s+", "", claim).lower()
         if key in seen:
@@ -658,6 +666,18 @@ def parse_candidates(text: str, *, limit: int) -> list[ClaimCandidate]:
         if len(candidates) >= limit:
             break
     return sorted(candidates, key=lambda x: x.priority, reverse=True)
+
+
+def _is_meta_claim(claim: str) -> bool:
+    """过滤前置模型误抽出的工具说明/核查流程本身。"""
+    normalized = re.sub(r"\s+", "", str(claim or "")).strip()
+    if not normalized:
+        return True
+    if META_CLAIM_RE.search(normalized):
+        return True
+    if normalized in {"请核查：是否属实？", "请核查是否属实？"}:
+        return True
+    return False
 
 
 def dedupe_candidates(candidates: list[ClaimCandidate], *, limit: int) -> list[ClaimCandidate]:
