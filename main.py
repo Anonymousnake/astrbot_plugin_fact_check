@@ -171,7 +171,7 @@ class FactCheckPlugin(Star):
                         or [
                             "gemini-3-flash-preview",
                             "gemini-2.5-flash",
-                            "gemini-3.1-flash-lite-preview",
+                            "gemini-3.1-flash-lite",
                         ],
                         request_timeout=int(self.config.get("fact_check_main_timeout_seconds") or 45),
                     ),
@@ -320,7 +320,7 @@ class FactCheckPlugin(Star):
                             )
                             or "https://generativelanguage.googleapis.com/v1beta/models",
                         ),
-                        pre_model=str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite-preview"),
+                        pre_model=str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite"),
                         main_models=[
                             str(model).strip()
                             for model in self.config.get("fact_check_main_models", [])
@@ -329,7 +329,7 @@ class FactCheckPlugin(Star):
                         or [
                             "gemini-3-flash-preview",
                             "gemini-2.5-flash",
-                            "gemini-3.1-flash-lite-preview",
+                            "gemini-3.1-flash-lite",
                         ],
                         max_image_bytes=int(self.config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024),
                         long_image_chunk_height=int(

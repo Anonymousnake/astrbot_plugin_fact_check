@@ -23,7 +23,7 @@ TRIGGER_RE = re.compile(
 )
 NO_CHECKABLE_CLAIM = "无明确事实断言"
 FAILED_REPLY = "这条我现在没查成。"
-LIGHTWEIGHT_MODELS = {"gemini-3.1-flash-lite-preview"}
+LIGHTWEIGHT_MODELS = {"gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview"}
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 META_CLAIM_RE = re.compile(
