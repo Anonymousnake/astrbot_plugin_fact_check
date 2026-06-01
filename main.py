@@ -880,6 +880,11 @@ class FactCheckPlugin(Star):
         text = "\n".join(part for part in quoted_texts if part).strip()
         if self._is_unusable_quoted_text(text):
             text = ""
+        if images and self._is_weak_image_caption_text(text):
+            logger.info(
+                f"[astrbot-fact-check-text-skip] weak image caption text={text!r}",
+            )
+            text = ""
         if inline_text:
             text = (text + "\n" + inline_text).strip() if text else inline_text
 
@@ -945,6 +950,33 @@ class FactCheckPlugin(Star):
             any(re.fullmatch(pattern, line, flags=re.IGNORECASE) for pattern in placeholder_patterns)
             for line in lines
         )
+
+    def _is_weak_image_caption_text(self, text: str | None) -> bool:
+        if not isinstance(text, str):
+            return False
+        cleaned = remove_trigger(text).strip()
+        if not cleaned:
+            return True
+        normalized = re.sub(r"[\s\u00a0\u200b\u200c\u200d:：，,。.!！?？/]+", "", cleaned)
+        if not normalized:
+            return True
+        placeholder_values = {
+            "图片",
+            "[图片]",
+            "图",
+            "截图",
+            "表情",
+            "[表情]",
+            "查看图片",
+            "请核查",
+            "事实核查",
+            "核查",
+        }
+        if normalized in placeholder_values:
+            return True
+        if len(normalized) <= 8 and re.fullmatch(r"[\[\]【】()（）A-Za-z0-9_\-]+", normalized):
+            return True
+        return False
 
     def _plain_texts(self, components: Iterable[object]) -> list[str]:
         texts: list[str] = []
