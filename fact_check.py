@@ -7,11 +7,13 @@ import os
 import random
 import re
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
+from zoneinfo import ZoneInfo
 
 import httpx
 from PIL import Image
@@ -32,6 +34,15 @@ META_CLAIM_RE = re.compile(
     r"事实核查命令|核查指令|不是事实断言|无事实断言)",
     re.IGNORECASE,
 )
+
+
+def current_time_context() -> str:
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    return (
+        f"当前日期时间：{now:%Y-%m-%d %H:%M:%S %Z}；"
+        f"今天是{now:%Y年%m月%d日}，星期{now.isoweekday()}；"
+        f"Unix时间戳：{int(now.timestamp())}。"
+    )
 
 
 @dataclass(slots=True)
@@ -188,6 +199,14 @@ def run_fact_check(
     )
     prompt = f"""你是一个中文事实核查助手。请使用 Google Search grounding 核查下面的聊天内容和核查问题列表。
 
+时间上下文：
+{current_time_context()}
+
+关键规则：
+- 所有“今天、昨天、明天、尚未发生、已经发布、即将发布”等时间判断，必须以上面的当前日期时间为准。
+- 如果图片、网页或搜索结果中出现发布日期/发布时间，必须先与当前日期比较；不要使用模型训练截止日期或内置知识作为当前时间。
+- 若声称某日期“尚未到来”，必须确认该日期确实晚于当前日期；否则不要这样判断。
+
 {speaker_line}{image_line}原始聊天内容：
 {request_data.text or "（无文字，主要来自图片）"}
 
@@ -265,6 +284,13 @@ def run_fact_check_followup(
     source_text = "\n".join(f"- {source}" for source in previous_sources[:5]) or "（上次未提取到来源）"
     prompt = f"""你是中文事实核查追问助手。用户正在追问上一轮事实核查结果。
 
+时间上下文：
+{current_time_context()}
+
+关键规则：
+- 所有时间判断必须以上面的当前日期时间为准。
+- 不要使用模型训练截止日期或内置知识作为当前时间。
+
 原始聊天内容：
 {original_text or "（无文字或主要来自图片）"}
 
@@ -330,6 +356,9 @@ def extract_claims_from_text(
 ) -> list[ClaimCandidate]:
     prompt = f"""你是事实核查的前置整理模块。
 
+时间上下文：
+{current_time_context()}
+
 任务：不要判断真伪。请把聊天内容整理成 0-{limit} 个适合交给联网核查模型的问题。
 
 规则：
@@ -379,6 +408,8 @@ def extract_claims_from_images(
         {
             "text": (
                 "你是事实核查的图片前置整理模块。\n"
+                f"时间上下文：{current_time_context()}\n"
+                "整理图片中的日期、发布时间、相对时间时，必须保留原文日期，并让后续联网核查模型按当前日期比较。\n"
                 "任务：先理解图片，再把图片内容整理成适合交给联网核查模型的问题。不要判断真伪。\n"
                 "请尽量 OCR 图中文字，包括标题、表格、聊天截图、社交媒体截图、水印、来源名。\n"
                 "如果图片是新闻、截图、谣言、通知、数据图、对话记录，通常至少整理出 1 个问题。\n"
