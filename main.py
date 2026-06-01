@@ -731,7 +731,17 @@ class FactCheckPlugin(Star):
     @staticmethod
     def _looks_like_fact_check_reply(text: str | None) -> bool:
         normalized = str(text or "")
-        return "事实核查" in normalized or "核查ID" in normalized or "追问可回复本消息" in normalized
+        if not normalized.strip():
+            return False
+        if FactCheckPlugin._is_fact_check_command_only(normalized):
+            return False
+        if "核查ID" in normalized or "追问可回复本消息" in normalized:
+            return True
+        if re.search(r"事实核查\s*(?:\d+\s*/\s*\d+)?\s*[:：]", normalized):
+            return True
+        if "事实核查" in normalized and any(marker in normalized for marker in ("要点：", "来源：", "总结论")):
+            return True
+        return False
 
     @staticmethod
     def _session_visible_to_event(session: FactCheckSession, event: AstrMessageEvent) -> bool:
@@ -939,6 +949,8 @@ class FactCheckPlugin(Star):
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         if not lines:
             return False
+        if all(self._is_fact_check_command_only(line) for line in lines):
+            return True
         placeholder_patterns = [
             r"^\[?(?:CQ:)?forward[,:\s].*id=\d+.*\]?$",
             r"^\[(?:合并转发|转发消息|forward message)[:：]?\d*\]$",
@@ -950,6 +962,20 @@ class FactCheckPlugin(Star):
             any(re.fullmatch(pattern, line, flags=re.IGNORECASE) for pattern in placeholder_patterns)
             for line in lines
         )
+
+    @staticmethod
+    def _is_fact_check_command_only(text: str | None) -> bool:
+        if not isinstance(text, str):
+            return False
+        cleaned = text.strip()
+        if not cleaned:
+            return False
+        cleaned = re.sub(r"\[?At[:：,][^\]]+\]?", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"@\S+", " ", cleaned)
+        cleaned = cleaned.strip(" \t\r\n:：，,。.!！?？")
+        if not cleaned:
+            return False
+        return bool(is_trigger(cleaned) and not remove_trigger(cleaned).strip())
 
     def _is_weak_image_caption_text(self, text: str | None) -> bool:
         if not isinstance(text, str):
