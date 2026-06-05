@@ -293,6 +293,7 @@ def run_fact_check(
     sources = dedupe_sources(extract_sources(body) + anysearch_evidence.sources, limit=5)
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(sources[:3])
+    reply = append_anysearch_source_note(reply, anysearch_evidence)
     if used_model in LIGHTWEIGHT_MODELS and reply:
         reply += "\n（主模型繁忙，已用轻量模型核查）"
     if not reply:
@@ -309,6 +310,20 @@ def run_fact_check(
         sources=sources,
         candidates=deduped,
     )
+
+
+def append_anysearch_source_note(reply: str, evidence: AnysearchEvidence) -> str:
+    sources = dedupe_sources(evidence.sources, limit=3)
+    if not sources:
+        return reply
+    compact_sources = "；".join(compact_source_label(source) for source in sources)
+    note = f"预检索线索：Anysearch 命中 {len(sources)} 个公开来源：{compact_sources}。"
+    text = str(reply or "").rstrip()
+    if not text:
+        return note
+    if "预检索线索：" in text:
+        return text
+    return f"{text}\n{note}"
 
 
 def run_fact_check_followup(
@@ -1118,6 +1133,26 @@ def dedupe_sources(sources: list[str], *, limit: int) -> list[str]:
         if len(deduped) >= limit:
             break
     return deduped
+
+
+def compact_source_label(source: str) -> str:
+    text = str(source or "").strip()
+    if not text:
+        return ""
+    url_text = text
+    if "：" in text:
+        _, possible_url = text.rsplit("：", 1)
+        if possible_url.strip().lower().startswith(("http://", "https://")):
+            url_text = possible_url.strip()
+    parsed = urlparse(url_text)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        host = parsed.hostname or parsed.netloc
+        if host.startswith("www."):
+            host = host[4:]
+        path_parts = [part for part in parsed.path.strip("/").split("/") if part][:2]
+        label = host + ("/" + "/".join(path_parts) if path_parts else "")
+        return shorten_text(label, 60).replace("\n", " ")
+    return shorten_text(re.sub(r"\s+", " ", text), 60).replace("\n", " ")
 
 
 def shorten_text(text: str, max_chars: int) -> str:

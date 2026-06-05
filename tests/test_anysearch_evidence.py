@@ -15,7 +15,9 @@ from fact_check import (
     AnysearchEvidence,
     ClaimCandidate,
     FactCheckRequest,
+    append_anysearch_source_note,
     build_anysearch_queries,
+    compact_source_label,
     collect_anysearch_evidence,
     extract_public_urls,
     is_public_http_url,
@@ -124,6 +126,32 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence.text, "")
         self.assertEqual(evidence.sources, [])
 
+    def test_append_anysearch_source_note_shows_compact_public_sources(self) -> None:
+        reply = append_anysearch_source_note(
+            "事实核查：大致可信",
+            AnysearchEvidence(
+                sources=[
+                    "https://www.iana.org/domains/reserved",
+                    "https://rfc2cn.com/rfc6761.html",
+                    "https://www.iana.org/domains/reserved",
+                ],
+            ),
+        )
+
+        self.assertIn("预检索线索：Anysearch 命中 2 个公开来源", reply)
+        self.assertIn("iana.org/domains/reserved", reply)
+        self.assertIn("rfc2cn.com/rfc6761.html", reply)
+
+    def test_compact_source_label_prefers_domain_and_short_path(self) -> None:
+        self.assertEqual(
+            compact_source_label("https://www.iana.org/domains/reserved/example/path"),
+            "iana.org/domains/reserved",
+        )
+        self.assertEqual(
+            compact_source_label("Example Title：https://example.com/a/b/c"),
+            "example.com/a/b",
+        )
+
     def test_run_fact_check_injects_anysearch_evidence_into_final_prompt(self) -> None:
         captured: dict[str, str] = {}
 
@@ -176,6 +204,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertIn("https://example.com/source", captured["prompt"])
         self.assertEqual(result.sources, ["https://example.com/source"])
         self.assertIn("事实核查：大致可信", result.reply)
+        self.assertIn("预检索线索：Anysearch 命中 1 个公开来源：example.com/source", result.reply)
 
     def test_run_fact_check_continues_when_anysearch_search_fails(self) -> None:
         captured: dict[str, str] = {}
