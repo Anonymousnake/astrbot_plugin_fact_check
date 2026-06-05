@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fact_check import (
     AnysearchEvidence,
@@ -172,6 +173,73 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertIn("https://example.com/source", captured["prompt"])
         self.assertEqual(result.sources, ["https://example.com/source"])
         self.assertIn("事实核查：大致可信", result.reply)
+
+    def test_run_fact_check_continues_when_anysearch_search_fails(self) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_generate_with_fallback(**kwargs):
+            captured["prompt"] = kwargs["prompt"]
+            return (
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": "事实核查：暂无法确认\n要点：搜索失败但主核查继续。"}]
+                            }
+                        }
+                    ]
+                },
+                "gemini-test",
+            )
+
+        with (
+            patch(
+                "fact_check.extract_claims_from_text",
+                return_value=[ClaimCandidate("请核查：A 事件是否属实？", "用户文字", 5)],
+            ),
+            patch("fact_check.anysearch_call_tool", side_effect=TimeoutError("simulated timeout")),
+            patch("fact_check.generate_with_fallback", side_effect=fake_generate_with_fallback),
+        ):
+            result = run_fact_check(
+                request_data=FactCheckRequest(text="A 事件是真的", trigger_text="/事实核查"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-pre",
+                main_models=["gemini-main"],
+                anysearch_enabled=True,
+            )
+
+        self.assertIn("事实核查：暂无法确认", result.reply)
+        self.assertEqual(result.sources, [])
+        self.assertNotIn("搜索摘要：", captured["prompt"])
+        self.assertNotIn("simulated timeout", captured["prompt"])
+
+    def test_request_cache_key_changes_when_anysearch_retrieval_config_changes(self) -> None:
+        from astrbot_plugin_fact_check.main import FactCheckPlugin
+
+        request = FactCheckRequest(text="A 事件是真的", trigger_text="/事实核查")
+        plugin = FactCheckPlugin.__new__(FactCheckPlugin)
+        plugin.config = {
+            "fact_check_anysearch_enabled": True,
+            "fact_check_anysearch_endpoint": "https://api.anysearch.com/mcp",
+            "fact_check_anysearch_timeout_seconds": 20,
+            "fact_check_anysearch_max_claims": 3,
+            "fact_check_anysearch_max_results_per_claim": 3,
+            "fact_check_anysearch_extract_top_urls": 2,
+            "fact_check_anysearch_max_chars": 6000,
+            "fact_check_anysearch_freshness": "",
+            "fact_check_anysearch_content_types": ["web", "news"],
+        }
+        original_key = plugin._request_cache_key(request)
+
+        plugin.config = dict(plugin.config)
+        plugin.config["fact_check_anysearch_content_types"] = ["news"]
+        self.assertNotEqual(original_key, plugin._request_cache_key(request))
+
+        plugin.config = dict(plugin.config)
+        plugin.config["fact_check_anysearch_content_types"] = ["web", "news"]
+        plugin.config["fact_check_anysearch_extract_top_urls"] = 0
+        self.assertNotEqual(original_key, plugin._request_cache_key(request))
 
 
 if __name__ == "__main__":

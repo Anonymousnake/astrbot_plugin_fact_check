@@ -21,6 +21,7 @@ temp/
 runtime/
 logs/
 *.log
+data/
 
 # Local databases and generated indexes
 *.db

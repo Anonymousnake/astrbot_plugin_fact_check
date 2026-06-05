@@ -651,6 +651,13 @@ class FactCheckPlugin(Star):
             logger.warning(f"[astrbot-fact-check-forward-failure-dump-error] {label}: {dump_exc!r}")
 
     def _request_cache_key(self, request_data: FactCheckRequest) -> str:
+        def cache_config_value(key: str, default):
+            value = self.config.get(key, None)
+            if value is None or value == "":
+                return default
+            return value
+
+        anysearch_api_key = str(self.config.get("fact_check_anysearch_api_key") or "").strip()
         payload = {
             "text": request_data.text.strip(),
             "speaker": request_data.speaker.strip(),
@@ -662,7 +669,27 @@ class FactCheckPlugin(Star):
                 }
                 for image in request_data.images
             ],
-            "anysearch_enabled": bool(self.config.get("fact_check_anysearch_enabled", False)),
+            "anysearch": {
+                "enabled": bool(self.config.get("fact_check_anysearch_enabled", False)),
+                "endpoint": str(
+                    self.config.get("fact_check_anysearch_endpoint") or "https://api.anysearch.com/mcp",
+                ).strip(),
+                "api_key_sha256": hashlib.sha256(anysearch_api_key.encode("utf-8")).hexdigest()
+                if anysearch_api_key
+                else "",
+                "timeout_seconds": str(cache_config_value("fact_check_anysearch_timeout_seconds", 20)),
+                "max_claims": str(cache_config_value("fact_check_anysearch_max_claims", 3)),
+                "max_results_per_claim": str(
+                    cache_config_value("fact_check_anysearch_max_results_per_claim", 3),
+                ),
+                "extract_top_urls": str(cache_config_value("fact_check_anysearch_extract_top_urls", 2)),
+                "max_chars": str(cache_config_value("fact_check_anysearch_max_chars", 6000)),
+                "freshness": str(self.config.get("fact_check_anysearch_freshness") or "").strip(),
+                "content_types": self._list_config(
+                    "fact_check_anysearch_content_types",
+                    ["web", "news"],
+                ),
+            },
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
