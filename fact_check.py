@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import ipaddress
 import json
 import os
 import random
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -27,7 +29,11 @@ NO_CHECKABLE_CLAIM = "无明确事实断言"
 FAILED_REPLY = "这条我现在没查成。"
 LIGHTWEIGHT_MODELS = {"gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview"}
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+ANYSEARCH_DEFAULT_ENDPOINT = "https://api.anysearch.com/mcp"
+ANYSEARCH_CONTENT_TYPES = {"web", "news", "doc", "academic", "data"}
+ANYSEARCH_FRESHNESS_VALUES = {"day", "week", "month", "year"}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+URL_RE = re.compile(r"(?:-\s*\*\*URL\*\*:\s*)?(https?://[^\s<>\]\)\"']+)", re.IGNORECASE)
 META_CLAIM_RE = re.compile(
     r"(系统自动生成|无需核查|不需要核查|不用核查|无法核查|没有必要核查|"
     r"此问题|该问题|这个问题|本问题|用户请求|机器人|bot|工具调用|"
@@ -75,6 +81,13 @@ class FactCheckResult:
     candidates: list[ClaimCandidate] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class AnysearchEvidence:
+    text: str = ""
+    sources: list[str] = field(default_factory=list)
+    reason: str = ""
+
+
 def is_trigger(text: str) -> bool:
     return bool(TRIGGER_RE.search(_normalize(text)))
 
@@ -120,6 +133,16 @@ def run_fact_check(
     image_download_timeout: int = 10,
     pre_request_timeout: int = 25,
     main_request_timeout: int = 45,
+    anysearch_enabled: bool = False,
+    anysearch_endpoint: str = ANYSEARCH_DEFAULT_ENDPOINT,
+    anysearch_api_key: str = "",
+    anysearch_timeout: int = 20,
+    anysearch_max_claims: int = 3,
+    anysearch_max_results_per_claim: int = 3,
+    anysearch_extract_top_urls: int = 2,
+    anysearch_max_chars: int = 6000,
+    anysearch_freshness: str = "",
+    anysearch_content_types: list[str] | None = None,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -182,6 +205,27 @@ def run_fact_check(
 
     deduped = dedupe_candidates(candidates, limit=3)
     candidate_text = format_candidates(deduped)
+    anysearch_evidence = collect_anysearch_evidence(
+        deduped,
+        enabled=anysearch_enabled,
+        endpoint=anysearch_endpoint,
+        api_key=anysearch_api_key,
+        timeout=anysearch_timeout,
+        max_claims=anysearch_max_claims,
+        max_results_per_claim=anysearch_max_results_per_claim,
+        extract_top_urls=anysearch_extract_top_urls,
+        max_chars=anysearch_max_chars,
+        freshness=anysearch_freshness,
+        content_types=anysearch_content_types,
+    )
+    if anysearch_evidence.reason:
+        print(f"[astrbot-fact-check-anysearch] {anysearch_evidence.reason}", flush=True)
+    evidence_block = (
+        "\nAnysearch 预检索证据（仅作线索，最终以可核验来源为准）：\n"
+        f"{anysearch_evidence.text}\n"
+        if anysearch_evidence.text
+        else ""
+    )
     speaker_line = f"发言人：{request_data.speaker}\n" if request_data.speaker else ""
     main_image_parts = build_inline_image_parts(
         request_data.images,
@@ -206,12 +250,15 @@ def run_fact_check(
 - 所有“今天、昨天、明天、尚未发生、已经发布、即将发布”等时间判断，必须以上面的当前日期时间为准。
 - 如果图片、网页或搜索结果中出现发布日期/发布时间，必须先与当前日期比较；不要使用模型训练截止日期或内置知识作为当前时间。
 - 若声称某日期“尚未到来”，必须确认该日期确实晚于当前日期；否则不要这样判断。
+- 如果提供了 Anysearch 预检索证据，它只是辅助线索；需要和 Google Search grounding、原始图片/文字一起交叉核对。
+- 若预检索摘要与更权威、更新时间更明确的来源冲突，优先依据权威来源，并说明不确定点。
 
 {speaker_line}{image_line}原始聊天内容：
 {request_data.text or "（无文字，主要来自图片）"}
 
 待核查问题：
 {candidate_text}
+{evidence_block}
 
 输出要求：
 - 中文，适合 QQ 群聊，简短但有用。
@@ -243,9 +290,9 @@ def run_fact_check(
     )
     print(f"[astrbot-fact-check-stage] main-check done model={used_model}", flush=True)
     reply = extract_text(body).strip()
-    sources = extract_sources(body)
+    sources = dedupe_sources(extract_sources(body) + anysearch_evidence.sources, limit=5)
     if sources and "来源" not in reply:
-        reply += "\n来源：" + "；".join(sources)
+        reply += "\n来源：" + "；".join(sources[:3])
     if used_model in LIGHTWEIGHT_MODELS and reply:
         reply += "\n（主模型繁忙，已用轻量模型核查）"
     if not reply:
@@ -809,6 +856,284 @@ def format_candidates(candidates: list[ClaimCandidate]) -> str:
         f"{index}. {item.claim}（来自：{item.source or 'unknown'}）"
         for index, item in enumerate(candidates, start=1)
     )
+
+
+def collect_anysearch_evidence(
+    candidates: list[ClaimCandidate],
+    *,
+    enabled: bool,
+    endpoint: str,
+    api_key: str,
+    timeout: int,
+    max_claims: int,
+    max_results_per_claim: int,
+    extract_top_urls: int,
+    max_chars: int,
+    freshness: str = "",
+    content_types: list[str] | None = None,
+) -> AnysearchEvidence:
+    if not enabled:
+        return AnysearchEvidence()
+    endpoint = (endpoint or ANYSEARCH_DEFAULT_ENDPOINT).strip()
+    if not endpoint:
+        return AnysearchEvidence(reason="disabled: empty endpoint")
+
+    query_payloads = build_anysearch_queries(
+        candidates,
+        max_claims=max_claims,
+        max_results_per_claim=max_results_per_claim,
+        freshness=freshness,
+        content_types=content_types,
+    )
+    if not query_payloads:
+        return AnysearchEvidence(reason="skipped: no search queries")
+
+    try:
+        if len(query_payloads) == 1:
+            search_text = anysearch_call_tool(
+                tool_name="search",
+                arguments=query_payloads[0],
+                endpoint=endpoint,
+                api_key=api_key,
+                timeout=timeout,
+            )
+        else:
+            search_text = anysearch_call_tool(
+                tool_name="batch_search",
+                arguments={"queries": query_payloads},
+                endpoint=endpoint,
+                api_key=api_key,
+                timeout=timeout,
+            )
+    except Exception as exc:
+        return AnysearchEvidence(reason=f"search failed: {error_label(exc)}")
+
+    urls = [url for url in extract_public_urls(search_text) if is_public_http_url(url)]
+    excerpts: list[str] = []
+    excerpt_sources: list[str] = []
+    for url in urls[: max(0, _clamp_int(extract_top_urls, default=2, lower=0, upper=5))]:
+        try:
+            extracted = anysearch_call_tool(
+                tool_name="extract",
+                arguments={"url": url},
+                endpoint=endpoint,
+                api_key=api_key,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            print(
+                f"[astrbot-fact-check-anysearch-extract-error] {shorten_text(url, 160)}: {error_label(exc)}",
+                flush=True,
+            )
+            continue
+        excerpt_sources.append(url)
+        excerpts.append(f"[{len(excerpts) + 1}] {url}\n{shorten_text(extracted, 1800)}")
+
+    sections = [f"搜索摘要：\n{shorten_text(search_text, 3600)}"]
+    if excerpts:
+        sections.append("网页正文摘录：\n" + "\n\n".join(excerpts))
+    evidence_text = shorten_text("\n\n".join(sections), _clamp_int(max_chars, default=6000, lower=1000, upper=12000))
+    sources = dedupe_sources(excerpt_sources + urls, limit=8)
+    return AnysearchEvidence(
+        text=evidence_text,
+        sources=sources,
+        reason=f"ok; queries={len(query_payloads)} urls={len(urls)} extracts={len(excerpts)}",
+    )
+
+
+def build_anysearch_queries(
+    candidates: list[ClaimCandidate],
+    *,
+    max_claims: int,
+    max_results_per_claim: int,
+    freshness: str = "",
+    content_types: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    max_claims = _clamp_int(max_claims, default=3, lower=1, upper=5)
+    max_results = _clamp_int(max_results_per_claim, default=3, lower=1, upper=10)
+    if isinstance(content_types, str):
+        raw_content_types = [item.strip() for item in content_types.split(",")]
+    else:
+        raw_content_types = content_types or ["web", "news"]
+    normalized_content_types = [
+        item
+        for item in raw_content_types
+        if str(item or "").strip() in ANYSEARCH_CONTENT_TYPES
+    ]
+    normalized_freshness = freshness if freshness in ANYSEARCH_FRESHNESS_VALUES else ""
+
+    queries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates[:max_claims]:
+        query = normalize_anysearch_query(candidate.claim)
+        key = re.sub(r"\s+", "", query).lower()
+        if not query or key in seen:
+            continue
+        seen.add(key)
+        payload: dict[str, Any] = {"query": query, "max_results": max_results}
+        if normalized_freshness:
+            payload["freshness"] = normalized_freshness
+        if normalized_content_types:
+            payload["content_types"] = normalized_content_types
+        queries.append(payload)
+    return queries
+
+
+def normalize_anysearch_query(claim: str) -> str:
+    query = str(claim or "").strip()
+    query = re.sub(r"^请核查[:：]?\s*", "", query)
+    query = re.sub(r"是否属实[？?]?\s*$", "", query)
+    query = re.sub(r"\s+", " ", query).strip(" \t\r\n。！？?；;")
+    return query[:240]
+
+
+def anysearch_call_tool(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    endpoint: str,
+    api_key: str,
+    timeout: int,
+    max_retries: int = 1,
+) -> str:
+    endpoint = (endpoint or ANYSEARCH_DEFAULT_ENDPOINT).strip()
+    if not is_public_http_url(endpoint):
+        raise ValueError("Anysearch endpoint must be a public http(s) URL")
+    clean_api_key = (api_key or os.getenv("ANYSEARCH_API_KEY") or "").strip()
+    headers = {"Content-Type": "application/json"}
+    if clean_api_key:
+        headers["Authorization"] = f"Bearer {clean_api_key}"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    }
+    http_timeout = httpx.Timeout(
+        float(max(3, timeout)),
+        connect=min(6.0, float(max(3, timeout))),
+        read=float(max(3, timeout)),
+        write=6.0,
+    )
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            with httpx.Client(timeout=http_timeout, follow_redirects=True, trust_env=True) as client:
+                response = client.post(endpoint, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+            if "error" in data:
+                error = data["error"]
+                if isinstance(error, dict):
+                    message = error.get("message") or json.dumps(error, ensure_ascii=False)
+                else:
+                    message = str(error)
+                raise RuntimeError(f"Anysearch API error: {message}")
+            return extract_anysearch_text(data)
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            if not is_retryable(exc) or attempt >= max_retries:
+                raise
+        except (httpx.RequestError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                raise
+        wait = backoff_seconds(attempt, last_error or RuntimeError("Anysearch request failed"))
+        print(
+            "[astrbot-fact-check-anysearch-retry] "
+            f"attempt={attempt + 1}/{max_retries + 1} tool={tool_name} "
+            f"wait={wait:.1f}s error={error_label(last_error)}",
+            flush=True,
+        )
+        time.sleep(wait)
+    if last_error:
+        raise last_error
+    raise RuntimeError("Anysearch request failed without a specific error")
+
+
+def extract_anysearch_text(data: dict[str, Any]) -> str:
+    result = data.get("result") or {}
+    content = result.get("content") or []
+    if isinstance(content, list):
+        texts = [
+            str(item.get("text") or "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        if texts:
+            return "\n".join(text for text in texts if text).strip()
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def extract_public_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    for match in URL_RE.finditer(str(text or "")):
+        url = normalize_url(match.group(1))
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def normalize_url(url: str) -> str:
+    return str(url or "").strip().rstrip(".,;:，。；：!?！？)]}>\"'")
+
+
+def is_public_http_url(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    if host.lower() in {"localhost", "localhost.localdomain"}:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def dedupe_sources(sources: list[str], *, limit: int) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        item = str(source or "").strip()
+        if not item:
+            continue
+        key = re.sub(r"\s+", "", item).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def shorten_text(text: str, max_chars: int) -> str:
+    text = str(text or "").strip()
+    max_chars = max(0, int(max_chars or 0))
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 20)].rstrip() + "\n...（已截断）"
+
+
+def _clamp_int(value: Any, *, default: int, lower: int, upper: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(lower, min(number, upper))
 
 
 def extract_text(body: dict[str, Any]) -> str:

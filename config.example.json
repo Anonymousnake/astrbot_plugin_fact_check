@@ -24,5 +24,18 @@
   "fact_check_image_download_timeout_seconds": 10,
   "fact_check_pre_timeout_seconds": 35,
   "fact_check_main_timeout_seconds": 70,
+  "fact_check_anysearch_enabled": false,
+  "fact_check_anysearch_endpoint": "https://api.anysearch.com/mcp",
+  "fact_check_anysearch_api_key": "",
+  "fact_check_anysearch_timeout_seconds": 20,
+  "fact_check_anysearch_max_claims": 3,
+  "fact_check_anysearch_max_results_per_claim": 3,
+  "fact_check_anysearch_extract_top_urls": 2,
+  "fact_check_anysearch_max_chars": 6000,
+  "fact_check_anysearch_freshness": "",
+  "fact_check_anysearch_content_types": [
+    "web",
+    "news"
+  ],
   "fact_check_show_failure_reason": true
 }

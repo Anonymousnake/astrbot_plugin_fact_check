@@ -350,6 +350,38 @@ class FactCheckPlugin(Star):
                         main_request_timeout=int(
                             self.config.get("fact_check_main_timeout_seconds") or 45,
                         ),
+                        anysearch_enabled=bool(
+                            self.config.get("fact_check_anysearch_enabled", False),
+                        ),
+                        anysearch_endpoint=str(
+                            self.config.get("fact_check_anysearch_endpoint")
+                            or "https://api.anysearch.com/mcp",
+                        ),
+                        anysearch_api_key=str(
+                            self.config.get("fact_check_anysearch_api_key") or "",
+                        ),
+                        anysearch_timeout=int(
+                            self.config.get("fact_check_anysearch_timeout_seconds") or 20,
+                        ),
+                        anysearch_max_claims=int(
+                            self.config.get("fact_check_anysearch_max_claims") or 3,
+                        ),
+                        anysearch_max_results_per_claim=int(
+                            self.config.get("fact_check_anysearch_max_results_per_claim") or 3,
+                        ),
+                        anysearch_extract_top_urls=int(
+                            self.config.get("fact_check_anysearch_extract_top_urls") or 2,
+                        ),
+                        anysearch_max_chars=int(
+                            self.config.get("fact_check_anysearch_max_chars") or 6000,
+                        ),
+                        anysearch_freshness=str(
+                            self.config.get("fact_check_anysearch_freshness") or "",
+                        ),
+                        anysearch_content_types=self._list_config(
+                            "fact_check_anysearch_content_types",
+                            ["web", "news"],
+                        ),
                     ),
                     timeout=timeout_seconds,
                 )
@@ -630,6 +662,7 @@ class FactCheckPlugin(Star):
                 }
                 for image in request_data.images
             ],
+            "anysearch_enabled": bool(self.config.get("fact_check_anysearch_enabled", False)),
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -1051,6 +1084,17 @@ class FactCheckPlugin(Star):
         if group_id:
             return f"group:{group_id}:user:{user_id}"
         return f"private:{user_id}"
+
+    def _list_config(self, key: str, default: list[str]) -> list[str]:
+        value = self.config.get(key, default)
+        if isinstance(value, str):
+            items = value.split(",")
+        else:
+            try:
+                items = list(value)
+            except TypeError:
+                items = list(default)
+        return [str(item).strip() for item in items if str(item).strip()]
 
     def _short_ref(self, value: str, limit: int = 120) -> str:
         value = str(value or "").replace("\n", " ").strip()
