@@ -7,6 +7,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+for astrbot_root in (Path("D:/Codex/AstrBot"), Path("/home/ubuntu/AstrBot")):
+    if astrbot_root.exists():
+        sys.path.insert(0, str(astrbot_root))
 
 from fact_check import (
     AnysearchEvidence,
