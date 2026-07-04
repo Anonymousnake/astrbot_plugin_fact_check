@@ -20,6 +20,7 @@ from fact_check import (
     compact_source_label,
     collect_anysearch_evidence,
     extract_public_urls,
+    extract_claims_from_text,
     is_public_http_url,
     normalize_anysearch_query,
     run_fact_check,
@@ -205,6 +206,99 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertEqual(result.sources, ["https://example.com/source"])
         self.assertIn("事实核查：大致可信", result.reply)
         self.assertIn("预检索线索：Anysearch 命中 1 个公开来源：example.com/source", result.reply)
+
+    def test_extraction_prompt_splits_high_risk_composite_claims(self) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_generate_with_fallback(**kwargs):
+            captured["prompt"] = kwargs["prompt"]
+            return (
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "text": """
+                                        [
+                                          {"question":"请核查：《人工智能拟人化互动服务管理暂行办法》是否存在及其生效时间是否属实？","source":"用户文字","priority":5},
+                                          {"question":"请核查：该办法是否明确禁止亲密陪伴 AI 与性互硬件销售？","source":"用户文字","priority":5}
+                                        ]
+                                        """
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                "gemini-test",
+            )
+
+        with patch("fact_check.generate_with_fallback", side_effect=fake_generate_with_fallback):
+            claims = extract_claims_from_text(
+                "网传《人工智能拟人化互动服务管理暂行办法》将实施，亲密陪伴 AI 和性互硬件以后不能卖。",
+                model="gemini-pre",
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+            )
+
+        self.assertIn("高风险复合命题要拆成 atomic claims", captured["prompt"])
+        self.assertIn("至少拆成两个问题", captured["prompt"])
+        self.assertGreaterEqual(len(claims), 2)
+        self.assertTrue(any("是否存在" in claim.claim for claim in claims))
+        self.assertTrue(any("是否明确禁止" in claim.claim for claim in claims))
+
+    def test_main_prompt_calibrates_partial_support_for_regulation_claims(self) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_generate_with_fallback(**kwargs):
+            captured["prompt"] = kwargs["prompt"]
+            return (
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "text": (
+                                            "事实核查：部分存疑\n"
+                                            "要点：1. 已证实：法规存在。"
+                                            "2. 未直接证实：未找到直接证据支持该具体推论。"
+                                        )
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                "gemini-test",
+            )
+
+        with (
+            patch(
+                "fact_check.extract_claims_from_text",
+                return_value=[
+                    ClaimCandidate("请核查：《人工智能拟人化互动服务管理暂行办法》是否存在及其生效时间是否属实？", "用户文字", 5),
+                    ClaimCandidate("请核查：该办法是否明确禁止亲密陪伴 AI 与性互硬件销售？", "用户文字", 5),
+                ],
+            ),
+            patch("fact_check.generate_with_fallback", side_effect=fake_generate_with_fallback),
+        ):
+            result = run_fact_check(
+                request_data=FactCheckRequest(
+                    text="网传《人工智能拟人化互动服务管理暂行办法》将实施，亲密陪伴 AI 和性互硬件以后不能卖。",
+                    trigger_text="/事实核查",
+                ),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-pre",
+                main_models=["gemini-main"],
+            )
+
+        self.assertIn("整体结论最高为“部分存疑”", captured["prompt"])
+        self.assertIn("不要因为任一子事实成立就把整体判成“大致可信”", captured["prompt"])
+        self.assertIn("已证实 / 未直接证实 / 存疑", captured["prompt"])
+        self.assertIn("事实核查：部分存疑", result.reply)
 
     def test_run_fact_check_continues_when_anysearch_search_fails(self) -> None:
         captured: dict[str, str] = {}
