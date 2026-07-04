@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import re
 import sys
@@ -9,16 +10,18 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image, Node, Nodes, Plain, Reply
+from astrbot.api.message_components import Forward, Image, Node, Nodes, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.utils.quoted_message.extractor import (
     extract_quoted_message_images,
     extract_quoted_message_text,
 )
+from astrbot.core.utils.quoted_message.chain_parser import OneBotPayloadParser
+from astrbot.core.utils.quoted_message.onebot_client import OneBotClient
 from astrbot.core.star.filter.custom_filter import CustomFilter
 
 from .fact_check import (
@@ -917,11 +920,15 @@ class FactCheckPlugin(Star):
                 speaker = str(comp.sender_nickname or comp.sender_id or "").strip()
                 before_text_count = len(quoted_texts)
                 before_image_count = len(images)
+                local_forward_ids: list[str] = []
                 local_texts: list[str] = []
                 if comp.message_str:
-                    local_texts.append(str(comp.message_str).strip())
+                    comp_text = str(comp.message_str).strip()
+                    local_texts.append(comp_text)
+                    local_forward_ids.extend(self._extract_forward_ids_from_text(comp_text))
                 if comp.chain:
                     local_texts.extend(self._plain_texts(comp.chain))
+                    local_forward_ids.extend(self._extract_forward_ids_from_components(comp.chain))
                     images.extend(await self._image_inputs(comp.chain, remaining=max_images - len(images)))
                 local_text = "\n".join(part for part in local_texts if part).strip()
                 if local_text and not self._is_unusable_quoted_text(local_text):
@@ -941,6 +948,38 @@ class FactCheckPlugin(Star):
                             if fetched_text and fetched_text not in quoted_texts:
                                 quoted_texts.append(fetched_text)
                         images.extend(await self._image_inputs(fetched_images, remaining=max_images - len(images)))
+                if local_forward_ids:
+                    speaker = await self._append_forward_payloads(
+                        event,
+                        local_forward_ids,
+                        quoted_texts=quoted_texts,
+                        images=images,
+                        max_images=max_images,
+                        speaker=speaker,
+                        label=f"reply:{getattr(comp, 'id', '')}",
+                    )
+            elif isinstance(comp, Forward):
+                speaker = await self._append_forward_payloads(
+                    event,
+                    [str(getattr(comp, "id", "") or "")],
+                    quoted_texts=quoted_texts,
+                    images=images,
+                    max_images=max_images,
+                    speaker=speaker,
+                    label="direct",
+                )
+            elif isinstance(comp, Plain):
+                forward_ids = self._extract_forward_ids_from_text(str(comp.text or ""))
+                if forward_ids:
+                    speaker = await self._append_forward_payloads(
+                        event,
+                        forward_ids,
+                        quoted_texts=quoted_texts,
+                        images=images,
+                        max_images=max_images,
+                        speaker=speaker,
+                        label="plain",
+                    )
             elif isinstance(comp, Image):
                 images.extend(await self._image_inputs([comp], remaining=max_images - len(images)))
 
@@ -955,7 +994,7 @@ class FactCheckPlugin(Star):
                 f"[astrbot-fact-check-text-skip] weak image caption text={text!r}",
             )
             text = ""
-        if inline_text:
+        if inline_text and not self._is_unusable_quoted_text(inline_text):
             text = (text + "\n" + inline_text).strip() if text else inline_text
 
         return FactCheckRequest(
@@ -1003,6 +1042,213 @@ class FactCheckPlugin(Star):
             return None
         return texts, images, ""
 
+    async def _append_forward_payloads(
+        self,
+        event: AstrMessageEvent,
+        forward_ids: Iterable[str],
+        *,
+        quoted_texts: list[str],
+        images: list[ImageInput],
+        max_images: int,
+        speaker: str,
+        label: str,
+    ) -> str:
+        fetched = await self._fetch_forward_payloads(event, forward_ids, label=label)
+        if not fetched:
+            return speaker
+        fetched_texts, fetched_images, fetched_speaker = fetched
+        if fetched_speaker and not speaker:
+            speaker = fetched_speaker
+        for fetched_text in fetched_texts:
+            if fetched_text and fetched_text not in quoted_texts:
+                quoted_texts.append(fetched_text)
+        images.extend(await self._image_inputs(fetched_images, remaining=max_images - len(images)))
+        return speaker
+
+    async def _fetch_forward_payloads(
+        self,
+        event: AstrMessageEvent,
+        forward_ids: Iterable[str],
+        *,
+        label: str,
+    ) -> tuple[list[str], list[Image], str] | None:
+        ids = self._dedupe_forward_ids(forward_ids)
+        if not ids:
+            return None
+
+        max_fetch = max(1, min(8, int(self.config.get("fact_check_forward_max_fetch") or 3)))
+        parser = OneBotPayloadParser()
+        client = OneBotClient(event)
+        pending = list(ids)
+        seen: set[str] = set()
+        texts: list[str] = []
+        image_refs: list[str] = []
+        fetched_count = 0
+
+        while pending and fetched_count < max_fetch:
+            current_id = pending.pop(0)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            fetched_count += 1
+            try:
+                payload = await client.get_forward_msg(current_id)
+            except Exception as exc:
+                logger.warning(
+                    f"[astrbot-fact-check-forward-fetch-error] {label}: id={self._short_ref(current_id)} {exc!r}",
+                )
+                continue
+            if not payload:
+                logger.info(
+                    f"[astrbot-fact-check-forward-fetch-empty] {label}: id={self._short_ref(current_id)}",
+                )
+                continue
+            parsed = parser.parse_get_forward_payload(payload)
+            parsed_text = self._clean_forward_text(str(parsed.get("text") or ""))
+            if parsed_text:
+                texts.append(parsed_text)
+            for ref in parsed.get("image_refs") or []:
+                ref_text = str(ref or "").strip()
+                if ref_text:
+                    image_refs.append(ref_text)
+            for nested_id in parsed.get("forward_ids") or []:
+                nested_text = str(nested_id or "").strip()
+                if nested_text and nested_text not in seen:
+                    pending.append(nested_text)
+
+        if pending:
+            logger.info(
+                f"[astrbot-fact-check-forward-fetch-limit] {label}: "
+                f"fetched={fetched_count} remaining={len(pending)}",
+            )
+
+        images: list[Image] = []
+        for ref in self._dedupe_forward_ids(image_refs):
+            images.append(Image(file=ref, url=ref if ref.startswith(("http://", "https://")) else ""))
+        combined_text = "\n".join(texts).strip()
+        logger.info(
+            f"[astrbot-fact-check-forward-fetch] {label}: "
+            f"roots={len(ids)} fetched={fetched_count} text_len={len(combined_text)} images={len(images)}",
+        )
+        if not texts and not images:
+            return None
+        return texts, images, ""
+
+    def _extract_forward_ids_from_components(self, components: Iterable[object] | None) -> list[str]:
+        ids: list[str] = []
+        if not components:
+            return ids
+        for comp in components:
+            if isinstance(comp, Forward):
+                ids.append(str(getattr(comp, "id", "") or "").strip())
+            elif isinstance(comp, Plain):
+                ids.extend(self._extract_forward_ids_from_text(str(comp.text or "")))
+            elif isinstance(comp, Reply):
+                ids.extend(self._extract_forward_ids_from_text(str(comp.message_str or "")))
+                ids.extend(self._extract_forward_ids_from_components(getattr(comp, "chain", None)))
+            elif isinstance(comp, Node):
+                ids.extend(self._extract_forward_ids_from_components(getattr(comp, "content", None)))
+            elif isinstance(comp, Nodes):
+                for node in getattr(comp, "nodes", []) or []:
+                    ids.extend(self._extract_forward_ids_from_components(getattr(node, "content", None)))
+        return self._dedupe_forward_ids(ids)
+
+    def _extract_forward_ids_from_text(self, text: str | None) -> list[str]:
+        if not isinstance(text, str) or not text.strip():
+            return []
+        ids: list[str] = []
+        for match in re.finditer(r"\[CQ:forward,([^\]]+)\]", text, flags=re.IGNORECASE):
+            attrs = match.group(1)
+            ids.extend(
+                value.strip()
+                for value in re.findall(
+                    r"(?:^|,)(?:id|message_id|resid|m_resid|fileid|fid)=([^,\]\s]+)",
+                    attrs,
+                    flags=re.IGNORECASE,
+                )
+                if value.strip()
+            )
+        ids.extend(self._extract_multimsg_forward_ids(text))
+        return self._dedupe_forward_ids(ids)
+
+    def _extract_multimsg_forward_ids(self, text: str) -> list[str]:
+        decoded = html.unescape(str(text or "")).replace("&#44;", ",")
+        if "com.tencent.multimsg" not in decoded and "resid" not in decoded:
+            return []
+
+        ids: list[str] = []
+        decoder = json.JSONDecoder()
+        start = decoded.find("{")
+        while start >= 0:
+            try:
+                value, end = decoder.raw_decode(decoded[start:])
+            except json.JSONDecodeError:
+                start = decoded.find("{", start + 1)
+                continue
+            if self._looks_like_multimsg_payload(value):
+                ids.extend(self._walk_multimsg_forward_ids(value))
+            start = decoded.find("{", start + max(end, 1))
+
+        if not ids:
+            ids.extend(
+                value.strip()
+                for value in re.findall(
+                    r'"(?:resid|m_resid|forward_id|fileid|fid)"\s*:\s*"([^"]+)"',
+                    decoded,
+                    flags=re.IGNORECASE,
+                )
+                if value.strip()
+            )
+        return self._dedupe_forward_ids(ids)
+
+    def _looks_like_multimsg_payload(self, value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        if value.get("app") == "com.tencent.multimsg":
+            return True
+        config = value.get("config")
+        if isinstance(config, dict) and str(config.get("forward") or "") == "1":
+            return True
+        prompt = str(value.get("prompt") or value.get("desc") or "")
+        return "聊天记录" in prompt or "合并转发" in prompt
+
+    def _walk_multimsg_forward_ids(self, value: Any) -> list[str]:
+        ids: list[str] = []
+        if isinstance(value, dict):
+            for key, item in value.items():
+                lowered = str(key).lower()
+                if lowered in {"resid", "m_resid", "forward_id", "fileid", "fid"}:
+                    item_text = str(item or "").strip()
+                    if item_text:
+                        ids.append(item_text)
+                else:
+                    ids.extend(self._walk_multimsg_forward_ids(item))
+        elif isinstance(value, list):
+            for item in value:
+                ids.extend(self._walk_multimsg_forward_ids(item))
+        return self._dedupe_forward_ids(ids)
+
+    @staticmethod
+    def _dedupe_forward_ids(values: Iterable[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = str(value or "").strip().strip("\"'")
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            deduped.append(text)
+        return deduped
+
+    @staticmethod
+    def _clean_forward_text(text: str) -> str:
+        lines: list[str] = []
+        for line in str(text or "").splitlines():
+            cleaned = re.sub(r"\[(?:Image|Forward Message|Video)\]", " ", line, flags=re.IGNORECASE).strip()
+            if cleaned:
+                lines.append(cleaned)
+        return "\n".join(lines).strip()
+
     def _is_unusable_quoted_text(self, text: str | None) -> bool:
         if not isinstance(text, str):
             return False
@@ -1012,7 +1258,8 @@ class FactCheckPlugin(Star):
         if all(self._is_fact_check_command_only(line) for line in lines):
             return True
         placeholder_patterns = [
-            r"^\[?(?:CQ:)?forward[,:\s].*id=\d+.*\]?$",
+            r"^\[?(?:CQ:)?forward[,:\s].*(?:id|resid|m_resid|fileid|fid)=[^,\]\s]+.*\]?$",
+            r"^\[CQ:json,.*com\.tencent\.multimsg.*\]$",
             r"^\[(?:合并转发|转发消息|forward message)[:：]?\d*\]$",
             r"^\[引用消息\]$",
             r"^\[Forward Message\]$",

@@ -103,6 +103,12 @@
     "description": "Timeout seconds for downloading each QQ image",
     "default": 10
   },
+  "fact_check_forward_max_fetch": {
+    "type": "int",
+    "description": "Max merged-forward payloads to expand from a quoted/direct QQ chat-record card",
+    "hint": "Includes nested forward ids. Keep small so one deep chat record cannot stall the command.",
+    "default": 3
+  },
   "fact_check_pre_timeout_seconds": {
     "type": "int",
     "description": "Timeout seconds for claim extraction requests",
