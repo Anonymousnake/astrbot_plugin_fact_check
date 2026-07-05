@@ -15,6 +15,7 @@ from fact_check import (
     AnysearchEvidence,
     ClaimCandidate,
     FactCheckRequest,
+    ImageInput,
     append_anysearch_source_note,
     build_anysearch_queries,
     compact_source_label,
@@ -25,6 +26,7 @@ from fact_check import (
     is_public_http_url,
     normalize_anysearch_query,
     run_fact_check,
+    read_image_input_bytes,
     sanitize_anysearch_evidence_text,
     sanitize_fact_check_reply,
 )
@@ -299,8 +301,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
             )
 
         self.assertIn("整体结论最高为“部分存疑”", captured["prompt"])
-        self.assertIn("不要因为任一子事实成立就把整体判成“大致可信”", captured["prompt"])
-        self.assertIn("已证实 / 未直接证实 / 存疑", captured["prompt"])
+        self.assertIn("不要因为任一子事实成立就把整体判成“可信”或“基本可信但需限定”", captured["prompt"])
+        self.assertIn("已核实 / 条件性成立 / 表述需限定", captured["prompt"])
+        self.assertNotIn("已证实 / 未直接证实 / 存疑", captured["prompt"])
         self.assertIn("事实核查：部分存疑", result.reply)
 
     def test_run_fact_check_continues_when_anysearch_search_fails(self) -> None:
@@ -404,6 +407,42 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertNotIn("结论：已证实", cleaned)
         self.assertIn("事实核查：条件性成立", cleaned)
         self.assertIn("结论：条件性成立", cleaned)
+
+    def test_sanitize_fact_check_reply_only_relabels_conditional_point(self) -> None:
+        reply = (
+            "事实核查：混合结论\n"
+            "1. 核查点：相关法规已经发布。\n"
+            "结论：已核实。\n"
+            "依据：官方文件可以确认法规存在。\n"
+            "2. 核查点：私人飞机可以被视为符合绿色投资条件。\n"
+            "结论：已核实。\n"
+            "依据：只有满足技术筛选条件时才适用。"
+        )
+
+        cleaned = sanitize_fact_check_reply(reply)
+
+        self.assertIn("1. 核查点：相关法规已经发布。\n结论：已核实。", cleaned)
+        self.assertIn("2. 核查点：私人飞机可以被视为符合绿色投资条件。\n结论：条件性成立。", cleaned)
+
+    def test_sanitize_fact_check_reply_splits_inline_conclusion_label(self) -> None:
+        reply = (
+            "1. 核查点：私人飞机可以被视为符合绿色投资条件。 结论：已核实。 "
+            "依据：满足技术筛选条件才适用。"
+        )
+
+        cleaned = sanitize_fact_check_reply(reply)
+
+        self.assertIn("1. 核查点：私人飞机可以被视为符合绿色投资条件。\n结论：条件性成立。", cleaned)
+        self.assertIn("\n依据：满足技术筛选条件才适用。", cleaned)
+
+    def test_read_image_input_bytes_rejects_untrusted_url_schemes_without_network(self) -> None:
+        with self.assertRaises(ValueError):
+            read_image_input_bytes(ImageInput(url="base64://QUJD"), max_bytes=10, timeout=1)
+
+        with patch("fact_check.httpx.Client") as client:
+            with self.assertRaises(ValueError):
+                read_image_input_bytes(ImageInput(url="http://127.0.0.1/private.png"), max_bytes=10, timeout=1)
+        client.assert_not_called()
 
     def test_dedupe_candidates_merges_near_duplicate_wrapped_claims(self) -> None:
         candidates = [

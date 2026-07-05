@@ -15,6 +15,11 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Uses a lightweight Gemini model to turn text/images into checkable questions.
 - Optionally searches Anysearch for pre-retrieval evidence before the final grounded check.
 - Uses the configured main Gemini model fallback chain for the final fact-check.
+- Formats replies as plain QQ-friendly text with explicit per-point `结论：` lines.
+- Saves cache hits as full fact-check sessions, so replying to cached results still supports follow-up.
+- Falls back to segmented OneBot text when merged-forward sending fails.
+- Accepts images only from trusted local adapter paths or public HTTP(S) URLs; `file://`, `base64://`,
+  localhost, and private-network URLs are ignored as user-supplied URLs.
 - Falls back to `这条我现在没查成。` with an optional short reason when extraction or model calls fail.
 
 ## Configuration

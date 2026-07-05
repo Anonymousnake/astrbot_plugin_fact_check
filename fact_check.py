@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -47,13 +47,13 @@ HIGH_RISK_COMPOSITE_EXTRACTION_RULES = """\
   2. 请核查该法规/政策是否明确覆盖原文提到的具体产品、硬件、功能、销售行为或违法性结论？
 - 不要过度细拆普通事实；只有这类“基础事实 + 具体适用/推论”的高风险命题才强制拆分。"""
 HIGH_RISK_VERDICT_CALIBRATION_RULES = """\
-- 证据必须直接覆盖核心争议命题才可判“大致可信”；只证实外围事实或基础事实不够。
+- 证据必须直接覆盖核心争议命题才可判“可信”或“基本可信但需限定”；只证实外围事实或基础事实不够。
 - 对“法规/政策存在 + 具体产品、硬件、功能、销售、违法性推论”的复合命题，必须分别判断：
   1. 法规/政策是否真实存在、发布机构和生效时间是否属实；
   2. 条文、官方解释或权威报道是否直接说明原文中的具体对象/行为被覆盖。
 - 若来源只支持法规/政策存在，但没有直接支持具体适用推论，整体结论最高为“部分存疑”，并明确写“未找到直接证据支持该具体推论”。
-- 总结论按最关键争议命题决定，不要因为任一子事实成立就把整体判成“大致可信”。
-- 要点中尽量标出“已证实 / 未直接证实 / 存疑”。"""
+- 总结论按最关键争议命题决定，不要因为任一子事实成立就把整体判成“可信”或“基本可信但需限定”。
+- 要点中尽量标出“已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断”。"""
 CONDITIONAL_CLAIM_RE = re.compile(
     r"(可以被视为|可被视为|符合.+条件|满足.+条件|在满足.+条件下|"
     r"eligible|aligned|taxonomy[- ]?(?:compatible|eligible|aligned))",
@@ -287,7 +287,7 @@ def run_fact_check(
 - 每个核查点都必须单独写“结论：...”，子问题结论只能从这些标签中选择：已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断。
 - 如果原文是“可以被视为符合某条件”“在满足条件下适用”“eligible”“aligned”“taxonomy-compatible”这类条件性表述，不要写“已证实”；优先写“条件性成立”或“表述需限定”，并说明条件。
 - 证据不足就明确说不确定，不要硬判。
-- 对复合命题逐项写清“已证实 / 未直接证实 / 存疑”，不要只回答其中一个子事实。
+- 对复合命题逐项写清“已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断”，不要只回答其中一个子事实。
 - 不要编造来源。
 
 格式：
@@ -1247,6 +1247,7 @@ def sanitize_anysearch_evidence_text(text: str) -> str:
 def sanitize_fact_check_reply(text: str) -> str:
     cleaned = sanitize_anysearch_evidence_text(strip_thinking(text))
     cleaned = _split_inline_fact_check_points(cleaned)
+    cleaned = _break_inline_fact_check_labels(cleaned)
     cleaned = _normalize_conditional_verdict(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -1265,25 +1266,97 @@ def _split_inline_fact_check_points(text: str) -> str:
                     end = matches[index + 1].start() if index + 1 < len(matches) else len(points_text)
                     point = points_text[start:end].strip(" \t\r\n；;")
                     if point:
-                        lines.append(f"{match.group(1)}. 核查点：{point}")
+                        lines.extend(_format_inline_fact_check_point(match.group(1), point))
                 continue
         stripped = re.sub(r"^[-*]\s+", "", stripped)
         lines.append(stripped)
     return "\n".join(lines)
 
 
+def _format_inline_fact_check_point(number: str, point: str) -> list[str]:
+    point = str(point or "").strip()
+    verdict = re.match(
+        r"^(已证实|已核实|未直接证实|存疑|部分存疑|证据不足|不准确|基本不实|无法判断|条件性成立|表述需限定)[:：]\s*(.+)$",
+        point,
+    )
+    if not verdict:
+        return [f"{number}. 核查点：{point}"]
+    label = _normalize_verdict_label(verdict.group(1), verdict.group(2))
+    return [f"{number}. 核查点：{verdict.group(2).strip()}", f"结论：{label}"]
+
+
+def _normalize_verdict_label(label: str, context: str = "") -> str:
+    label = str(label or "").strip()
+    if label in {"已证实", "已核实"}:
+        return "条件性成立" if CONDITIONAL_CLAIM_RE.search(context or "") else "已核实"
+    if label == "未直接证实":
+        return "证据不足"
+    if label == "存疑":
+        return "部分存疑"
+    if label == "基本不实":
+        return "不准确"
+    return label
+
+
+def _break_inline_fact_check_labels(text: str) -> str:
+    lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        line = re.sub(
+            r"\s+(结论|依据|来源|补充依据|是否改变原结论)[:：]",
+            lambda match: "\n" + match.group(1) + "：",
+            line,
+        )
+        lines.extend(part.strip() for part in line.splitlines())
+    return "\n".join(lines)
+
+
 def _normalize_conditional_verdict(text: str) -> str:
     if not CONDITIONAL_CLAIM_RE.search(text or ""):
         return text
-    lines: list[str] = []
+    output: list[str] = []
+    block: list[str] = []
+
+    def normalize_line(line: str, *, conditional: bool) -> str:
+        if not conditional:
+            return line
+        stripped = line.strip()
+        if re.match(r"^事实核查[:：]\s*(已证实|已核实|大致可信|基本可信)(?=[\s，,。；;]|$)", stripped):
+            return re.sub(
+                r"(事实核查[:：]\s*)(已证实|已核实|大致可信|基本可信)",
+                r"\1条件性成立",
+                line,
+                count=1,
+            )
+        if re.match(r"^结论[:：]\s*(已证实|已核实|可信|大致可信)(?=[\s，,。；;]|$)", stripped):
+            return re.sub(
+                r"(结论[:：]\s*)(已证实|已核实|可信|大致可信)",
+                r"\1条件性成立",
+                line,
+                count=1,
+            )
+        return line
+
+    def flush_block() -> None:
+        if not block:
+            return
+        conditional = bool(CONDITIONAL_CLAIM_RE.search("\n".join(block)))
+        output.extend(normalize_line(line, conditional=conditional) for line in block)
+        block.clear()
+
+    text_has_condition = bool(CONDITIONAL_CLAIM_RE.search(text or ""))
     for line in str(text or "").splitlines():
         stripped = line.strip()
-        if re.match(r"^事实核查[:：]\s*(已证实|大致可信)\b", stripped):
-            line = re.sub(r"(事实核查[:：]\s*)(已证实|大致可信)", r"\1条件性成立", line, count=1)
-        elif re.match(r"^结论[:：]\s*(已证实|已核实)\b", stripped):
-            line = re.sub(r"(结论[:：]\s*)(已证实|已核实)", r"\1条件性成立", line, count=1)
-        lines.append(line)
-    return "\n".join(lines)
+        if re.match(r"^\d+\.\s*核查点[:：]", stripped):
+            flush_block()
+            block.append(line)
+            continue
+        if block:
+            block.append(line)
+            continue
+        output.append(normalize_line(line, conditional=text_has_condition))
+    flush_block()
+    return "\n".join(output)
 
 
 def extract_sources(body: dict[str, Any], limit: int = 3) -> list[str]:
@@ -1440,39 +1513,39 @@ def read_image_input_bytes(item: ImageInput, *, max_bytes: int | None, timeout: 
         if max_bytes is not None and size > max_bytes:
             raise ValueError(f"image too large: {size} bytes > limit {max_bytes}")
         return path.read_bytes(), guess_mime_type(item.file_name or path.name, "")
-    if url_value.startswith("file://"):
-        path = Path(url_value.removeprefix("file:///").removeprefix("file://"))
-        if not path.exists():
-            raise FileNotFoundError(f"local image not found: {path}")
-        size = path.stat().st_size
-        if max_bytes is not None and size > max_bytes:
-            raise ValueError(f"image too large: {size} bytes > limit {max_bytes}")
-        return path.read_bytes(), guess_mime_type(item.file_name or path.name, "")
-    if url_value.startswith("base64://"):
-        body = base64.b64decode(url_value.removeprefix("base64://"))
-        if max_bytes is not None and len(body) > max_bytes:
-            raise ValueError(f"image too large: {len(body)} bytes > limit {max_bytes}")
-        return body, guess_mime_type(item.file_name, "")
     if url_value:
+        if not is_public_http_url(url_value):
+            raise ValueError("image url must be public http(s)")
         return get_bytes_with_timeout(url_value, max_bytes=max_bytes, timeout=timeout)
     raise ValueError("empty image input")
 
 
 def get_bytes_with_timeout(url: str, *, max_bytes: int | None, timeout: int) -> tuple[bytes, str]:
+    if not is_public_http_url(url):
+        raise ValueError("image url must be public http(s)")
     http_timeout = httpx.Timeout(float(timeout), connect=min(5.0, float(timeout)), read=float(timeout), write=5.0)
-    with httpx.Client(timeout=http_timeout, follow_redirects=True, trust_env=True) as client:
-        with client.stream("GET", url, headers={"User-Agent": "AstrBot-QQ-Agent/0.1"}) as response:
-            response.raise_for_status()
-            content_length = response.headers.get("Content-Length", "")
-            if max_bytes is not None and content_length and int(content_length) > max_bytes:
-                raise ValueError(f"image too large: {content_length} bytes > limit {max_bytes}")
-            chunks: list[bytes] = []
-            size = 0
-            for chunk in response.iter_bytes():
-                if not chunk:
+    current_url = url
+    with httpx.Client(timeout=http_timeout, follow_redirects=False, trust_env=True) as client:
+        for _ in range(5):
+            if not is_public_http_url(current_url):
+                raise ValueError("image redirect target must be public http(s)")
+            response_cm = client.stream("GET", current_url, headers={"User-Agent": "AstrBot-QQ-Agent/0.1"})
+            with response_cm as response:
+                if 300 <= response.status_code < 400 and response.headers.get("Location"):
+                    current_url = urljoin(str(response.url), response.headers["Location"])
                     continue
-                size += len(chunk)
-                if max_bytes is not None and size > max_bytes:
-                    raise ValueError(f"image too large while downloading: {size} bytes > limit {max_bytes}")
-                chunks.append(chunk)
-            return b"".join(chunks), response.headers.get("Content-Type", "")
+                response.raise_for_status()
+                content_length = response.headers.get("Content-Length", "")
+                if max_bytes is not None and content_length and int(content_length) > max_bytes:
+                    raise ValueError(f"image too large: {content_length} bytes > limit {max_bytes}")
+                chunks: list[bytes] = []
+                size = 0
+                for chunk in response.iter_bytes():
+                    if not chunk:
+                        continue
+                    size += len(chunk)
+                    if max_bytes is not None and size > max_bytes:
+                        raise ValueError(f"image too large while downloading: {size} bytes > limit {max_bytes}")
+                    chunks.append(chunk)
+                return b"".join(chunks), response.headers.get("Content-Type", "")
+        raise ValueError("too many image redirects")

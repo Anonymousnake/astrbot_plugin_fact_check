@@ -30,6 +30,7 @@ from .fact_check import (
     FactCheckResult,
     ImageInput,
     explain_failure,
+    is_public_http_url,
     is_trigger,
     remove_trigger,
     run_fact_check,
@@ -116,7 +117,8 @@ class FactCheckPlugin(Star):
             max(1, int(self.config.get("fact_check_max_concurrent") or 1)),
         )
         self._fact_check_tasks: set[asyncio.Task] = set()
-        self._reply_cache: dict[str, tuple[float, str]] = {}
+        self._active_followup_jobs = 0
+        self._reply_cache: dict[str, tuple[float, FactCheckResult]] = {}
         self._fact_check_sessions: dict[str, FactCheckSession] = {}
         self._cooldown_until = 0.0
 
@@ -130,24 +132,42 @@ class FactCheckPlugin(Star):
         question = self._extract_followup_question(event)
         if not question:
             return
-        session = await self._find_followup_session(event)
+        session, missing_context = await self._find_followup_session_with_state(event)
         if not session:
+            if missing_context and self._is_fact_check_allowed(event):
+                event.set_extra("qq_agent_command_handled", True)
+                event.stop_event()
+                await event.send(
+                    event.plain_result("这条事实核查上下文已过期，请重新发送 /事实核查 再查一次。")
+                )
             return
         if not self._session_visible_to_event(session, event):
             return
-        if is_plugin_allowed is not None and not is_plugin_allowed(
-            "fact_check",
-            event,
-            default_allow=True,
-            default_allow_private=True,
-        ):
+        if not self._is_fact_check_allowed(event):
             return
 
         event.set_extra("qq_agent_command_handled", True)
         event.stop_event()
         label = self._event_label(event)
         started_at = time.perf_counter()
+        cooldown_left = self._cooldown_left()
+        if cooldown_left > 0:
+            logger.warning(
+                f"[astrbot-fact-check-followup-cooldown] {label}: "
+                f"left={cooldown_left:.1f}s session={session.session_id}",
+            )
+            await event.send(event.plain_result(f"Gemini 刚被限流，先冷却 {int(cooldown_left) + 1} 秒。"))
+            return
+        if self._fact_check_queue_full():
+            logger.warning(
+                f"[astrbot-fact-check-followup-queue-full] {label}: "
+                f"jobs={self._active_fact_check_jobs()} max={self._max_fact_check_queue()}",
+            )
+            await event.send(event.plain_result("事实核查队列满了，等前面的跑完再试一下。"))
+            return
+
         await event.send(event.plain_result("我接着查一下。"))
+        self._active_followup_jobs = max(0, int(getattr(self, "_active_followup_jobs", 0))) + 1
         try:
             async with self._fact_check_semaphore:
                 result = await asyncio.wait_for(
@@ -201,6 +221,8 @@ class FactCheckPlugin(Star):
                 purpose="followup-exception",
             )
             return
+        finally:
+            self._active_followup_jobs = max(0, int(getattr(self, "_active_followup_jobs", 0)) - 1)
 
         logger.info(
             f"[astrbot-fact-check-followup-done] {label}: "
@@ -226,31 +248,28 @@ class FactCheckPlugin(Star):
         started_at = time.perf_counter()
         event.set_extra("qq_agent_command_handled", True)
         event.stop_event()
-        if is_plugin_allowed is not None and not is_plugin_allowed(
-            "fact_check",
-            event,
-            default_allow=True,
-            default_allow_private=True,
-        ):
+        if not self._is_fact_check_allowed(event):
             yield event.plain_result("这个群没开事实核查。")
             return
 
         request_data = await self._build_fact_check_request(event, trigger_text=trigger_text)
         if not request_data.text and not request_data.images:
+            if self._is_fact_check_command_only(trigger_text):
+                yield event.plain_result(self._fact_check_usage_text())
+                return
             reason = "no quoted text or inline claim"
             logger.info(f"[astrbot-fact-check-reason] {self._event_label(event)}: {reason}")
             yield event.plain_result(self._failed_fact_check_reply(reason))
             return
 
         cache_key = self._request_cache_key(request_data)
-        cached_reply = self._get_cached_reply(cache_key)
-        if cached_reply:
+        cached_result = self._get_cached_result(cache_key)
+        if cached_result:
             logger.info(f"[astrbot-fact-check-cache-hit] {self._event_label(event)}: key={cache_key[:12]}")
-            cached_result = FactCheckResult(cached_reply, "ok; cache", [], [])
             session_id = self._remember_fact_check_session(event, request_data, cached_result)
             await self._send_fact_check_reply(
                 event,
-                cached_reply,
+                cached_result.reply or FAILED_REPLY,
                 label=self._event_label(event),
                 purpose="cache",
                 session_id=session_id,
@@ -266,11 +285,10 @@ class FactCheckPlugin(Star):
             yield event.plain_result(f"Gemini 刚被限流，先冷却 {int(cooldown_left) + 1} 秒。")
             return
 
-        max_queue = max(1, int(self.config.get("fact_check_max_queue") or 4))
-        if len(self._fact_check_tasks) >= max_queue:
+        if self._fact_check_queue_full():
             logger.warning(
                 f"[astrbot-fact-check-queue-full] {self._event_label(event)}: "
-                f"tasks={len(self._fact_check_tasks)} max={max_queue}",
+                f"jobs={self._active_fact_check_jobs()} max={self._max_fact_check_queue()}",
             )
             yield event.plain_result("事实核查队列满了，等前面的跑完再试一下。")
             return
@@ -408,7 +426,7 @@ class FactCheckPlugin(Star):
             f"[astrbot-fact-check-done] {label}: "
             f"{time.perf_counter() - started_at:.2f}s",
         )
-        self._set_cached_reply(cache_key, result.reply or FAILED_REPLY)
+        self._set_cached_result(cache_key, result)
         session_id = self._remember_fact_check_session(event, request_data, result)
         await self._send_fact_check_reply(
             event,
@@ -549,9 +567,11 @@ class FactCheckPlugin(Star):
             return False
 
         chunks = self._split_reply_text(text, max_chars=350 if group_id else 700)
+        next_index = 0
         for attempt in range(1, 4):
             try:
-                for index, chunk in enumerate(chunks, start=1):
+                for index in range(next_index, len(chunks)):
+                    chunk = chunks[index]
                     payload = {
                         target_key: int(target_value),
                         "message": [{"type": "text", "data": {"text": chunk}}],
@@ -559,7 +579,8 @@ class FactCheckPlugin(Star):
                     if action == "send_msg":
                         payload["message_type"] = "group"
                     await call_action(action, **payload)
-                    if index < len(chunks):
+                    next_index = index + 1
+                    if next_index < len(chunks):
                         await asyncio.sleep(1.0)
                 logger.info(
                     f"[astrbot-fact-check-send-ok] {label}: "
@@ -571,13 +592,13 @@ class FactCheckPlugin(Star):
                     logger.info(
                         f"[astrbot-fact-check-send-assume-ok] {label}: "
                         f"method=onebot action={action} chunks={len(chunks)} "
-                        f"attempt={attempt} error={exc!r}",
+                        f"sent={next_index} attempt={attempt} error={exc!r}",
                     )
                     return True
                 message = (
                     f"[astrbot-fact-check-send-error] {label}: "
                     f"method=onebot action={action} chunks={len(chunks)} "
-                    f"attempt={attempt}/3 error={exc!r}"
+                    f"sent={next_index} attempt={attempt}/3 error={exc!r}"
                 )
                 if suppress_errors:
                     logger.info(message)
@@ -713,6 +734,30 @@ class FactCheckPlugin(Star):
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+    def _is_fact_check_allowed(self, event: AstrMessageEvent) -> bool:
+        if is_plugin_allowed is None:
+            return True
+        return bool(
+            is_plugin_allowed(
+                "fact_check",
+                event,
+                default_allow=True,
+                default_allow_private=True,
+            )
+        )
+
+    def _max_fact_check_queue(self) -> int:
+        return max(1, int(self.config.get("fact_check_max_queue") or 4))
+
+    def _active_fact_check_jobs(self) -> int:
+        return len(getattr(self, "_fact_check_tasks", set()) or set()) + max(
+            0,
+            int(getattr(self, "_active_followup_jobs", 0)),
+        )
+
+    def _fact_check_queue_full(self) -> bool:
+        return self._active_fact_check_jobs() >= self._max_fact_check_queue()
+
     def _remember_fact_check_session(
         self,
         event: AstrMessageEvent,
@@ -765,6 +810,13 @@ class FactCheckPlugin(Star):
         return ""
 
     async def _find_followup_session(self, event: AstrMessageEvent) -> FactCheckSession | None:
+        session, _ = await self._find_followup_session_with_state(event)
+        return session
+
+    async def _find_followup_session_with_state(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[FactCheckSession | None, bool]:
         self._cleanup_fact_check_sessions()
         ids: list[str] = []
         quoted_looks_like_fact_check = False
@@ -787,18 +839,23 @@ class FactCheckPlugin(Star):
         for session_id in ids:
             session = self._fact_check_sessions.get(session_id)
             if session:
-                return session
+                return session, False
 
         # NapCat sometimes exposes a fact-check quote without the marker. Only then use latest session.
         if not quoted_looks_like_fact_check:
-            return None
+            return None, bool(ids)
         candidates = [
             session
             for session in self._fact_check_sessions.values()
             if self._session_visible_to_event(session, event)
         ]
         if not candidates:
-            return None
+            return None, True
+        latest = candidates[0]
+        for candidate in candidates[1:]:
+            if candidate.created_at > latest.created_at:
+                latest = candidate
+        return latest, False
         return max(candidates, key=lambda item: item.created_at)
 
     @staticmethod
@@ -829,7 +886,50 @@ class FactCheckPlugin(Star):
             return bool(group_id and group_id == session.group_id)
         return str(event.get_sender_id() or "").strip() == session.user_id
 
+    def _get_cached_result(self, cache_key: str) -> FactCheckResult | None:
+        ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))
+        if ttl <= 0:
+            return None
+        cached = self._reply_cache.get(cache_key)
+        if not cached:
+            return None
+        created_at, value = cached
+        if time.time() - created_at > ttl:
+            self._reply_cache.pop(cache_key, None)
+            return None
+        if isinstance(value, FactCheckResult):
+            return value
+        return FactCheckResult(str(value or FAILED_REPLY), "ok; cache", [], [])
+
+    def _set_cached_result(self, cache_key: str, result: FactCheckResult) -> None:
+        ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))
+        if ttl <= 0:
+            return
+        self._reply_cache[cache_key] = (
+            time.time(),
+            FactCheckResult(
+                reply=result.reply or FAILED_REPLY,
+                reason=result.reason or "ok; cache",
+                sources=list(result.sources or []),
+                candidates=list(result.candidates or []),
+            ),
+        )
+        max_entries = max(8, int(self.config.get("fact_check_cache_max_entries") or 32))
+        while len(self._reply_cache) > max_entries:
+            oldest_key = ""
+            oldest_at = float("inf")
+            for key, (created_at, _) in self._reply_cache.items():
+                if created_at < oldest_at:
+                    oldest_key = key
+                    oldest_at = created_at
+            if not oldest_key:
+                break
+            self._reply_cache.pop(oldest_key, None)
+
     def _get_cached_reply(self, cache_key: str) -> str:
+        result = self._get_cached_result(cache_key)
+        return result.reply if result else ""
+
         ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))
         if ttl <= 0:
             return ""
@@ -843,6 +943,9 @@ class FactCheckPlugin(Star):
         return reply
 
     def _set_cached_reply(self, cache_key: str, reply: str) -> None:
+        self._set_cached_result(cache_key, FactCheckResult(str(reply or FAILED_REPLY), "ok; cache", [], []))
+        return
+
         ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))
         if ttl <= 0:
             return
@@ -912,9 +1015,11 @@ class FactCheckPlugin(Star):
         """Show fact-check usage when the bare command is used."""
         event.set_extra("qq_agent_command_handled", True)
         event.stop_event()
-        yield event.plain_result(
-            "用法：回复一条消息后发送 /事实核查，或者直接发送 /事实核查 要核查的内容。"
-        )
+        yield event.plain_result(self._fact_check_usage_text())
+
+    @staticmethod
+    def _fact_check_usage_text() -> str:
+        return "用法：回复一条消息后发送 /事实核查，或者直接发送 /事实核查 要核查的内容。"
 
     async def _build_fact_check_request(
         self,
@@ -1355,8 +1460,15 @@ class FactCheckPlugin(Star):
                         f"[astrbot-fact-check-image-local-error] "
                         f"{self._short_ref(file_name or str(comp.url or ''))}: {exc!r}",
                     )
-            url = str(comp.url or comp.file or "").strip()
-            if not path and (not url or not url.startswith(("http://", "https://", "file://", "base64://"))):
+            url = str(comp.url or "").strip()
+            if not url and is_public_http_url(file_name):
+                url = file_name
+            if url and not is_public_http_url(url):
+                logger.warning(
+                    f"[astrbot-fact-check-image-skip] non-public url={self._short_ref(url)}",
+                )
+                url = ""
+            if not path and not url:
                 continue
             images.append(ImageInput(url=url, file_name=file_name, path=path))
             if len(images) >= remaining:
