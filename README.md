@@ -28,13 +28,13 @@ Managed by AstrBot WebUI through `_conf_schema.json`.
 - `fact_check_max_image_bytes`: max bytes per image download.
 - `fact_check_anysearch_enabled`: enable Anysearch pre-retrieval evidence.
 - `fact_check_anysearch_api_key`: optional Anysearch API key. Empty means anonymous access or `ANYSEARCH_API_KEY`.
-- `fact_check_anysearch_extract_top_urls`: number of public result pages to extract into Markdown snippets.
+- `fact_check_anysearch_extract_top_urls`: number of public result pages to extract into plain-text snippets.
 - `fact_check_show_failure_reason`: append a short friendly reason to failures.
 
 ## Anysearch evidence mode
 
 When `fact_check_anysearch_enabled` is true, the plugin sends extracted checkable claims to
-`fact_check_anysearch_endpoint` and injects returned search snippets plus a small number of public
+`fact_check_anysearch_endpoint` and injects cleaned search snippets plus a small number of public
 page excerpts into the final Gemini prompt. This supplements Gemini Google Search grounding; it does
 not replace the existing claim extraction, image handling, fallback, queue, cache, follow-up, or QQ
 forward-message output flow.

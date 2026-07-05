@@ -20,6 +20,7 @@ tmp/
 temp/
 runtime/
 logs/
+data/
 *.log
 data/
 

@@ -54,6 +54,11 @@ HIGH_RISK_VERDICT_CALIBRATION_RULES = """\
 - 若来源只支持法规/政策存在，但没有直接支持具体适用推论，整体结论最高为“部分存疑”，并明确写“未找到直接证据支持该具体推论”。
 - 总结论按最关键争议命题决定，不要因为任一子事实成立就把整体判成“大致可信”。
 - 要点中尽量标出“已证实 / 未直接证实 / 存疑”。"""
+CONDITIONAL_CLAIM_RE = re.compile(
+    r"(可以被视为|可被视为|符合.+条件|满足.+条件|在满足.+条件下|"
+    r"eligible|aligned|taxonomy[- ]?(?:compatible|eligible|aligned))",
+    re.IGNORECASE,
+)
 
 
 def current_time_context() -> str:
@@ -236,7 +241,7 @@ def run_fact_check(
         print(f"[astrbot-fact-check-anysearch] {anysearch_evidence.reason}", flush=True)
     evidence_block = (
         "\nAnysearch 预检索证据（仅作线索，最终以可核验来源为准）：\n"
-        f"{anysearch_evidence.text}\n"
+        f"{sanitize_anysearch_evidence_text(anysearch_evidence.text)}\n"
         if anysearch_evidence.text
         else ""
     )
@@ -277,15 +282,22 @@ def run_fact_check(
 
 输出要求：
 - 中文，适合 QQ 群聊，简短但有用。
-- 先给总结论：大致可信 / 部分存疑 / 基本不实 / 暂无可靠证据。
-- 再按 1/2/3 简短说明每个候选的核查结果和依据。
+- 不要使用 Markdown 粗体、Markdown 标题、代码块或裸列表符号。
+- 先给总结论，只能从这些标签中选择：可信 / 基本可信但需限定 / 条件性成立 / 混合结论 / 部分存疑 / 证据不足 / 基本不实 / 表述不准确。
+- 每个核查点都必须单独写“结论：...”，子问题结论只能从这些标签中选择：已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断。
+- 如果原文是“可以被视为符合某条件”“在满足条件下适用”“eligible”“aligned”“taxonomy-compatible”这类条件性表述，不要写“已证实”；优先写“条件性成立”或“表述需限定”，并说明条件。
 - 证据不足就明确说不确定，不要硬判。
 - 对复合命题逐项写清“已证实 / 未直接证实 / 存疑”，不要只回答其中一个子事实。
 - 不要编造来源。
 
 格式：
-事实核查：总结论
-要点：1. ... 2. ...
+事实核查：<总结论>
+1. 核查点：...
+结论：...
+依据：...
+2. 核查点：...
+结论：...
+依据：...
 来源：列出你实际用到的来源标题或站点，最多 3 个。
 """
     print(
@@ -305,7 +317,7 @@ def run_fact_check(
         request_timeout=main_request_timeout,
     )
     print(f"[astrbot-fact-check-stage] main-check done model={used_model}", flush=True)
-    reply = extract_text(body).strip()
+    reply = sanitize_fact_check_reply(extract_text(body).strip())
     sources = dedupe_sources(extract_sources(body) + anysearch_evidence.sources, limit=5)
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(sources[:3])
@@ -407,7 +419,7 @@ def run_fact_check_followup(
         grounding=True,
         request_timeout=request_timeout,
     )
-    reply = extract_text(body).strip()
+    reply = sanitize_fact_check_reply(extract_text(body).strip())
     sources = extract_sources(body)
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(sources)
@@ -550,7 +562,7 @@ def generate_with_fallback(
     clean_models = [model.strip() for model in models if str(model or "").strip()]
     if not clean_models:
         raise RuntimeError("no fact-check model configured")
-    attempts = max_attempts or max(1, min(4, len(clean_models) + 1))
+    attempts = max_attempts or max(1, min(3, len(clean_models)))
     last_error: Exception | None = None
     last_model = clean_models[0]
     for attempt in range(attempts):
@@ -874,14 +886,37 @@ def dedupe_candidates(candidates: list[ClaimCandidate], *, limit: int) -> list[C
     deduped: list[ClaimCandidate] = []
     seen: set[str] = set()
     for item in sorted(candidates, key=lambda x: x.priority, reverse=True):
-        key = re.sub(r"\s+", "", item.claim).lower()
-        if key in seen:
+        keys = _candidate_dedupe_keys(item.claim)
+        if any(key in seen for key in keys):
             continue
-        seen.add(key)
+        seen.update(keys)
         deduped.append(item)
         if len(deduped) >= limit:
             break
     return deduped
+
+
+def _candidate_dedupe_keys(claim: str) -> set[str]:
+    normalized = normalize_anysearch_query(claim)
+    compact = _compact_claim_key(normalized)
+    keys = {compact}
+    tokens = _claim_tokens(compact)
+    if tokens:
+        keys.add(" ".join(sorted(tokens)))
+    return {key for key in keys if key}
+
+
+def _compact_claim_key(text: str) -> str:
+    text = str(text or "").lower()
+    text = re.sub(r"(请核查|是否属实|是否准确|是否真实|是否正确|事实是否准确)", "", text)
+    text = re.sub(r"(可以被视为|可被视为|符合|条件|属实|准确|真实|正确)", "", text)
+    return re.sub(r"[\s\u00a0\u200b\u200c\u200d:：，,。.!！?？；;、/（）()《》“”\"'\-]+", "", text)
+
+
+def _claim_tokens(compact: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", compact, flags=re.IGNORECASE))
+    stopwords = {"请核查", "是否属实", "是否准确", "可以", "被视为", "符合", "条件"}
+    return {token for token in tokens if token not in stopwords}
 
 
 def format_candidates(candidates: list[ClaimCandidate]) -> str:
@@ -962,9 +997,9 @@ def collect_anysearch_evidence(
         excerpt_sources.append(url)
         excerpts.append(f"[{len(excerpts) + 1}] {url}\n{shorten_text(extracted, 1800)}")
 
-    sections = [f"搜索摘要：\n{shorten_text(search_text, 3600)}"]
+    sections = [f"搜索摘要：\n{shorten_text(sanitize_anysearch_evidence_text(search_text), 3600)}"]
     if excerpts:
-        sections.append("网页正文摘录：\n" + "\n\n".join(excerpts))
+        sections.append("网页正文摘录：\n" + sanitize_anysearch_evidence_text("\n\n".join(excerpts)))
     evidence_text = shorten_text("\n\n".join(sections), _clamp_int(max_chars, default=6000, lower=1000, upper=12000))
     sources = dedupe_sources(excerpt_sources + urls, limit=8)
     return AnysearchEvidence(
@@ -1197,6 +1232,60 @@ def extract_text(body: dict[str, Any]) -> str:
     return strip_thinking(text)
 
 
+def sanitize_anysearch_evidence_text(text: str) -> str:
+    cleaned_lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^\s*[-*]\s*\*\*URL\*\*\s*[:：]\s*", "URL：", line, flags=re.IGNORECASE)
+        line = re.sub(r"^\s*[-*]\s*\*\*([^*]+)\*\*\s*[:：]\s*", r"\1：", line)
+        line = line.replace("**", "")
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def sanitize_fact_check_reply(text: str) -> str:
+    cleaned = sanitize_anysearch_evidence_text(strip_thinking(text))
+    cleaned = _split_inline_fact_check_points(cleaned)
+    cleaned = _normalize_conditional_verdict(cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _split_inline_fact_check_points(text: str) -> str:
+    lines: list[str] = []
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("要点："):
+            points_text = stripped.split("：", 1)[1].strip()
+            matches = list(re.finditer(r"(\d+)\.\s*", points_text))
+            if matches:
+                for index, match in enumerate(matches):
+                    start = match.end()
+                    end = matches[index + 1].start() if index + 1 < len(matches) else len(points_text)
+                    point = points_text[start:end].strip(" \t\r\n；;")
+                    if point:
+                        lines.append(f"{match.group(1)}. 核查点：{point}")
+                continue
+        stripped = re.sub(r"^[-*]\s+", "", stripped)
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
+def _normalize_conditional_verdict(text: str) -> str:
+    if not CONDITIONAL_CLAIM_RE.search(text or ""):
+        return text
+    lines: list[str] = []
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if re.match(r"^事实核查[:：]\s*(已证实|大致可信)\b", stripped):
+            line = re.sub(r"(事实核查[:：]\s*)(已证实|大致可信)", r"\1条件性成立", line, count=1)
+        elif re.match(r"^结论[:：]\s*(已证实|已核实)\b", stripped):
+            line = re.sub(r"(结论[:：]\s*)(已证实|已核实)", r"\1条件性成立", line, count=1)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def extract_sources(body: dict[str, Any], limit: int = 3) -> list[str]:
     candidates = body.get("candidates", []) or []
     metadata = (candidates[0] if candidates else {}).get("groundingMetadata") or {}
@@ -1305,7 +1394,7 @@ def post_json_with_timeout(
     *,
     api_key: str,
     timeout: int,
-    max_retries: int = 2,
+    max_retries: int = 1,
 ) -> dict[str, Any]:
     http_timeout = httpx.Timeout(float(timeout), connect=min(8.0, float(timeout)), read=float(timeout), write=8.0)
     last_error: Exception | None = None

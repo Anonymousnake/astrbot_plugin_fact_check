@@ -19,11 +19,14 @@ from fact_check import (
     build_anysearch_queries,
     compact_source_label,
     collect_anysearch_evidence,
+    dedupe_candidates,
     extract_public_urls,
     extract_claims_from_text,
     is_public_http_url,
     normalize_anysearch_query,
     run_fact_check,
+    sanitize_anysearch_evidence_text,
+    sanitize_fact_check_reply,
 )
 
 
@@ -366,6 +369,53 @@ class AnysearchEvidenceTests(unittest.TestCase):
         plugin.config["fact_check_anysearch_content_types"] = ["web", "news"]
         plugin.config["fact_check_anysearch_extract_top_urls"] = 0
         self.assertNotEqual(original_key, plugin._request_cache_key(request))
+
+    def test_sanitize_anysearch_evidence_removes_markdown_url_labels(self) -> None:
+        text = "### Query\n- **URL**: https://example.com/a\n- **Title**: Example"
+
+        cleaned = sanitize_anysearch_evidence_text(text)
+
+        self.assertNotIn("**", cleaned)
+        self.assertNotIn("###", cleaned)
+        self.assertNotIn("- URL", cleaned)
+        self.assertIn("URL：https://example.com/a", cleaned)
+
+    def test_sanitize_fact_check_reply_splits_single_line_points(self) -> None:
+        reply = "事实核查：**大致可信**\n要点：1. A 有依据。2. B 证据不足。\n来源：Example"
+
+        cleaned = sanitize_fact_check_reply(reply)
+
+        self.assertNotIn("**", cleaned)
+        self.assertNotIn("要点：1.", cleaned)
+        self.assertIn("1. 核查点：A 有依据。", cleaned)
+        self.assertIn("\n2. 核查点：B 证据不足。", cleaned)
+
+    def test_sanitize_fact_check_reply_preserves_conditional_verdict(self) -> None:
+        reply = (
+            "事实核查：已证实，但需满足条件\n"
+            "1. 核查点：欧盟规则下私人飞机可以被视为符合绿色投资条件。\n"
+            "结论：已证实，因为有条件规则\n"
+            "依据：只有在满足特定排放和技术筛选条件时才适用。"
+        )
+
+        cleaned = sanitize_fact_check_reply(reply)
+
+        self.assertNotIn("事实核查：已证实", cleaned)
+        self.assertNotIn("结论：已证实", cleaned)
+        self.assertIn("事实核查：条件性成立", cleaned)
+        self.assertIn("结论：条件性成立", cleaned)
+
+    def test_dedupe_candidates_merges_near_duplicate_wrapped_claims(self) -> None:
+        candidates = [
+            ClaimCandidate("请核查：欧盟私人飞机可以被视为绿色投资是否属实？", "a", 5),
+            ClaimCandidate("欧盟私人飞机可被视为符合绿色投资条件是否准确？", "b", 4),
+            ClaimCandidate("请核查：另一条完全不同的事实是否属实？", "c", 3),
+        ]
+
+        deduped = dedupe_candidates(candidates, limit=3)
+
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(deduped[0].source, "a")
 
 
 if __name__ == "__main__":

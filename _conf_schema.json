@@ -153,7 +153,7 @@
   },
   "fact_check_anysearch_extract_top_urls": {
     "type": "int",
-    "description": "How many top public result URLs to extract into Markdown evidence",
+    "description": "How many top public result URLs to extract into cleaned plain-text evidence",
     "default": 2
   },
   "fact_check_anysearch_max_chars": {

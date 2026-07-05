@@ -214,25 +214,6 @@ class FactCheckPlugin(Star):
             session_id=session.session_id,
         )
 
-    @filter.command("事实核查转发测试")
-    async def fact_check_forward_test(self, event: AstrMessageEvent):
-        event.set_extra("qq_agent_command_handled", True)
-        event.stop_event()
-        label = self._event_label(event)
-        nodes = Nodes(
-            [
-                Node(uin=str(event.get_self_id() or "0"), name="事实核查测试", content=[Plain("合并转发测试 1/2")]),
-                Node(uin=str(event.get_self_id() or "0"), name="事实核查测试", content=[Plain("合并转发测试 2/2")]),
-            ],
-        )
-        logger.info(f"[astrbot-fact-check-forward-test] {label}: start")
-        try:
-            await event.send(event.chain_result([nodes]))
-            logger.info(f"[astrbot-fact-check-forward-test-ok] {label}")
-        except Exception as exc:
-            logger.error(f"[astrbot-fact-check-forward-test-failed] {label}: {exc!r}")
-            yield event.plain_result(f"合并转发测试失败：{exc!r}")
-
     @filter.custom_filter(FactCheckWakeFilter, priority=998_000)
     async def fact_check(self, event: AstrMessageEvent):
         """Run fact-checking when users say /事实核查, factcheck, or fact-check."""
@@ -265,7 +246,15 @@ class FactCheckPlugin(Star):
         cached_reply = self._get_cached_reply(cache_key)
         if cached_reply:
             logger.info(f"[astrbot-fact-check-cache-hit] {self._event_label(event)}: key={cache_key[:12]}")
-            await self._send_fact_check_reply(event, cached_reply, label=self._event_label(event), purpose="cache")
+            cached_result = FactCheckResult(cached_reply, "ok; cache", [], [])
+            session_id = self._remember_fact_check_session(event, request_data, cached_result)
+            await self._send_fact_check_reply(
+                event,
+                cached_reply,
+                label=self._event_label(event),
+                purpose="cache",
+                session_id=session_id,
+            )
             return
 
         cooldown_left = self._cooldown_left()
@@ -510,6 +499,24 @@ class FactCheckPlugin(Star):
                 f"method=event.send.forward retry kind={getattr(outcome, 'kind', None) or 'unknown'} error={exc!r}",
             )
             self._dump_forward_failure(label, text, exc)
+            fallback_text = self._fact_check_text_with_session_marker(safe_text, session_id=session_id)
+            if await self._send_text_via_onebot(
+                event,
+                fallback_text,
+                label=label,
+                prefer_send_msg=True,
+                suppress_errors=True,
+            ):
+                logger.info(f"[astrbot-fact-check-send-ok] {label}: method=onebot fallback")
+                return
+            try:
+                await event.send(event.plain_result(fallback_text))
+                logger.info(f"[astrbot-fact-check-send-ok] {label}: method=plain fallback")
+            except Exception as fallback_exc:
+                logger.error(
+                    f"[astrbot-fact-check-send-failed] {label}: "
+                    f"method=plain fallback error={fallback_exc!r}",
+                )
 
     async def _send_text_via_onebot(
 
@@ -633,6 +640,15 @@ class FactCheckPlugin(Star):
             f"lengths={[len(chunk) for chunk in chunks]}",
         )
         return event.chain_result([Nodes(nodes)])
+
+    @staticmethod
+    def _fact_check_text_with_session_marker(text: str, *, session_id: str | None) -> str:
+        text = str(text or FAILED_REPLY).strip() or FAILED_REPLY
+        if not session_id:
+            return text
+        if session_id in text:
+            return text
+        return (text.rstrip() + f"\n\n追问可回复本消息。核查ID：{session_id}").strip()
 
     def _dump_forward_failure(self, label: str, text: str, exc: Exception) -> None:
         try:
