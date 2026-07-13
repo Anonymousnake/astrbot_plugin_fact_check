@@ -178,6 +178,38 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.reply, "Fact check: evidence-model fallback.")
 
+    def test_grounded_evidence_is_used_when_gemini_3_returns_no_text(self) -> None:
+        evidence_response = {
+            "candidates": [{"content": {"parts": [{"text": "Fact check: grounded fallback."}]}}],
+        }
+        empty_verdict = {"candidates": [{"content": {"parts": []}}]}
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("Check the claim.")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                side_effect=[
+                    (evidence_response, "gemini-2.5-flash"),
+                    (empty_verdict, "gemini-3-flash-preview"),
+                ],
+            ),
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A claim", trigger_text="/factcheck"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview"],
+            )
+
+        self.assertEqual(result.reply, "Fact check: grounded fallback.")
+
     def test_unavailable_best_model_is_skipped_during_cooldown(self) -> None:
         request = fact_check.httpx.Request("POST", "https://example.invalid/models/generateContent")
         response = fact_check.httpx.Response(503, request=request)

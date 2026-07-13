@@ -168,6 +168,7 @@ def run_fact_check(
     anysearch_freshness: str = "",
     anysearch_content_types: list[str] | None = None,
     model_failure_cooldown_seconds: int = 0,
+    verdict_request_timeout: int = 25,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -371,7 +372,7 @@ def run_fact_check(
             flush=True,
         )
         try:
-            body, used_model = generate_with_fallback(
+            verdict_body, verdict_model = generate_with_fallback(
                 prompt=verdict_prompt,
                 models=verdict_models,
                 api_key=api_key,
@@ -380,8 +381,12 @@ def run_fact_check(
                 max_output_tokens=768,
                 grounding=False,
                 model_failure_cooldown_seconds=model_failure_cooldown_seconds,
-                request_timeout=main_request_timeout,
+                http_max_retries=0,
+                request_timeout=verdict_request_timeout,
             )
+            if not extract_text(verdict_body).strip():
+                raise RuntimeError("verdict model returned no readable text")
+            body, used_model = verdict_body, verdict_model
             print(f"[astrbot-fact-check-stage] verdict-review done model={used_model}", flush=True)
         except Exception as exc:
             print(
@@ -668,6 +673,7 @@ def generate_with_fallback(
     model_failure_cooldown_seconds: int = 0,
     extra_parts: list[dict[str, Any]] | None = None,
     max_attempts: int | None = None,
+    http_max_retries: int = 1,
     request_timeout: int = 45,
 ) -> tuple[dict[str, Any], str]:
     clean_models = [model.strip() for model in models if str(model or "").strip()]
@@ -692,6 +698,7 @@ def generate_with_fallback(
                 max_output_tokens=max_output_tokens,
                 grounding=model_grounding,
                 extra_parts=extra_parts,
+                http_max_retries=http_max_retries,
                 request_timeout=request_timeout,
             ), model
         except Exception as exc:
@@ -744,6 +751,8 @@ def _mark_model_unavailable(model: str, exc: Exception, *, cooldown_seconds: int
 
 
 def _is_model_capacity_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TimeoutException):
+        return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in {429, 503}
     lowered = str(exc or "").lower()
@@ -760,6 +769,7 @@ def gemini_generate(
     max_output_tokens: int,
     grounding: bool,
     extra_parts: list[dict[str, Any]] | None = None,
+    http_max_retries: int = 1,
     request_timeout: int = 45,
 ) -> dict[str, Any]:
     generation_config: dict[str, Any] = {
@@ -782,6 +792,7 @@ def gemini_generate(
         payload,
         api_key=api_key,
         timeout=request_timeout,
+        max_retries=max(0, int(http_max_retries)),
     )
 
 

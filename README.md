@@ -31,6 +31,7 @@ Managed by AstrBot WebUI through `_conf_schema.json`.
 - `fact_check_pre_model`: pre-processing model.
 - `fact_check_evidence_model`: grounded evidence-retrieval model, normally `gemini-2.5-flash`.
 - `fact_check_verdict_models`: evidence-only verdict editors, normally `gemini-3-flash-preview`.
+- `fact_check_verdict_timeout_seconds`: short timeout for the Gemini 3 review; the grounded 2.5 result is sent immediately when it expires or returns no readable text.
 - `fact_check_max_images`: max images per request.
 - `fact_check_max_image_bytes`: max bytes per image download.
 - `fact_check_anysearch_enabled`: enable Anysearch pre-retrieval evidence.

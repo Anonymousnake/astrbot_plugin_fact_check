@@ -41,6 +41,12 @@
     "hint": "Prevents an overloaded verdict model from delaying each fact-check before its grounded fallback is sent.",
     "default": 900
   },
+  "fact_check_verdict_timeout_seconds": {
+    "type": "int",
+    "description": "Timeout seconds for the Gemini 3 evidence-only verdict review",
+    "hint": "On timeout or an empty reply, the plugin immediately sends the complete Gemini 2.5 grounded result.",
+    "default": 25
+  },
   "fact_check_max_images": {
     "type": "int",
     "description": "Max images to inspect per fact-check request",

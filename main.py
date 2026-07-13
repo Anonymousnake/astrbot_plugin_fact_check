@@ -386,6 +386,9 @@ class FactCheckPlugin(Star):
                         model_failure_cooldown_seconds=int(
                             self.config.get("fact_check_model_failure_cooldown_seconds") or 900,
                         ),
+                        verdict_request_timeout=int(
+                            self.config.get("fact_check_verdict_timeout_seconds") or 25,
+                        ),
                     ),
                     timeout=timeout_seconds,
                 )
@@ -709,6 +712,9 @@ class FactCheckPlugin(Star):
                 "verdict": self._list_config(
                     "fact_check_verdict_models",
                     ["gemini-3-flash-preview"],
+                ),
+                "verdict_timeout_seconds": str(
+                    cache_config_value("fact_check_verdict_timeout_seconds", 25),
                 ),
             },
             "anysearch": {
