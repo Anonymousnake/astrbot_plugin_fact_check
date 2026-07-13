@@ -188,15 +188,7 @@ class FactCheckPlugin(Star):
                             or "https://generativelanguage.googleapis.com/v1beta/models"
                         ),
                         main_models=[
-                            str(model).strip()
-                            for model in self.config.get("fact_check_main_models", [])
-                            if str(model).strip()
-                        ]
-                        or [
-                            "gemini-3.5-flash",
-                            "gemini-3-flash-preview",
-                            "gemini-2.5-flash",
-                            "gemini-3.1-flash-lite",
+                            str(self.config.get("fact_check_evidence_model") or "gemini-2.5-flash").strip(),
                         ],
                         request_timeout=int(self.config.get("fact_check_main_timeout_seconds") or 45),
                     ),
@@ -333,17 +325,13 @@ class FactCheckPlugin(Star):
                             or "https://generativelanguage.googleapis.com/v1beta/models",
                         ),
                         pre_model=str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite"),
-                        main_models=[
-                            str(model).strip()
-                            for model in self.config.get("fact_check_main_models", [])
-                            if str(model).strip()
-                        ]
-                        or [
-                            "gemini-3.5-flash",
-                            "gemini-3-flash-preview",
-                            "gemini-2.5-flash",
-                            "gemini-3.1-flash-lite",
-                        ],
+                        evidence_model=str(
+                            self.config.get("fact_check_evidence_model") or "gemini-2.5-flash",
+                        ).strip(),
+                        verdict_models=self._list_config(
+                            "fact_check_verdict_models",
+                            ["gemini-3-flash-preview"],
+                        ),
                         max_image_bytes=int(self.config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024),
                         long_image_chunk_height=int(
                             self.config.get("fact_check_long_image_chunk_height") or 2200,
@@ -394,10 +382,6 @@ class FactCheckPlugin(Star):
                         anysearch_content_types=self._list_config(
                             "fact_check_anysearch_content_types",
                             ["web", "news"],
-                        ),
-                        ungrounded_main_models=self._list_config(
-                            "fact_check_ungrounded_main_models",
-                            [],
                         ),
                         model_failure_cooldown_seconds=int(
                             self.config.get("fact_check_model_failure_cooldown_seconds") or 900,
@@ -719,6 +703,14 @@ class FactCheckPlugin(Star):
                 }
                 for image in request_data.images
             ],
+            "models": {
+                "pre": str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite").strip(),
+                "evidence": str(self.config.get("fact_check_evidence_model") or "gemini-2.5-flash").strip(),
+                "verdict": self._list_config(
+                    "fact_check_verdict_models",
+                    ["gemini-3-flash-preview"],
+                ),
+            },
             "anysearch": {
                 "enabled": bool(self.config.get("fact_check_anysearch_enabled", False)),
                 "endpoint": str(

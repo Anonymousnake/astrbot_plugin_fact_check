@@ -13,8 +13,9 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Extracts quoted text and inline text.
 - Extracts up to `fact_check_max_images` image URLs from the current or quoted message.
 - Uses a lightweight Gemini model to turn text/images into checkable questions.
-- Optionally searches Anysearch for pre-retrieval evidence before the final grounded check.
-- Uses the configured main Gemini model fallback chain for the final fact-check.
+- Uses Gemini 2.5 Flash with Google Search grounding to collect evidence and produce a complete fallback result.
+- Uses Gemini 3 Flash without native grounding to turn that evidence package into a stricter atomic-claim verdict.
+- Optionally searches Anysearch for extra pre-retrieval evidence before the grounded check.
 - Formats replies as plain QQ-friendly text with explicit per-point `结论：` lines.
 - Saves cache hits as full fact-check sessions, so replying to cached results still supports follow-up.
 - Falls back to segmented OneBot text when merged-forward sending fails.
@@ -28,7 +29,8 @@ Managed by AstrBot WebUI through `_conf_schema.json`.
 
 - `gemini_api_key`: Gemini API key. Empty means use `GEMINI_API_KEY`.
 - `fact_check_pre_model`: pre-processing model.
-- `fact_check_main_models`: ordered fallback list.
+- `fact_check_evidence_model`: grounded evidence-retrieval model, normally `gemini-2.5-flash`.
+- `fact_check_verdict_models`: evidence-only verdict editors, normally `gemini-3-flash-preview`.
 - `fact_check_max_images`: max images per request.
 - `fact_check_max_image_bytes`: max bytes per image download.
 - `fact_check_anysearch_enabled`: enable Anysearch pre-retrieval evidence.

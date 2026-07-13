@@ -21,27 +21,24 @@
     "description": "Pre-processing model for extracting checkable claims",
     "default": "gemini-3.1-flash-lite"
   },
-  "fact_check_main_models": {
-    "type": "list",
-    "description": "Main fact-check model fallback order",
-    "hint": "The first model is tried first. Later models are used on rate-limit/server errors.",
-    "default": [
-      "gemini-3.5-flash",
-      "gemini-3-flash-preview",
-      "gemini-2.5-flash",
-      "gemini-3.1-flash-lite"
-    ]
+  "fact_check_evidence_model": {
+    "type": "string",
+    "description": "Grounded evidence-retrieval model",
+    "hint": "This model performs Google Search grounding and returns a complete fallback fact-check result.",
+    "default": "gemini-2.5-flash"
   },
-  "fact_check_ungrounded_main_models": {
+  "fact_check_verdict_models": {
     "type": "list",
-    "description": "Main models that should use Anysearch evidence without native Google Search grounding",
-    "hint": "Useful when a better Gemini model is available on the free tier but Google Search grounding for that model requires billing.",
-    "default": []
+    "description": "Evidence-only verdict editor fallback order",
+    "hint": "These models receive the grounded evidence package without native Google Search. If they are unavailable, the grounded evidence result is sent directly.",
+    "default": [
+      "gemini-3-flash-preview"
+    ]
   },
   "fact_check_model_failure_cooldown_seconds": {
     "type": "int",
-    "description": "Seconds to skip a main model after a 429 or 503 capacity failure",
-    "hint": "Prevents one overloaded preferred model from delaying every fact-check before the fallback model runs.",
+    "description": "Seconds to skip an unavailable model after a 429 or 503 capacity failure",
+    "hint": "Prevents an overloaded verdict model from delaying each fact-check before its grounded fallback is sent.",
     "default": 900
   },
   "fact_check_max_images": {

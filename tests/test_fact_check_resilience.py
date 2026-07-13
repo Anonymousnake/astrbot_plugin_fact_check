@@ -107,6 +107,77 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model, "gemini-3.5-flash")
         self.assertFalse(generate.call_args.kwargs["grounding"])
 
+    def test_grounded_evidence_is_reviewed_by_ungrounded_gemini_3(self) -> None:
+        evidence_response = {
+            "candidates": [{"content": {"parts": [{"text": "Grounded evidence: the policy exists."}]}}],
+        }
+        verdict_response = {
+            "candidates": [{"content": {"parts": [{"text": "Fact check: partial support."}]}}],
+        }
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("Check the policy and its product implication.")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                side_effect=[
+                    (evidence_response, "gemini-2.5-flash"),
+                    (verdict_response, "gemini-3-flash-preview"),
+                ],
+            ) as generate,
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A policy claim", trigger_text="/factcheck"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview"],
+            )
+
+        evidence_call, verdict_call = generate.call_args_list
+        self.assertEqual(evidence_call.kwargs["models"], ["gemini-2.5-flash"])
+        self.assertTrue(evidence_call.kwargs["grounding"])
+        self.assertEqual(verdict_call.kwargs["models"], ["gemini-3-flash-preview"])
+        self.assertFalse(verdict_call.kwargs["grounding"])
+        self.assertIn("Grounded evidence", verdict_call.kwargs["prompt"])
+        self.assertEqual(result.reply, "Fact check: partial support.")
+
+    def test_grounded_evidence_is_the_complete_fallback_when_gemini_3_fails(self) -> None:
+        evidence_response = {
+            "candidates": [{"content": {"parts": [{"text": "Fact check: evidence-model fallback."}]}}],
+        }
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("Check the claim.")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                side_effect=[
+                    (evidence_response, "gemini-2.5-flash"),
+                    RuntimeError("Gemini 3 unavailable"),
+                ],
+            ),
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A claim", trigger_text="/factcheck"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview"],
+            )
+
+        self.assertEqual(result.reply, "Fact check: evidence-model fallback.")
+
     def test_unavailable_best_model_is_skipped_during_cooldown(self) -> None:
         request = fact_check.httpx.Request("POST", "https://example.invalid/models/generateContent")
         response = fact_check.httpx.Response(503, request=request)

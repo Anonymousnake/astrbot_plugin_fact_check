@@ -147,7 +147,9 @@ def run_fact_check(
     api_key: str,
     base_url: str,
     pre_model: str,
-    main_models: list[str],
+    evidence_model: str = "",
+    verdict_models: list[str] | None = None,
+    main_models: list[str] | None = None,
     max_image_bytes: int = 5 * 1024 * 1024,
     long_image_chunk_height: int = 2200,
     long_image_max_parts: int = 8,
@@ -165,12 +167,18 @@ def run_fact_check(
     anysearch_max_chars: int = 6000,
     anysearch_freshness: str = "",
     anysearch_content_types: list[str] | None = None,
-    ungrounded_main_models: list[str] | None = None,
     model_failure_cooldown_seconds: int = 0,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
         return FactCheckResult(FAILED_REPLY, "missing Gemini API key")
+
+    # `main_models` keeps the callable backwards-compatible for older tests and
+    # third-party callers. New configuration uses one grounded evidence model
+    # followed by optional evidence-only verdict editors.
+    legacy_models = [str(model).strip() for model in (main_models or []) if str(model).strip()]
+    evidence_model = str(evidence_model or "").strip() or (legacy_models[0] if legacy_models else "gemini-2.5-flash")
+    verdict_models = [str(model).strip() for model in (verdict_models or []) if str(model).strip()]
 
     candidates: list[ClaimCandidate] = []
     text_context = request_data.text.strip()
@@ -321,26 +329,71 @@ def run_fact_check(
 来源：列出你实际用到的来源标题或站点，最多 3 个。
 """
     print(
-        "[astrbot-fact-check-stage] main-check start "
-        f"models={','.join(main_models)} candidates={len(deduped)}",
+        "[astrbot-fact-check-stage] evidence-check start "
+        f"model={evidence_model} candidates={len(deduped)}",
         flush=True,
     )
-    body, used_model = generate_with_fallback(
+    evidence_body, evidence_used_model = generate_with_fallback(
         prompt=prompt,
-        models=main_models,
+        models=[evidence_model],
         api_key=api_key,
         base_url=base_url,
         temperature=0.1,
         max_output_tokens=768,
         grounding=True,
-        ungrounded_models=(ungrounded_main_models or []) if anysearch_evidence.text else [],
         model_failure_cooldown_seconds=model_failure_cooldown_seconds,
         extra_parts=main_image_parts,
         request_timeout=main_request_timeout,
     )
-    print(f"[astrbot-fact-check-stage] main-check done model={used_model}", flush=True)
+    print(
+        "[astrbot-fact-check-stage] evidence-check done "
+        f"model={evidence_used_model}",
+        flush=True,
+    )
+
+    # Gemini 3 Flash does not need native grounding here. It receives the
+    # grounded evidence package from 2.5 Flash and is used only to calibrate
+    # atomic-claim verdicts. The grounded result remains a complete fallback.
+    body = evidence_body
+    used_model = evidence_used_model
+    if verdict_models:
+        evidence_text = shorten_text(extract_text(evidence_body).strip(), 9000)
+        evidence_sources = dedupe_sources(extract_sources(evidence_body) + anysearch_evidence.sources, limit=5)
+        verdict_prompt = build_evidence_verdict_prompt(
+            request_data=request_data,
+            candidates=deduped,
+            evidence_text=evidence_text,
+            evidence_sources=evidence_sources,
+        )
+        print(
+            "[astrbot-fact-check-stage] verdict-review start "
+            f"models={','.join(verdict_models)}",
+            flush=True,
+        )
+        try:
+            body, used_model = generate_with_fallback(
+                prompt=verdict_prompt,
+                models=verdict_models,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=0.1,
+                max_output_tokens=768,
+                grounding=False,
+                model_failure_cooldown_seconds=model_failure_cooldown_seconds,
+                request_timeout=main_request_timeout,
+            )
+            print(f"[astrbot-fact-check-stage] verdict-review done model={used_model}", flush=True)
+        except Exception as exc:
+            print(
+                "[astrbot-fact-check-verdict-fallback] "
+                f"model={','.join(verdict_models)} error={error_label(exc)}",
+                flush=True,
+            )
     reply = sanitize_fact_check_reply(extract_text(body).strip())
-    sources = dedupe_sources(extract_sources(body) + anysearch_evidence.sources, limit=5)
+    sources = dedupe_sources(
+        extract_sources(body) + extract_sources(evidence_body) + anysearch_evidence.sources,
+        limit=5,
+    )
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(sources[:3])
     reply = append_anysearch_source_note(reply, anysearch_evidence)
@@ -374,6 +427,40 @@ def append_anysearch_source_note(reply: str, evidence: AnysearchEvidence) -> str
     if "预检索线索：" in text:
         return text
     return f"{text}\n{note}"
+
+
+def build_evidence_verdict_prompt(
+    *,
+    request_data: FactCheckRequest,
+    candidates: list[ClaimCandidate],
+    evidence_text: str,
+    evidence_sources: list[str],
+) -> str:
+    """Build the non-grounded Gemini 3 verdict pass from a grounded evidence package."""
+    sources = "\n".join(f"- {source}" for source in evidence_sources[:5]) or "- No source URL was returned."
+    return f"""You are the final Chinese fact-check verdict editor.
+
+Use only the grounded evidence package below. Do not browse, invent sources, or fill gaps with prior knowledge.
+The evidence model may have verified a background fact without proving a later legal, medical, financial, policy, product, hardware, sales, or illegality inference. Split such compound claims into atomic claims. If a key inference lacks direct support, the overall conclusion must not be trustworthy; use a cautious partial/insufficient verdict instead.
+
+Current time:
+{current_time_context()}
+
+Original chat content:
+{request_data.text or '(image-led request)'}
+
+Checkable claims:
+{format_candidates(candidates)}
+
+Grounded evidence package:
+{evidence_text or '(The grounded model returned no readable text.)'}
+
+Grounded source URLs:
+{sources}
+
+Write a concise Chinese QQ-ready result. Start with "事实核查：" and choose one overall verdict from: 可信 / 基本可信但需限定 / 条件性成立 / 混合结论 / 部分存疑 / 证据不足 / 基本不实 / 表述不准确.
+For every atomic claim write: "结论：" followed by one of: 已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断.
+State clearly when the evidence does not directly support a key inference. End with at most three actual source domains or titles. Do not use Markdown headings, bold, code blocks, or fabricated citations."""
 
 
 def run_fact_check_followup(
