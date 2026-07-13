@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import threading
 import time
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -34,6 +35,8 @@ ANYSEARCH_CONTENT_TYPES = {"web", "news", "doc", "academic", "data"}
 ANYSEARCH_FRESHNESS_VALUES = {"day", "week", "month", "year"}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 URL_RE = re.compile(r"(?:-\s*\*\*URL\*\*:\s*)?(https?://[^\s<>\]\)\"']+)", re.IGNORECASE)
+_MODEL_FAILURE_UNTIL: dict[str, float] = {}
+_MODEL_FAILURE_LOCK = threading.Lock()
 META_CLAIM_RE = re.compile(
     r"(系统自动生成|无需核查|不需要核查|不用核查|无法核查|没有必要核查|"
     r"此问题|该问题|这个问题|本问题|用户请求|机器人|bot|工具调用|"
@@ -163,6 +166,7 @@ def run_fact_check(
     anysearch_freshness: str = "",
     anysearch_content_types: list[str] | None = None,
     ungrounded_main_models: list[str] | None = None,
+    model_failure_cooldown_seconds: int = 0,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -330,6 +334,7 @@ def run_fact_check(
         max_output_tokens=768,
         grounding=True,
         ungrounded_models=(ungrounded_main_models or []) if anysearch_evidence.text else [],
+        model_failure_cooldown_seconds=model_failure_cooldown_seconds,
         extra_parts=main_image_parts,
         request_timeout=main_request_timeout,
     )
@@ -573,6 +578,7 @@ def generate_with_fallback(
     max_output_tokens: int,
     grounding: bool,
     ungrounded_models: list[str] | None = None,
+    model_failure_cooldown_seconds: int = 0,
     extra_parts: list[dict[str, Any]] | None = None,
     max_attempts: int | None = None,
     request_timeout: int = 45,
@@ -580,12 +586,13 @@ def generate_with_fallback(
     clean_models = [model.strip() for model in models if str(model or "").strip()]
     if not clean_models:
         raise RuntimeError("no fact-check model configured")
-    attempts = max_attempts or max(1, min(3, len(clean_models)))
+    active_models = _available_models(clean_models)
+    attempts = max_attempts or max(1, min(3, len(active_models)))
     last_error: Exception | None = None
-    last_model = clean_models[0]
+    last_model = active_models[0]
     ungrounded = {str(model).strip() for model in (ungrounded_models or []) if str(model).strip()}
     for attempt in range(attempts):
-        model = clean_models[min(attempt, len(clean_models) - 1)]
+        model = active_models[min(attempt, len(active_models) - 1)]
         last_model = model
         model_grounding = grounding and model not in ungrounded
         try:
@@ -602,9 +609,14 @@ def generate_with_fallback(
             ), model
         except Exception as exc:
             last_error = exc
+            _mark_model_unavailable(
+                model,
+                exc,
+                cooldown_seconds=model_failure_cooldown_seconds,
+            )
             if not is_retryable(exc) or attempt >= attempts - 1:
                 break
-            next_model = clean_models[min(attempt + 1, len(clean_models) - 1)]
+            next_model = active_models[min(attempt + 1, len(active_models) - 1)]
             wait = backoff_seconds(attempt, exc)
             print(
                 "[astrbot-fact-check-retry] "
@@ -619,6 +631,36 @@ def generate_with_fallback(
         f"fact-check request failed after {attempts} attempt(s); "
         f"last_model={last_model}; last_error={error_label(last_error)}"
     )
+
+
+def _available_models(models: list[str]) -> list[str]:
+    now = time.monotonic()
+    with _MODEL_FAILURE_LOCK:
+        for model, until in list(_MODEL_FAILURE_UNTIL.items()):
+            if until <= now:
+                _MODEL_FAILURE_UNTIL.pop(model, None)
+        active = [model for model in models if _MODEL_FAILURE_UNTIL.get(model, 0.0) <= now]
+    return active or models
+
+
+def _mark_model_unavailable(model: str, exc: Exception, *, cooldown_seconds: int) -> None:
+    if cooldown_seconds <= 0 or not _is_model_capacity_error(exc):
+        return
+    seconds = max(1, int(cooldown_seconds))
+    with _MODEL_FAILURE_LOCK:
+        _MODEL_FAILURE_UNTIL[model] = time.monotonic() + seconds
+    print(
+        "[astrbot-fact-check-model-cooldown] "
+        f"model={model} seconds={seconds} error={error_label(exc)}",
+        flush=True,
+    )
+
+
+def _is_model_capacity_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {429, 503}
+    lowered = str(exc or "").lower()
+    return "429" in lowered or "503" in lowered or "too many requests" in lowered
 
 
 def gemini_generate(

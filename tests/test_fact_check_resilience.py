@@ -107,6 +107,50 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model, "gemini-3.5-flash")
         self.assertFalse(generate.call_args.kwargs["grounding"])
 
+    def test_unavailable_best_model_is_skipped_during_cooldown(self) -> None:
+        request = fact_check.httpx.Request("POST", "https://example.invalid/models/generateContent")
+        response = fact_check.httpx.Response(503, request=request)
+        unavailable = fact_check.httpx.HTTPStatusError("busy", request=request, response=response)
+        success = {"candidates": [{"content": {"parts": [{"text": "事实核查：可信"}]}}]}
+
+        with (
+            patch.object(fact_check, "_MODEL_FAILURE_UNTIL", {}),
+            patch.object(fact_check, "gemini_generate", side_effect=[unavailable, success, success]) as generate,
+            patch.object(fact_check.time, "sleep"),
+        ):
+            first_body, first_model = fact_check.generate_with_fallback(
+                prompt="Use the supplied evidence.",
+                models=["gemini-3.5-flash", "gemini-2.5-flash"],
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                temperature=0,
+                max_output_tokens=128,
+                grounding=True,
+                ungrounded_models=["gemini-3.5-flash"],
+                model_failure_cooldown_seconds=900,
+            )
+            second_body, second_model = fact_check.generate_with_fallback(
+                prompt="Use the supplied evidence.",
+                models=["gemini-3.5-flash", "gemini-2.5-flash"],
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                temperature=0,
+                max_output_tokens=128,
+                grounding=True,
+                ungrounded_models=["gemini-3.5-flash"],
+                model_failure_cooldown_seconds=900,
+            )
+
+        self.assertEqual(first_body, success)
+        self.assertEqual(second_body, success)
+        self.assertEqual(first_model, "gemini-2.5-flash")
+        self.assertEqual(second_model, "gemini-2.5-flash")
+        self.assertEqual([call.kwargs["model"] for call in generate.call_args_list], [
+            "gemini-3.5-flash",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

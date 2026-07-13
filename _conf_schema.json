@@ -27,6 +27,7 @@
     "hint": "The first model is tried first. Later models are used on rate-limit/server errors.",
     "default": [
       "gemini-3.5-flash",
+      "gemini-3-flash-preview",
       "gemini-2.5-flash",
       "gemini-3.1-flash-lite"
     ]
@@ -36,6 +37,12 @@
     "description": "Main models that should use Anysearch evidence without native Google Search grounding",
     "hint": "Useful when a better Gemini model is available on the free tier but Google Search grounding for that model requires billing.",
     "default": []
+  },
+  "fact_check_model_failure_cooldown_seconds": {
+    "type": "int",
+    "description": "Seconds to skip a main model after a 429 or 503 capacity failure",
+    "hint": "Prevents one overloaded preferred model from delaying every fact-check before the fallback model runs.",
+    "default": 900
   },
   "fact_check_max_images": {
     "type": "int",

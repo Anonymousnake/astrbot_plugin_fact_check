@@ -194,6 +194,7 @@ class FactCheckPlugin(Star):
                         ]
                         or [
                             "gemini-3.5-flash",
+                            "gemini-3-flash-preview",
                             "gemini-2.5-flash",
                             "gemini-3.1-flash-lite",
                         ],
@@ -339,6 +340,7 @@ class FactCheckPlugin(Star):
                         ]
                         or [
                             "gemini-3.5-flash",
+                            "gemini-3-flash-preview",
                             "gemini-2.5-flash",
                             "gemini-3.1-flash-lite",
                         ],
@@ -396,6 +398,9 @@ class FactCheckPlugin(Star):
                         ungrounded_main_models=self._list_config(
                             "fact_check_ungrounded_main_models",
                             [],
+                        ),
+                        model_failure_cooldown_seconds=int(
+                            self.config.get("fact_check_model_failure_cooldown_seconds") or 900,
                         ),
                     ),
                     timeout=timeout_seconds,
