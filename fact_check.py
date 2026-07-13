@@ -162,6 +162,7 @@ def run_fact_check(
     anysearch_max_chars: int = 6000,
     anysearch_freshness: str = "",
     anysearch_content_types: list[str] | None = None,
+    ungrounded_main_models: list[str] | None = None,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -171,15 +172,21 @@ def run_fact_check(
     text_context = request_data.text.strip()
     if text_context:
         print(f"[astrbot-fact-check-stage] text-preprocess start len={len(text_context)} model={pre_model}", flush=True)
-        candidates.extend(
-            extract_claims_from_text(
-                text_context,
-                model=pre_model,
-                api_key=api_key,
-                base_url=base_url,
-                request_timeout=pre_request_timeout,
-            ),
-        )
+        try:
+            candidates.extend(
+                extract_claims_from_text(
+                    text_context,
+                    model=pre_model,
+                    api_key=api_key,
+                    base_url=base_url,
+                    request_timeout=pre_request_timeout,
+                ),
+            )
+        except Exception as exc:
+            print(
+                f"[astrbot-fact-check-text-preprocess-error] {error_label(exc)}",
+                flush=True,
+            )
         print(f"[astrbot-fact-check-stage] text-preprocess done candidates={len(candidates)}", flush=True)
 
     if request_data.images:
@@ -188,21 +195,27 @@ def run_fact_check(
             f"images={len(request_data.images)} model={pre_model}",
             flush=True,
         )
-        candidates.extend(
-            extract_claims_from_images(
-                request_data.images,
-                context_text=text_context,
-                model=pre_model,
-                api_key=api_key,
-                base_url=base_url,
-                max_image_bytes=max_image_bytes,
-                long_image_chunk_height=long_image_chunk_height,
-                long_image_max_parts=long_image_max_parts,
-                long_image_max_width=long_image_max_width,
-                image_download_timeout=image_download_timeout,
-                request_timeout=pre_request_timeout,
-            ),
-        )
+        try:
+            candidates.extend(
+                extract_claims_from_images(
+                    request_data.images,
+                    context_text=text_context,
+                    model=pre_model,
+                    api_key=api_key,
+                    base_url=base_url,
+                    max_image_bytes=max_image_bytes,
+                    long_image_chunk_height=long_image_chunk_height,
+                    long_image_max_parts=long_image_max_parts,
+                    long_image_max_width=long_image_max_width,
+                    image_download_timeout=image_download_timeout,
+                    request_timeout=pre_request_timeout,
+                ),
+            )
+        except Exception as exc:
+            print(
+                f"[astrbot-fact-check-image-preprocess-error] {error_label(exc)}",
+                flush=True,
+            )
         print(f"[astrbot-fact-check-stage] image-preprocess done candidates={len(candidates)}", flush=True)
 
     if not candidates:
@@ -214,13 +227,16 @@ def run_fact_check(
                     priority=2,
                 ),
             )
-        else:
-            return FactCheckResult(
-                FAILED_REPLY,
-                f"no checkable factual claims; text={text_context[:120]}; images={len(request_data.images)}",
-                [],
-                [],
+        elif request_data.images:
+            candidates.append(
+                ClaimCandidate(
+                    claim="请核查图片中主要事实断言是否准确，并指出无法辨认或缺少证据的部分。",
+                    source="原始图片",
+                    priority=2,
+                ),
             )
+        else:
+            return FactCheckResult(FAILED_REPLY, "no checkable factual claims", [], [])
 
     deduped = dedupe_candidates(candidates, limit=3)
     candidate_text = format_candidates(deduped)
@@ -313,6 +329,7 @@ def run_fact_check(
         temperature=0.1,
         max_output_tokens=768,
         grounding=True,
+        ungrounded_models=(ungrounded_main_models or []) if anysearch_evidence.text else [],
         extra_parts=main_image_parts,
         request_timeout=main_request_timeout,
     )
@@ -555,6 +572,7 @@ def generate_with_fallback(
     temperature: float,
     max_output_tokens: int,
     grounding: bool,
+    ungrounded_models: list[str] | None = None,
     extra_parts: list[dict[str, Any]] | None = None,
     max_attempts: int | None = None,
     request_timeout: int = 45,
@@ -565,9 +583,11 @@ def generate_with_fallback(
     attempts = max_attempts or max(1, min(3, len(clean_models)))
     last_error: Exception | None = None
     last_model = clean_models[0]
+    ungrounded = {str(model).strip() for model in (ungrounded_models or []) if str(model).strip()}
     for attempt in range(attempts):
         model = clean_models[min(attempt, len(clean_models) - 1)]
         last_model = model
+        model_grounding = grounding and model not in ungrounded
         try:
             return gemini_generate(
                 prompt=prompt,
@@ -576,7 +596,7 @@ def generate_with_fallback(
                 base_url=base_url,
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
-                grounding=grounding,
+                grounding=model_grounding,
                 extra_parts=extra_parts,
                 request_timeout=request_timeout,
             ), model
@@ -589,6 +609,7 @@ def generate_with_fallback(
             print(
                 "[astrbot-fact-check-retry] "
                 f"attempt={attempt + 1}/{attempts} model={model} next={next_model} "
+                f"grounding={'on' if model_grounding else 'off'} "
                 f"wait={wait:.1f}s error={error_label(exc)}"
                 ,
                 flush=True,
@@ -1507,12 +1528,13 @@ def read_image_input_bytes(item: ImageInput, *, max_bytes: int | None, timeout: 
     url_value = (item.url or "").strip()
     if path_value:
         path = Path(path_value.removeprefix("file:///").removeprefix("file://"))
-        if not path.exists():
+        if path.exists():
+            size = path.stat().st_size
+            if max_bytes is not None and size > max_bytes:
+                raise ValueError(f"image too large: {size} bytes > limit {max_bytes}")
+            return path.read_bytes(), guess_mime_type(item.file_name or path.name, "")
+        if not url_value:
             raise FileNotFoundError(f"local image not found: {path}")
-        size = path.stat().st_size
-        if max_bytes is not None and size > max_bytes:
-            raise ValueError(f"image too large: {size} bytes > limit {max_bytes}")
-        return path.read_bytes(), guess_mime_type(item.file_name or path.name, "")
     if url_value:
         if not is_public_http_url(url_value):
             raise ValueError("image url must be public http(s)")

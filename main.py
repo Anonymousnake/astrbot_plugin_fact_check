@@ -5,6 +5,7 @@ import hashlib
 import html
 import json
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -192,7 +193,7 @@ class FactCheckPlugin(Star):
                             if str(model).strip()
                         ]
                         or [
-                            "gemini-3-flash-preview",
+                            "gemini-3.5-flash",
                             "gemini-2.5-flash",
                             "gemini-3.1-flash-lite",
                         ],
@@ -337,7 +338,7 @@ class FactCheckPlugin(Star):
                             if str(model).strip()
                         ]
                         or [
-                            "gemini-3-flash-preview",
+                            "gemini-3.5-flash",
                             "gemini-2.5-flash",
                             "gemini-3.1-flash-lite",
                         ],
@@ -391,6 +392,10 @@ class FactCheckPlugin(Star):
                         anysearch_content_types=self._list_config(
                             "fact_check_anysearch_content_types",
                             ["web", "news"],
+                        ),
+                        ungrounded_main_models=self._list_config(
+                            "fact_check_ungrounded_main_models",
+                            [],
                         ),
                     ),
                     timeout=timeout_seconds,
@@ -1452,6 +1457,7 @@ class FactCheckPlugin(Star):
             if not path:
                 try:
                     path = await asyncio.wait_for(comp.convert_to_file_path(), timeout=resolve_timeout)
+                    path = self._snapshot_image_path(path, file_name=file_name)
                     logger.info(
                         f"[astrbot-fact-check-image-local] {self._short_ref(file_name or str(comp.url or ''))}: {path}",
                     )
@@ -1474,6 +1480,45 @@ class FactCheckPlugin(Star):
             if len(images) >= remaining:
                 break
         return images
+
+    def _snapshot_image_path(self, path_value: str, *, file_name: str = "") -> str:
+        source = Path(str(path_value or "").removeprefix("file:///").removeprefix("file://"))
+        if not source.is_file():
+            return str(path_value or "")
+        try:
+            cache_dir = Path(StarTools.get_data_dir()) / "input_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            self._prune_image_input_cache(cache_dir)
+            suffix = source.suffix.lower()
+            if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+                suffix = Path(str(file_name or "").split("?", 1)[0]).suffix.lower()
+            if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+                suffix = ".img"
+            target = cache_dir / f"{uuid.uuid4().hex}{suffix}"
+            shutil.copy2(source, target)
+            return str(target)
+        except Exception as exc:
+            logger.warning(
+                f"[astrbot-fact-check-image-snapshot-error] {self._short_ref(str(source))}: {exc!r}",
+            )
+            return str(path_value or "")
+
+    def _prune_image_input_cache(self, cache_dir: Path) -> None:
+        now = time.time()
+        last_prune = float(getattr(self, "_image_cache_last_prune", 0.0) or 0.0)
+        if now - last_prune < 300:
+            return
+        self._image_cache_last_prune = now
+        max_age = max(
+            7200,
+            int(self.config.get("fact_check_followup_ttl_seconds") or 3600) + 600,
+        )
+        for item in cache_dir.iterdir():
+            try:
+                if item.is_file() and now - item.stat().st_mtime > max_age:
+                    item.unlink()
+            except OSError:
+                continue
 
     def _failed_fact_check_reply(self, reason: str) -> str:
         if bool(self.config.get("fact_check_show_failure_reason", True)):

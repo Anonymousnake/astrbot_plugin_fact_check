@@ -26,10 +26,16 @@
     "description": "Main fact-check model fallback order",
     "hint": "The first model is tried first. Later models are used on rate-limit/server errors.",
     "default": [
-      "gemini-3-flash-preview",
+      "gemini-3.5-flash",
       "gemini-2.5-flash",
       "gemini-3.1-flash-lite"
     ]
+  },
+  "fact_check_ungrounded_main_models": {
+    "type": "list",
+    "description": "Main models that should use Anysearch evidence without native Google Search grounding",
+    "hint": "Useful when a better Gemini model is available on the free tier but Google Search grounding for that model requires billing.",
+    "default": []
   },
   "fact_check_max_images": {
     "type": "int",
