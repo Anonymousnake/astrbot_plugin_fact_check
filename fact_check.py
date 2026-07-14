@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
+import contextvars
+import functools
 import io
 import ipaddress
 import json
 import os
 import random
 import re
+import socket
 import threading
 import time
 from datetime import datetime
@@ -37,6 +41,12 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 URL_RE = re.compile(r"(?:-\s*\*\*URL\*\*:\s*)?(https?://[^\s<>\]\)\"']+)", re.IGNORECASE)
 _MODEL_FAILURE_UNTIL: dict[str, float] = {}
 _MODEL_FAILURE_LOCK = threading.Lock()
+_PUBLIC_HOST_CACHE: dict[str, tuple[float, bool]] = {}
+_PUBLIC_HOST_CACHE_LOCK = threading.Lock()
+_REQUEST_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "fact_check_request_deadline",
+    default=None,
+)
 META_CLAIM_RE = re.compile(
     r"(系统自动生成|无需核查|不需要核查|不用核查|无法核查|没有必要核查|"
     r"此问题|该问题|这个问题|本问题|用户请求|机器人|bot|工具调用|"
@@ -78,6 +88,7 @@ class ImageInput:
     url: str
     file_name: str = ""
     path: str = ""
+    content_sha256: str = ""
 
 
 @dataclass(slots=True)
@@ -141,6 +152,50 @@ def explain_failure(reason: str) -> str:
     return f"{FAILED_REPLY}\n原因：{detail}"
 
 
+def _with_request_deadline(func):
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        seconds = float(kwargs.get("total_timeout_seconds") or 0)
+        token = _REQUEST_DEADLINE.set(time.monotonic() + seconds if seconds > 0 else None)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _REQUEST_DEADLINE.reset(token)
+
+    return wrapped
+
+
+def _bounded_timeout(timeout: float, *, minimum: float = 0.25) -> float:
+    requested = max(minimum, float(timeout))
+    deadline = _REQUEST_DEADLINE.get()
+    if deadline is None:
+        return requested
+    remaining = deadline - time.monotonic()
+    if remaining <= minimum:
+        raise httpx.TimeoutException("fact-check total deadline exceeded")
+    return min(requested, remaining)
+
+
+def _sleep_with_deadline(seconds: float) -> None:
+    delay = max(0.0, float(seconds))
+    deadline = _REQUEST_DEADLINE.get()
+    if deadline is None:
+        time.sleep(delay)
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise httpx.TimeoutException("fact-check total deadline exceeded")
+    time.sleep(min(delay, remaining))
+    if deadline - time.monotonic() <= 0:
+        raise httpx.TimeoutException("fact-check total deadline exceeded")
+
+
+def _retry_budget_available(*, minimum: float = 0.5) -> bool:
+    deadline = _REQUEST_DEADLINE.get()
+    return deadline is None or deadline - time.monotonic() > minimum
+
+
+@_with_request_deadline
 def run_fact_check(
     *,
     request_data: FactCheckRequest,
@@ -169,6 +224,7 @@ def run_fact_check(
     anysearch_content_types: list[str] | None = None,
     model_failure_cooldown_seconds: int = 0,
     verdict_request_timeout: int = 25,
+    total_timeout_seconds: int = 0,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -183,7 +239,18 @@ def run_fact_check(
 
     candidates: list[ClaimCandidate] = []
     text_context = request_data.text.strip()
-    if text_context:
+    text_preprocess_attempted = False
+    main_image_parts = build_inline_image_parts(
+        request_data.images,
+        max_image_bytes=max_image_bytes,
+        long_image_chunk_height=long_image_chunk_height,
+        long_image_max_parts=long_image_max_parts,
+        long_image_max_width=long_image_max_width,
+        image_download_timeout=image_download_timeout,
+        stage="shared-reference",
+    )
+    if text_context and not request_data.images:
+        text_preprocess_attempted = True
         print(f"[astrbot-fact-check-stage] text-preprocess start len={len(text_context)} model={pre_model}", flush=True)
         try:
             candidates.extend(
@@ -222,6 +289,7 @@ def run_fact_check(
                     long_image_max_width=long_image_max_width,
                     image_download_timeout=image_download_timeout,
                     request_timeout=pre_request_timeout,
+                    inline_parts=main_image_parts,
                 ),
             )
         except Exception as exc:
@@ -229,7 +297,42 @@ def run_fact_check(
                 f"[astrbot-fact-check-image-preprocess-error] {error_label(exc)}",
                 flush=True,
             )
+            if text_context:
+                text_preprocess_attempted = True
+                try:
+                    candidates.extend(
+                        extract_claims_from_text(
+                            text_context,
+                            model=pre_model,
+                            api_key=api_key,
+                            base_url=base_url,
+                            request_timeout=pre_request_timeout,
+                        ),
+                    )
+                except Exception as text_exc:
+                    print(
+                        f"[astrbot-fact-check-text-preprocess-error] {error_label(text_exc)}",
+                        flush=True,
+                    )
         print(f"[astrbot-fact-check-stage] image-preprocess done candidates={len(candidates)}", flush=True)
+
+    if text_context and not candidates and not text_preprocess_attempted:
+        text_preprocess_attempted = True
+        try:
+            candidates.extend(
+                extract_claims_from_text(
+                    text_context,
+                    model=pre_model,
+                    api_key=api_key,
+                    base_url=base_url,
+                    request_timeout=pre_request_timeout,
+                ),
+            )
+        except Exception as exc:
+            print(
+                f"[astrbot-fact-check-text-preprocess-error] {error_label(exc)}",
+                flush=True,
+            )
 
     if not candidates:
         if text_context:
@@ -275,20 +378,12 @@ def run_fact_check(
         else ""
     )
     speaker_line = f"发言人：{request_data.speaker}\n" if request_data.speaker else ""
-    main_image_parts = build_inline_image_parts(
-        request_data.images,
-        max_image_bytes=max_image_bytes,
-        long_image_chunk_height=long_image_chunk_height,
-        long_image_max_parts=long_image_max_parts,
-        long_image_max_width=long_image_max_width,
-        image_download_timeout=image_download_timeout,
-        stage="main-reference",
-    )
-    image_line = (
-        f"参考图片：已附上 {len(main_image_parts)} 张原图。请同时参考图中文字、截图上下文和画面含义。\n"
-        if main_image_parts
-        else "参考图片：原图未成功附上，只能依据前置整理出的核查问题和原始文字判断。\n"
-    )
+    if main_image_parts:
+        image_line = f"参考图片：已附上 {len(main_image_parts)} 张原图。请同时参考图中文字、截图上下文和画面含义。\n"
+    elif request_data.images:
+        image_line = "参考图片：原图未成功附上，只能依据前置整理出的核查问题和原始文字判断。\n"
+    else:
+        image_line = ""
     prompt = f"""你是一个中文事实核查助手。请使用 Google Search grounding 核查下面的聊天内容和核查问题列表。
 
 时间上下文：
@@ -360,11 +455,14 @@ def run_fact_check(
     if verdict_models:
         evidence_text = shorten_text(extract_text(evidence_body).strip(), 9000)
         evidence_sources = dedupe_sources(extract_sources(evidence_body) + anysearch_evidence.sources, limit=5)
+        grounding_evidence = extract_grounding_evidence(evidence_body)
         verdict_prompt = build_evidence_verdict_prompt(
             request_data=request_data,
             candidates=deduped,
             evidence_text=evidence_text,
             evidence_sources=evidence_sources,
+            grounding_evidence=grounding_evidence,
+            anysearch_evidence=anysearch_evidence.text,
         )
         print(
             "[astrbot-fact-check-stage] verdict-review start "
@@ -380,6 +478,7 @@ def run_fact_check(
                 temperature=0.1,
                 max_output_tokens=768,
                 grounding=False,
+                thinking_level="medium",
                 model_failure_cooldown_seconds=model_failure_cooldown_seconds,
                 http_max_retries=0,
                 request_timeout=verdict_request_timeout,
@@ -400,8 +499,8 @@ def run_fact_check(
         limit=5,
     )
     if sources and "来源" not in reply:
-        reply += "\n来源：" + "；".join(sources[:3])
-    reply = append_anysearch_source_note(reply, anysearch_evidence)
+        reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources[:3])
+    reply = append_source_links(reply, sources)
     if used_model in LIGHTWEIGHT_MODELS and reply:
         reply += "\n（主模型繁忙，已用轻量模型核查）"
     if not reply:
@@ -420,18 +519,22 @@ def run_fact_check(
     )
 
 
-def append_anysearch_source_note(reply: str, evidence: AnysearchEvidence) -> str:
-    sources = dedupe_sources(evidence.sources, limit=3)
-    if not sources:
-        return reply
-    compact_sources = "；".join(compact_source_label(source) for source in sources)
-    note = f"预检索线索：Anysearch 命中 {len(sources)} 个公开来源：{compact_sources}。"
-    text = str(reply or "").rstrip()
-    if not text:
-        return note
-    if "预检索线索：" in text:
-        return text
-    return f"{text}\n{note}"
+def append_source_links(reply: str, sources: list[str], *, limit: int = 3) -> str:
+    urls: list[str] = []
+    for source in sources:
+        for match in URL_RE.finditer(str(source or "")):
+            url = normalize_url(match.group(1))
+            if url and is_public_http_url(url) and url not in urls:
+                urls.append(url)
+            if len(urls) >= limit:
+                break
+        if len(urls) >= limit:
+            break
+    missing = [url for url in urls if url not in str(reply or "")]
+    if not missing:
+        return str(reply or "").strip()
+    links = "\n".join(f"{index}. {url}" for index, url in enumerate(missing, start=1))
+    return f"{str(reply or '').rstrip()}\n可核验链接：\n{links}".strip()
 
 
 def build_evidence_verdict_prompt(
@@ -440,6 +543,8 @@ def build_evidence_verdict_prompt(
     candidates: list[ClaimCandidate],
     evidence_text: str,
     evidence_sources: list[str],
+    grounding_evidence: str = "",
+    anysearch_evidence: str = "",
 ) -> str:
     """Build the non-grounded Gemini 3 verdict pass from a grounded evidence package."""
     sources = "\n".join(f"- {source}" for source in evidence_sources[:5]) or "- No source URL was returned."
@@ -460,6 +565,12 @@ Checkable claims:
 Grounded evidence package:
 {evidence_text or '(The grounded model returned no readable text.)'}
 
+Grounding support mapping from Google Search:
+{grounding_evidence or '(No grounding support mapping was returned.)'}
+
+Raw Anysearch excerpts and search snippets:
+{sanitize_anysearch_evidence_text(anysearch_evidence) or '(No Anysearch evidence was returned.)'}
+
 Grounded source URLs:
 {sources}
 
@@ -468,6 +579,42 @@ For every atomic claim write: "结论：" followed by one of: 已核实 / 条件
 State clearly when the evidence does not directly support a key inference. End with at most three actual source domains or titles. Do not use Markdown headings, bold, code blocks, or fabricated citations."""
 
 
+def extract_grounding_evidence(body: dict[str, Any], *, max_chars: int = 6000) -> str:
+    candidates = body.get("candidates", []) or []
+    metadata = (candidates[0] if candidates else {}).get("groundingMetadata") or {}
+    chunks = metadata.get("groundingChunks") or []
+    supports = metadata.get("groundingSupports") or []
+    lines: list[str] = []
+    for support in supports:
+        if not isinstance(support, dict):
+            continue
+        segment = support.get("segment") or {}
+        segment_text = shorten_text(str(segment.get("text") or "").strip(), 500)
+        source_labels: list[str] = []
+        for index in support.get("groundingChunkIndices") or []:
+            if not isinstance(index, int) or index < 0 or index >= len(chunks):
+                continue
+            web = (chunks[index] or {}).get("web") or {}
+            uri = str(web.get("uri") or "").strip()
+            title = str(web.get("title") or "").strip()
+            if uri:
+                source_labels.append(f"{title or compact_source_label(uri)}：{uri}")
+        if segment_text or source_labels:
+            line = f"证据片段：{segment_text or '（未返回原文片段）'}"
+            if source_labels:
+                line += "\n直接支持来源：" + "；".join(source_labels[:3])
+            lines.append(line)
+    if not lines:
+        for chunk in chunks[:5]:
+            web = (chunk or {}).get("web") or {}
+            uri = str(web.get("uri") or "").strip()
+            title = str(web.get("title") or "").strip()
+            if uri:
+                lines.append(f"检索来源：{title or compact_source_label(uri)}：{uri}")
+    return shorten_text("\n\n".join(lines), max_chars)
+
+
+@_with_request_deadline
 def run_fact_check_followup(
     *,
     original_text: str,
@@ -479,6 +626,7 @@ def run_fact_check_followup(
     base_url: str,
     main_models: list[str],
     request_timeout: int = 45,
+    total_timeout_seconds: int = 0,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -536,7 +684,8 @@ def run_fact_check_followup(
     reply = sanitize_fact_check_reply(extract_text(body).strip())
     sources = extract_sources(body)
     if sources and "来源" not in reply:
-        reply += "\n来源：" + "；".join(sources)
+        reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources)
+    reply = append_source_links(reply, sources)
     if used_model in LIGHTWEIGHT_MODELS and reply:
         reply += "\n（主模型繁忙，已用轻量模型回答追问）"
     if not reply:
@@ -590,6 +739,7 @@ def extract_claims_from_text(
         max_output_tokens=640,
         grounding=False,
         request_timeout=request_timeout,
+        thinking_level="minimal",
     )
     return parse_candidates(extract_text(body), limit=limit)
 
@@ -608,6 +758,7 @@ def extract_claims_from_images(
     limit: int = 5,
     image_download_timeout: int = 10,
     request_timeout: int = 25,
+    inline_parts: list[dict[str, Any]] | None = None,
 ) -> list[ClaimCandidate]:
     parts: list[dict[str, Any]] = [
         {
@@ -627,25 +778,28 @@ def extract_claims_from_images(
             ),
         },
     ]
-    seen_image_payloads: set[str] = set()
-    for item in images:
-        try:
-            append_unique_inline_parts(
-                parts,
-                download_image_as_inline_parts(
-                    item,
-                    max_bytes=max_image_bytes,
-                    long_image_chunk_height=long_image_chunk_height,
-                    long_image_max_parts=long_image_max_parts,
-                    long_image_max_width=long_image_max_width,
-                    timeout=image_download_timeout,
-                ),
-                seen_image_payloads,
-                stage="preprocess",
-                label=item.file_name or item.url or item.path,
-            )
-        except Exception as exc:
-            print(f"[astrbot-fact-check-image-download-error] {item.file_name or item.url}: {exc!r}", flush=True)
+    if inline_parts is not None:
+        parts.extend(inline_parts)
+    else:
+        seen_image_payloads: set[str] = set()
+        for item in images:
+            try:
+                append_unique_inline_parts(
+                    parts,
+                    download_image_as_inline_parts(
+                        item,
+                        max_bytes=max_image_bytes,
+                        long_image_chunk_height=long_image_chunk_height,
+                        long_image_max_parts=long_image_max_parts,
+                        long_image_max_width=long_image_max_width,
+                        timeout=image_download_timeout,
+                    ),
+                    seen_image_payloads,
+                    stage="preprocess",
+                    label=item.file_name or item.url or item.path,
+                )
+            except Exception as exc:
+                print(f"[astrbot-fact-check-image-download-error] {item.file_name or item.url}: {exc!r}", flush=True)
     if len(parts) == 1:
         return []
     raw = call_gemini_parts(
@@ -656,6 +810,7 @@ def extract_claims_from_images(
         temperature=0.0,
         max_output_tokens=640,
         request_timeout=request_timeout,
+        thinking_level="minimal",
     )
     return parse_candidates(raw, limit=limit)
 
@@ -675,6 +830,7 @@ def generate_with_fallback(
     max_attempts: int | None = None,
     http_max_retries: int = 1,
     request_timeout: int = 45,
+    thinking_level: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     clean_models = [model.strip() for model in models if str(model or "").strip()]
     if not clean_models:
@@ -700,6 +856,7 @@ def generate_with_fallback(
                 extra_parts=extra_parts,
                 http_max_retries=http_max_retries,
                 request_timeout=request_timeout,
+                thinking_level=thinking_level,
             ), model
         except Exception as exc:
             last_error = exc
@@ -708,7 +865,7 @@ def generate_with_fallback(
                 exc,
                 cooldown_seconds=model_failure_cooldown_seconds,
             )
-            if not is_retryable(exc) or attempt >= attempts - 1:
+            if not is_retryable(exc) or attempt >= attempts - 1 or not _retry_budget_available():
                 break
             next_model = active_models[min(attempt + 1, len(active_models) - 1)]
             wait = backoff_seconds(attempt, exc)
@@ -720,7 +877,7 @@ def generate_with_fallback(
                 ,
                 flush=True,
             )
-            time.sleep(wait)
+            _sleep_with_deadline(wait)
     raise RuntimeError(
         f"fact-check request failed after {attempts} attempt(s); "
         f"last_model={last_model}; last_error={error_label(last_error)}"
@@ -759,6 +916,24 @@ def _is_model_capacity_error(exc: Exception) -> bool:
     return "429" in lowered or "503" in lowered or "too many requests" in lowered
 
 
+def build_generation_config(
+    *,
+    model: str,
+    temperature: float,
+    max_output_tokens: int,
+    thinking_level: str | None = None,
+) -> dict[str, Any]:
+    config: dict[str, Any] = {"maxOutputTokens": max_output_tokens}
+    if model.startswith("gemini-3"):
+        if thinking_level:
+            config["thinkingConfig"] = {"thinkingLevel": thinking_level}
+        return config
+    config["temperature"] = temperature
+    if model.startswith("gemini-2.5-flash"):
+        config["thinkingConfig"] = {"thinkingBudget": 0}
+    return config
+
+
 def gemini_generate(
     *,
     prompt: str,
@@ -771,13 +946,14 @@ def gemini_generate(
     extra_parts: list[dict[str, Any]] | None = None,
     http_max_retries: int = 1,
     request_timeout: int = 45,
+    thinking_level: str | None = None,
 ) -> dict[str, Any]:
-    generation_config: dict[str, Any] = {
-        "temperature": temperature,
-        "maxOutputTokens": max_output_tokens,
-    }
-    if model.startswith("gemini-2.5-flash"):
-        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+    generation_config = build_generation_config(
+        model=model,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        thinking_level=thinking_level,
+    )
     parts: list[dict[str, Any]] = [{"text": prompt}]
     if extra_parts:
         parts.extend(extra_parts)
@@ -805,13 +981,16 @@ def call_gemini_parts(
     temperature: float,
     max_output_tokens: int,
     request_timeout: int = 25,
+    thinking_level: str | None = None,
 ) -> str:
     payload = {
         "contents": [{"parts": parts}],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_output_tokens,
-        },
+        "generationConfig": build_generation_config(
+            model=model,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            thinking_level=thinking_level,
+        ),
     }
     body = post_json_with_timeout(
         base_url.rstrip("/") + f"/{model}:generateContent",
@@ -1138,20 +1317,38 @@ def collect_anysearch_evidence(
         return AnysearchEvidence(reason=f"search failed: {error_label(exc)}")
 
     urls = [url for url in extract_public_urls(search_text) if is_public_http_url(url)]
-    excerpts: list[str] = []
-    excerpt_sources: list[str] = []
-    for url in urls[: max(0, _clamp_int(extract_top_urls, default=2, lower=0, upper=5))]:
+    extract_urls = urls[: max(0, _clamp_int(extract_top_urls, default=2, lower=0, upper=5))]
+    request_deadline = _REQUEST_DEADLINE.get()
+
+    def extract_page(url: str) -> tuple[str, str, str]:
+        token = _REQUEST_DEADLINE.set(request_deadline)
         try:
+            ensure_public_url_target(url)
             extracted = anysearch_call_tool(
                 tool_name="extract",
                 arguments={"url": url},
                 endpoint=endpoint,
                 api_key=api_key,
-                timeout=timeout,
+                timeout=min(max(3, timeout), 10),
+                max_retries=0,
             )
         except Exception as exc:
+            return url, "", error_label(exc)
+        finally:
+            _REQUEST_DEADLINE.reset(token)
+        return url, extracted, ""
+
+    extract_results: list[tuple[str, str, str]] = []
+    if extract_urls:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(extract_urls))) as executor:
+            extract_results = list(executor.map(extract_page, extract_urls))
+
+    excerpts: list[str] = []
+    excerpt_sources: list[str] = []
+    for url, extracted, error in extract_results:
+        if error:
             print(
-                f"[astrbot-fact-check-anysearch-extract-error] {shorten_text(url, 160)}: {error_label(exc)}",
+                f"[astrbot-fact-check-anysearch-extract-error] {shorten_text(url, 160)}: {error}",
                 flush=True,
             )
             continue
@@ -1228,6 +1425,7 @@ def anysearch_call_tool(
     endpoint = (endpoint or ANYSEARCH_DEFAULT_ENDPOINT).strip()
     if not is_public_http_url(endpoint):
         raise ValueError("Anysearch endpoint must be a public http(s) URL")
+    ensure_public_url_target(endpoint)
     clean_api_key = (api_key or os.getenv("ANYSEARCH_API_KEY") or "").strip()
     headers = {"Content-Type": "application/json"}
     if clean_api_key:
@@ -1238,15 +1436,16 @@ def anysearch_call_tool(
         "method": "tools/call",
         "params": {"name": tool_name, "arguments": arguments},
     }
-    http_timeout = httpx.Timeout(
-        float(max(3, timeout)),
-        connect=min(6.0, float(max(3, timeout))),
-        read=float(max(3, timeout)),
-        write=6.0,
-    )
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
+            bounded = _bounded_timeout(max(3, timeout))
+            http_timeout = httpx.Timeout(
+                bounded,
+                connect=min(6.0, bounded),
+                read=bounded,
+                write=min(6.0, bounded),
+            )
             with httpx.Client(timeout=http_timeout, follow_redirects=True, trust_env=True) as client:
                 response = client.post(endpoint, json=payload, headers=headers)
                 response.raise_for_status()
@@ -1261,11 +1460,11 @@ def anysearch_call_tool(
             return extract_anysearch_text(data)
         except httpx.HTTPStatusError as exc:
             last_error = exc
-            if not is_retryable(exc) or attempt >= max_retries:
+            if not is_retryable(exc) or attempt >= max_retries or not _retry_budget_available():
                 raise
         except (httpx.RequestError, json.JSONDecodeError, RuntimeError) as exc:
             last_error = exc
-            if attempt >= max_retries:
+            if attempt >= max_retries or not _retry_budget_available():
                 raise
         wait = backoff_seconds(attempt, last_error or RuntimeError("Anysearch request failed"))
         print(
@@ -1274,7 +1473,7 @@ def anysearch_call_tool(
             f"wait={wait:.1f}s error={error_label(last_error)}",
             flush=True,
         )
-        time.sleep(wait)
+        _sleep_with_deadline(wait)
     if last_error:
         raise last_error
     raise RuntimeError("Anysearch request failed without a specific error")
@@ -1323,13 +1522,38 @@ def is_public_http_url(url: str) -> bool:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return True
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
+    return ip.is_global
+
+
+def ensure_public_url_target(url: str) -> None:
+    if not is_public_http_url(url):
+        raise ValueError("URL must use public http(s)")
+    host = str(urlparse(url).hostname or "").lower()
+    try:
+        ipaddress.ip_address(host)
+        return
+    except ValueError:
+        pass
+    now = time.monotonic()
+    with _PUBLIC_HOST_CACHE_LOCK:
+        cached = _PUBLIC_HOST_CACHE.get(host)
+        if cached and now - cached[0] < 60:
+            if not cached[1]:
+                raise ValueError("URL hostname resolves to a non-public address")
+            return
+    try:
+        addresses = {
+            item[4][0]
+            for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            if item and item[4]
+        }
+    except OSError as exc:
+        raise ValueError(f"URL hostname could not be resolved: {host}") from exc
+    public = bool(addresses) and all(ipaddress.ip_address(address).is_global for address in addresses)
+    with _PUBLIC_HOST_CACHE_LOCK:
+        _PUBLIC_HOST_CACHE[host] = (now, public)
+    if not public:
+        raise ValueError("URL hostname resolves to a non-public address")
 
 
 def dedupe_sources(sources: list[str], *, limit: int) -> list[str]:
@@ -1543,17 +1767,21 @@ def request_with_retry(req: request.Request, *, timeout: int, max_retries: int):
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return request.urlopen(req, timeout=timeout)
+            return request.urlopen(req, timeout=_bounded_timeout(timeout))
         except HTTPError as exc:
             last_error = exc
-            if exc.code not in RETRYABLE_STATUS_CODES or attempt >= max_retries:
+            if (
+                exc.code not in RETRYABLE_STATUS_CODES
+                or attempt >= max_retries
+                or not _retry_budget_available()
+            ):
                 raise
-            time.sleep(1.2 * (attempt + 1))
+            _sleep_with_deadline(1.2 * (attempt + 1))
         except URLError as exc:
             last_error = exc
-            if attempt >= max_retries:
+            if attempt >= max_retries or not _retry_budget_available():
                 raise
-            time.sleep(1.2 * (attempt + 1))
+            _sleep_with_deadline(1.2 * (attempt + 1))
     if last_error:
         raise last_error
     raise RuntimeError("request failed without a specific error")
@@ -1630,10 +1858,16 @@ def post_json_with_timeout(
     timeout: int,
     max_retries: int = 1,
 ) -> dict[str, Any]:
-    http_timeout = httpx.Timeout(float(timeout), connect=min(8.0, float(timeout)), read=float(timeout), write=8.0)
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
+            bounded = _bounded_timeout(timeout)
+            http_timeout = httpx.Timeout(
+                bounded,
+                connect=min(8.0, bounded),
+                read=bounded,
+                write=min(8.0, bounded),
+            )
             with httpx.Client(timeout=http_timeout, follow_redirects=True, trust_env=True) as client:
                 response = client.post(
                     url,
@@ -1644,11 +1878,11 @@ def post_json_with_timeout(
                 return response.json()
         except httpx.HTTPStatusError as exc:
             last_error = exc
-            if not is_retryable(exc) or attempt >= max_retries:
+            if not is_retryable(exc) or attempt >= max_retries or not _retry_budget_available():
                 raise
         except httpx.RequestError as exc:
             last_error = exc
-            if attempt >= max_retries:
+            if attempt >= max_retries or not _retry_budget_available():
                 raise
         wait = backoff_seconds(attempt, last_error or RuntimeError("request failed"))
         print(
@@ -1657,7 +1891,7 @@ def post_json_with_timeout(
             f"error={error_label(last_error)}",
             flush=True,
         )
-        time.sleep(wait)
+        _sleep_with_deadline(wait)
     if last_error:
         raise last_error
     raise RuntimeError("HTTP request failed without a specific error")
@@ -1685,12 +1919,20 @@ def read_image_input_bytes(item: ImageInput, *, max_bytes: int | None, timeout: 
 def get_bytes_with_timeout(url: str, *, max_bytes: int | None, timeout: int) -> tuple[bytes, str]:
     if not is_public_http_url(url):
         raise ValueError("image url must be public http(s)")
-    http_timeout = httpx.Timeout(float(timeout), connect=min(5.0, float(timeout)), read=float(timeout), write=5.0)
+    bounded = _bounded_timeout(timeout)
+    http_timeout = httpx.Timeout(
+        bounded,
+        connect=min(5.0, bounded),
+        read=bounded,
+        write=min(5.0, bounded),
+    )
     current_url = url
+    ensure_public_url_target(current_url)
     with httpx.Client(timeout=http_timeout, follow_redirects=False, trust_env=True) as client:
         for _ in range(5):
             if not is_public_http_url(current_url):
                 raise ValueError("image redirect target must be public http(s)")
+            ensure_public_url_target(current_url)
             response_cm = client.stream("GET", current_url, headers={"User-Agent": "AstrBot-QQ-Agent/0.1"})
             with response_cm as response:
                 if 300 <= response.status_code < 400 and response.headers.get("Location"):

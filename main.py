@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import html
 import json
@@ -171,28 +172,30 @@ class FactCheckPlugin(Star):
         self._active_followup_jobs = max(0, int(getattr(self, "_active_followup_jobs", 0))) + 1
         try:
             async with self._fact_check_semaphore:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        run_fact_check_followup,
-                        original_text=session.request_data.text,
-                        candidates=session.candidates,
-                        previous_reply=session.reply,
-                        previous_sources=session.sources,
-                        question=question,
-                        api_key=str(self.config.get("gemini_api_key") or ""),
-                        base_url=str(
-                            self.config.get(
-                                "gemini_base_url",
-                                "https://generativelanguage.googleapis.com/v1beta/models",
-                            )
-                            or "https://generativelanguage.googleapis.com/v1beta/models"
-                        ),
-                        main_models=[
-                            str(self.config.get("fact_check_evidence_model") or "gemini-2.5-flash").strip(),
-                        ],
-                        request_timeout=int(self.config.get("fact_check_main_timeout_seconds") or 45),
+                total_timeout = max(
+                    10,
+                    int(self.config.get("fact_check_total_timeout_seconds") or 90),
+                )
+                result = await asyncio.to_thread(
+                    run_fact_check_followup,
+                    original_text=session.request_data.text,
+                    candidates=session.candidates,
+                    previous_reply=session.reply,
+                    previous_sources=session.sources,
+                    question=question,
+                    api_key=str(self.config.get("gemini_api_key") or ""),
+                    base_url=str(
+                        self.config.get(
+                            "gemini_base_url",
+                            "https://generativelanguage.googleapis.com/v1beta/models",
+                        )
+                        or "https://generativelanguage.googleapis.com/v1beta/models"
                     ),
-                    timeout=max(10.0, float(self.config.get("fact_check_total_timeout_seconds") or 90)),
+                    main_models=[
+                        str(self.config.get("fact_check_evidence_model") or "gemini-2.5-flash").strip(),
+                    ],
+                    request_timeout=int(self.config.get("fact_check_main_timeout_seconds") or 45),
+                    total_timeout_seconds=total_timeout,
                 )
         except asyncio.TimeoutError:
             reason = f"follow-up timeout after {time.perf_counter() - started_at:.1f}s"
@@ -312,85 +315,83 @@ class FactCheckPlugin(Star):
                     10.0,
                     float(self.config.get("fact_check_total_timeout_seconds") or 90),
                 )
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        run_fact_check,
-                        request_data=request_data,
-                        api_key=str(self.config.get("gemini_api_key") or ""),
-                        base_url=str(
-                            self.config.get(
-                                "gemini_base_url",
-                                "https://generativelanguage.googleapis.com/v1beta/models",
-                            )
-                            or "https://generativelanguage.googleapis.com/v1beta/models",
-                        ),
-                        pre_model=str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite"),
-                        evidence_model=str(
-                            self.config.get("fact_check_evidence_model") or "gemini-2.5-flash",
-                        ).strip(),
-                        verdict_models=self._list_config(
-                            "fact_check_verdict_models",
-                            ["gemini-3-flash-preview"],
-                        ),
-                        max_image_bytes=int(self.config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024),
-                        long_image_chunk_height=int(
-                            self.config.get("fact_check_long_image_chunk_height") or 2200,
-                        ),
-                        long_image_max_parts=int(
-                            self.config.get("fact_check_long_image_max_parts") or 8,
-                        ),
-                        long_image_max_width=int(
-                            self.config.get("fact_check_long_image_max_width") or 1280,
-                        ),
-                        image_download_timeout=int(
-                            self.config.get("fact_check_image_download_timeout_seconds") or 10,
-                        ),
-                        pre_request_timeout=int(
-                            self.config.get("fact_check_pre_timeout_seconds") or 25,
-                        ),
-                        main_request_timeout=int(
-                            self.config.get("fact_check_main_timeout_seconds") or 45,
-                        ),
-                        anysearch_enabled=bool(
-                            self.config.get("fact_check_anysearch_enabled", False),
-                        ),
-                        anysearch_endpoint=str(
-                            self.config.get("fact_check_anysearch_endpoint")
-                            or "https://api.anysearch.com/mcp",
-                        ),
-                        anysearch_api_key=str(
-                            self.config.get("fact_check_anysearch_api_key") or "",
-                        ),
-                        anysearch_timeout=int(
-                            self.config.get("fact_check_anysearch_timeout_seconds") or 20,
-                        ),
-                        anysearch_max_claims=int(
-                            self.config.get("fact_check_anysearch_max_claims") or 3,
-                        ),
-                        anysearch_max_results_per_claim=int(
-                            self.config.get("fact_check_anysearch_max_results_per_claim") or 3,
-                        ),
-                        anysearch_extract_top_urls=int(
-                            self.config.get("fact_check_anysearch_extract_top_urls") or 2,
-                        ),
-                        anysearch_max_chars=int(
-                            self.config.get("fact_check_anysearch_max_chars") or 6000,
-                        ),
-                        anysearch_freshness=str(
-                            self.config.get("fact_check_anysearch_freshness") or "",
-                        ),
-                        anysearch_content_types=self._list_config(
-                            "fact_check_anysearch_content_types",
-                            ["web", "news"],
-                        ),
-                        model_failure_cooldown_seconds=int(
-                            self.config.get("fact_check_model_failure_cooldown_seconds") or 900,
-                        ),
-                        verdict_request_timeout=int(
-                            self.config.get("fact_check_verdict_timeout_seconds") or 25,
-                        ),
+                result = await asyncio.to_thread(
+                    run_fact_check,
+                    request_data=request_data,
+                    api_key=str(self.config.get("gemini_api_key") or ""),
+                    base_url=str(
+                        self.config.get(
+                            "gemini_base_url",
+                            "https://generativelanguage.googleapis.com/v1beta/models",
+                        )
+                        or "https://generativelanguage.googleapis.com/v1beta/models",
                     ),
-                    timeout=timeout_seconds,
+                    pre_model=str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite"),
+                    evidence_model=str(
+                        self.config.get("fact_check_evidence_model") or "gemini-2.5-flash",
+                    ).strip(),
+                    verdict_models=self._list_config(
+                        "fact_check_verdict_models",
+                        ["gemini-3-flash-preview"],
+                    ),
+                    max_image_bytes=int(self.config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024),
+                    long_image_chunk_height=int(
+                        self.config.get("fact_check_long_image_chunk_height") or 2200,
+                    ),
+                    long_image_max_parts=int(
+                        self.config.get("fact_check_long_image_max_parts") or 8,
+                    ),
+                    long_image_max_width=int(
+                        self.config.get("fact_check_long_image_max_width") or 1280,
+                    ),
+                    image_download_timeout=int(
+                        self.config.get("fact_check_image_download_timeout_seconds") or 10,
+                    ),
+                    pre_request_timeout=int(
+                        self.config.get("fact_check_pre_timeout_seconds") or 25,
+                    ),
+                    main_request_timeout=int(
+                        self.config.get("fact_check_main_timeout_seconds") or 45,
+                    ),
+                    anysearch_enabled=bool(
+                        self.config.get("fact_check_anysearch_enabled", False),
+                    ),
+                    anysearch_endpoint=str(
+                        self.config.get("fact_check_anysearch_endpoint")
+                        or "https://api.anysearch.com/mcp",
+                    ),
+                    anysearch_api_key=str(
+                        self.config.get("fact_check_anysearch_api_key") or "",
+                    ),
+                    anysearch_timeout=int(
+                        self.config.get("fact_check_anysearch_timeout_seconds") or 20,
+                    ),
+                    anysearch_max_claims=int(
+                        self.config.get("fact_check_anysearch_max_claims") or 3,
+                    ),
+                    anysearch_max_results_per_claim=int(
+                        self.config.get("fact_check_anysearch_max_results_per_claim") or 3,
+                    ),
+                    anysearch_extract_top_urls=int(
+                        self.config.get("fact_check_anysearch_extract_top_urls") or 2,
+                    ),
+                    anysearch_max_chars=int(
+                        self.config.get("fact_check_anysearch_max_chars") or 6000,
+                    ),
+                    anysearch_freshness=str(
+                        self.config.get("fact_check_anysearch_freshness") or "",
+                    ),
+                    anysearch_content_types=self._list_config(
+                        "fact_check_anysearch_content_types",
+                        ["web", "news"],
+                    ),
+                    model_failure_cooldown_seconds=int(
+                        self.config.get("fact_check_model_failure_cooldown_seconds") or 900,
+                    ),
+                    verdict_request_timeout=int(
+                        self.config.get("fact_check_verdict_timeout_seconds") or 25,
+                    ),
+                    total_timeout_seconds=int(timeout_seconds),
                 )
         except asyncio.TimeoutError:
             elapsed = time.perf_counter() - started_at
@@ -423,8 +424,11 @@ class FactCheckPlugin(Star):
             f"[astrbot-fact-check-done] {label}: "
             f"{time.perf_counter() - started_at:.2f}s",
         )
-        self._set_cached_result(cache_key, result)
-        session_id = self._remember_fact_check_session(event, request_data, result)
+        successful = self._is_successful_result(result)
+        session_id = None
+        if successful:
+            self._set_cached_result(cache_key, result)
+            session_id = self._remember_fact_check_session(event, request_data, result)
         await self._send_fact_check_reply(
             event,
             result.reply or FAILED_REPLY,
@@ -694,18 +698,21 @@ class FactCheckPlugin(Star):
                 return default
             return value
 
+        image_records: list[dict[str, str]] = []
+        for image in request_data.images:
+            digest = image.content_sha256 or self._image_input_digest(image)
+            image_records.append(
+                {
+                    "content_sha256": digest,
+                    "url": "" if digest else image.url,
+                    "file_name": "" if digest else image.file_name,
+                },
+            )
         anysearch_api_key = str(self.config.get("fact_check_anysearch_api_key") or "").strip()
         payload = {
             "text": request_data.text.strip(),
             "speaker": request_data.speaker.strip(),
-            "images": [
-                {
-                    "url": image.url,
-                    "file_name": image.file_name,
-                    "path": image.path,
-                }
-                for image in request_data.images
-            ],
+            "images": image_records,
             "models": {
                 "pre": str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite").strip(),
                 "evidence": str(self.config.get("fact_check_evidence_model") or "gemini-2.5-flash").strip(),
@@ -741,6 +748,40 @@ class FactCheckPlugin(Star):
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _is_successful_result(result: FactCheckResult) -> bool:
+        return not result.reason or result.reason.startswith("ok")
+
+    @staticmethod
+    def _image_input_digest(image: ImageInput) -> str:
+        if image.content_sha256:
+            return image.content_sha256
+        path = Path(str(image.path or "").removeprefix("file:///").removeprefix("file://"))
+        if not path.is_file():
+            return ""
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError:
+            return ""
+
+    def _dedupe_image_inputs(self, images: Iterable[ImageInput]) -> list[ImageInput]:
+        unique: list[ImageInput] = []
+        seen: set[str] = set()
+        for image in images:
+            digest = image.content_sha256 or self._image_input_digest(image)
+            key = f"sha256:{digest}" if digest else f"url:{str(image.url or '').strip()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            if digest and not image.content_sha256:
+                image.content_sha256 = digest
+            unique.append(image)
+        return unique
 
     def _is_fact_check_allowed(self, event: AstrMessageEvent) -> bool:
         if is_plugin_allowed is None:
@@ -828,6 +869,7 @@ class FactCheckPlugin(Star):
         self._cleanup_fact_check_sessions()
         ids: list[str] = []
         quoted_looks_like_fact_check = False
+        quoted_fact_check_texts: list[str] = []
         for text in _event_text_candidates(event):
             ids.extend(self._extract_fact_check_session_ids(text))
 
@@ -836,20 +878,24 @@ class FactCheckPlugin(Star):
                 continue
             for text in [str(comp.message_str or "")] + self._plain_texts(comp.chain or []):
                 ids.extend(self._extract_fact_check_session_ids(text))
-                quoted_looks_like_fact_check = quoted_looks_like_fact_check or self._looks_like_fact_check_reply(text)
+                if self._looks_like_fact_check_reply(text):
+                    quoted_looks_like_fact_check = True
+                    quoted_fact_check_texts.append(text)
             fetched = await self._fetch_reply_payload(event, comp)
             if fetched:
                 fetched_texts, _, _ = fetched
                 for text in fetched_texts:
                     ids.extend(self._extract_fact_check_session_ids(text))
-                    quoted_looks_like_fact_check = quoted_looks_like_fact_check or self._looks_like_fact_check_reply(text)
+                    if self._looks_like_fact_check_reply(text):
+                        quoted_looks_like_fact_check = True
+                        quoted_fact_check_texts.append(text)
 
         for session_id in ids:
             session = self._fact_check_sessions.get(session_id)
             if session:
                 return session, False
 
-        # NapCat sometimes exposes a fact-check quote without the marker. Only then use latest session.
+        # NapCat may omit the marker. Bind only when the quoted result itself matches a saved session.
         if not quoted_looks_like_fact_check:
             return None, bool(ids)
         candidates = [
@@ -859,12 +905,46 @@ class FactCheckPlugin(Star):
         ]
         if not candidates:
             return None, True
-        latest = candidates[0]
-        for candidate in candidates[1:]:
-            if candidate.created_at > latest.created_at:
-                latest = candidate
-        return latest, False
-        return max(candidates, key=lambda item: item.created_at)
+        ranked = sorted(
+            (
+                (
+                    max(
+                        (
+                            self._fact_check_reply_match_score(text, session.reply)
+                            for text in quoted_fact_check_texts
+                        ),
+                        default=0.0,
+                    ),
+                    session,
+                )
+                for session in candidates
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        best_score, best_session = ranked[0]
+        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+        if best_score < 0.62 or (len(ranked) > 1 and best_score - second_score < 0.08):
+            return None, True
+        return best_session, False
+
+    @staticmethod
+    def _fact_check_reply_match_score(quoted: str, saved: str) -> float:
+        def normalize(value: str) -> str:
+            value = re.sub(r"fc_[0-9a-fA-F]{8,16}", "", str(value or ""))
+            value = re.sub(r"核查ID[:：]?", "", value)
+            value = re.sub(r"追问可回复本消息[。.]?", "", value)
+            return re.sub(r"[^\w\u4e00-\u9fff]+", "", value).lower()[:4000]
+
+        left = normalize(quoted)
+        right = normalize(saved)
+        if not left or not right:
+            return 0.0
+        if len(left) >= 40 and left in right:
+            return min(1.0, 0.85 + len(left) / max(len(right), 1) * 0.15)
+        if len(right) >= 40 and right in left:
+            return min(1.0, 0.85 + len(right) / max(len(left), 1) * 0.15)
+        return difflib.SequenceMatcher(None, left, right, autojunk=False).ratio()
 
     @staticmethod
     def _extract_fact_check_session_ids(text: str | None) -> list[str]:
@@ -938,32 +1018,8 @@ class FactCheckPlugin(Star):
         result = self._get_cached_result(cache_key)
         return result.reply if result else ""
 
-        ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))
-        if ttl <= 0:
-            return ""
-        cached = self._reply_cache.get(cache_key)
-        if not cached:
-            return ""
-        created_at, reply = cached
-        if time.time() - created_at > ttl:
-            self._reply_cache.pop(cache_key, None)
-            return ""
-        return reply
-
     def _set_cached_reply(self, cache_key: str, reply: str) -> None:
         self._set_cached_result(cache_key, FactCheckResult(str(reply or FAILED_REPLY), "ok; cache", [], []))
-        return
-
-        ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))
-        if ttl <= 0:
-            return
-        self._reply_cache[cache_key] = (time.time(), reply)
-        max_entries = max(8, int(self.config.get("fact_check_cache_max_entries") or 32))
-        if len(self._reply_cache) <= max_entries:
-            return
-        stale = sorted(self._reply_cache.items(), key=lambda item: item[1][0])
-        for key, _ in stale[: len(self._reply_cache) - max_entries]:
-            self._reply_cache.pop(key, None)
 
     def _cooldown_left(self) -> float:
         return max(0.0, self._cooldown_until - time.time())
@@ -1043,6 +1099,7 @@ class FactCheckPlugin(Star):
         quoted_texts: list[str] = []
         images: list[ImageInput] = []
         max_images = max(0, int(self.config.get("fact_check_max_images") or 2))
+        collect_limit = max(max_images + 4, max_images * 3)
 
         for comp in event.get_messages():
             if isinstance(comp, Reply):
@@ -1058,7 +1115,7 @@ class FactCheckPlugin(Star):
                 if comp.chain:
                     local_texts.extend(self._plain_texts(comp.chain))
                     local_forward_ids.extend(self._extract_forward_ids_from_components(comp.chain))
-                    images.extend(await self._image_inputs(comp.chain, remaining=max_images - len(images)))
+                    images.extend(await self._image_inputs(comp.chain, remaining=collect_limit - len(images)))
                 local_text = "\n".join(part for part in local_texts if part).strip()
                 if local_text and not self._is_unusable_quoted_text(local_text):
                     quoted_texts.append(local_text)
@@ -1076,14 +1133,14 @@ class FactCheckPlugin(Star):
                         for fetched_text in fetched_texts:
                             if fetched_text and fetched_text not in quoted_texts:
                                 quoted_texts.append(fetched_text)
-                        images.extend(await self._image_inputs(fetched_images, remaining=max_images - len(images)))
+                        images.extend(await self._image_inputs(fetched_images, remaining=collect_limit - len(images)))
                 if local_forward_ids:
                     speaker = await self._append_forward_payloads(
                         event,
                         local_forward_ids,
                         quoted_texts=quoted_texts,
                         images=images,
-                        max_images=max_images,
+                        max_images=collect_limit,
                         speaker=speaker,
                         label=f"reply:{getattr(comp, 'id', '')}",
                     )
@@ -1093,7 +1150,7 @@ class FactCheckPlugin(Star):
                     [str(getattr(comp, "id", "") or "")],
                     quoted_texts=quoted_texts,
                     images=images,
-                    max_images=max_images,
+                    max_images=collect_limit,
                     speaker=speaker,
                     label="direct",
                 )
@@ -1105,15 +1162,15 @@ class FactCheckPlugin(Star):
                         forward_ids,
                         quoted_texts=quoted_texts,
                         images=images,
-                        max_images=max_images,
+                        max_images=collect_limit,
                         speaker=speaker,
                         label="plain",
                     )
             elif isinstance(comp, Image):
-                images.extend(await self._image_inputs([comp], remaining=max_images - len(images)))
+                images.extend(await self._image_inputs([comp], remaining=collect_limit - len(images)))
 
-            if len(images) >= max_images:
-                images = images[:max_images]
+            if len(images) >= collect_limit:
+                images = images[:collect_limit]
 
         text = "\n".join(part for part in quoted_texts if part).strip()
         if self._is_unusable_quoted_text(text):
@@ -1126,11 +1183,12 @@ class FactCheckPlugin(Star):
         if inline_text and not self._is_unusable_quoted_text(inline_text):
             text = (text + "\n" + inline_text).strip() if text else inline_text
 
+        images = self._dedupe_image_inputs(images)[:max_images]
         return FactCheckRequest(
             text=text[:3000],
             trigger_text=trigger_text,
             speaker=speaker,
-            images=images[:max_images],
+            images=images,
         )
 
     async def _fetch_reply_payload(
@@ -1479,7 +1537,17 @@ class FactCheckPlugin(Star):
                 url = ""
             if not path and not url:
                 continue
-            images.append(ImageInput(url=url, file_name=file_name, path=path))
+            content_sha256 = ""
+            if path:
+                content_sha256 = self._image_input_digest(ImageInput(url=url, file_name=file_name, path=path))
+            images.append(
+                ImageInput(
+                    url=url,
+                    file_name=file_name,
+                    path=path,
+                    content_sha256=content_sha256,
+                ),
+            )
             if len(images) >= remaining:
                 break
         return images
@@ -1497,8 +1565,13 @@ class FactCheckPlugin(Star):
                 suffix = Path(str(file_name or "").split("?", 1)[0]).suffix.lower()
             if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
                 suffix = ".img"
-            target = cache_dir / f"{uuid.uuid4().hex}{suffix}"
-            shutil.copy2(source, target)
+            digest = hashlib.sha256()
+            with source.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            target = cache_dir / f"{digest.hexdigest()}{suffix}"
+            if not target.exists():
+                shutil.copy2(source, target)
             return str(target)
         except Exception as exc:
             logger.warning(

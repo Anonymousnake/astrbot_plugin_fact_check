@@ -16,7 +16,7 @@ from fact_check import (
     ClaimCandidate,
     FactCheckRequest,
     ImageInput,
-    append_anysearch_source_note,
+    append_source_links,
     build_anysearch_queries,
     compact_source_label,
     collect_anysearch_evidence,
@@ -132,22 +132,6 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence.text, "")
         self.assertEqual(evidence.sources, [])
 
-    def test_append_anysearch_source_note_shows_compact_public_sources(self) -> None:
-        reply = append_anysearch_source_note(
-            "事实核查：大致可信",
-            AnysearchEvidence(
-                sources=[
-                    "https://www.iana.org/domains/reserved",
-                    "https://rfc2cn.com/rfc6761.html",
-                    "https://www.iana.org/domains/reserved",
-                ],
-            ),
-        )
-
-        self.assertIn("预检索线索：Anysearch 命中 2 个公开来源", reply)
-        self.assertIn("iana.org/domains/reserved", reply)
-        self.assertIn("rfc2cn.com/rfc6761.html", reply)
-
     def test_compact_source_label_prefers_domain_and_short_path(self) -> None:
         self.assertEqual(
             compact_source_label("https://www.iana.org/domains/reserved/example/path"),
@@ -210,7 +194,17 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertIn("https://example.com/source", captured["prompt"])
         self.assertEqual(result.sources, ["https://example.com/source"])
         self.assertIn("事实核查：大致可信", result.reply)
-        self.assertIn("预检索线索：Anysearch 命中 1 个公开来源：example.com/source", result.reply)
+        self.assertIn("可核验链接：", result.reply)
+        self.assertIn("https://example.com/source", result.reply)
+
+    def test_final_reply_always_appends_clickable_source_urls(self) -> None:
+        reply = append_source_links(
+            "事实核查：可信\n来源：Example News",
+            ["Example News：https://example.com/report"],
+        )
+
+        self.assertIn("可核验链接：", reply)
+        self.assertIn("https://example.com/report", reply)
 
     def test_extraction_prompt_splits_high_risk_composite_claims(self) -> None:
         captured: dict[str, str] = {}
@@ -442,6 +436,21 @@ class AnysearchEvidenceTests(unittest.TestCase):
         with patch("fact_check.httpx.Client") as client:
             with self.assertRaises(ValueError):
                 read_image_input_bytes(ImageInput(url="http://127.0.0.1/private.png"), max_bytes=10, timeout=1)
+        client.assert_not_called()
+
+    def test_read_image_input_bytes_rejects_hostname_resolving_to_private_ip(self) -> None:
+        with (
+            patch("fact_check._PUBLIC_HOST_CACHE", {}),
+            patch("fact_check.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.8", 0))]),
+            patch("fact_check.httpx.Client") as client,
+        ):
+            with self.assertRaises(ValueError):
+                read_image_input_bytes(
+                    ImageInput(url="https://private.example/image.png"),
+                    max_bytes=10,
+                    timeout=1,
+                )
+
         client.assert_not_called()
 
     def test_dedupe_candidates_merges_near_duplicate_wrapped_claims(self) -> None:

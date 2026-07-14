@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from astrbot.api.message_components import Image, Plain, Reply
-from astrbot_plugin_fact_check.fact_check import ClaimCandidate, FactCheckRequest, FactCheckResult
+from astrbot_plugin_fact_check.fact_check import ClaimCandidate, FactCheckRequest, FactCheckResult, ImageInput
 from astrbot_plugin_fact_check import main
 
 
@@ -104,6 +105,52 @@ def make_plugin() -> main.FactCheckPlugin:
 
 
 class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_fact_check_is_not_cached_or_saved_for_followup(self) -> None:
+        plugin = make_plugin()
+        event = FakeEvent(fail_send=False)
+        request = FactCheckRequest(text="A 事件", trigger_text="/事实核查")
+        failed = FactCheckResult(reply="这条我现在没查成。", reason="request timeout")
+
+        with (
+            patch("astrbot_plugin_fact_check.main.run_fact_check", return_value=failed),
+            patch.object(plugin, "_send_fact_check_reply", new=AsyncMock()) as send,
+        ):
+            await plugin._run_fact_check_job(event, request, time.perf_counter(), "cache-key")
+
+        self.assertEqual(plugin._reply_cache, {})
+        self.assertEqual(plugin._fact_check_sessions, {})
+        self.assertIsNone(send.call_args.kwargs["session_id"])
+
+    def test_request_cache_key_uses_image_content_instead_of_snapshot_path(self) -> None:
+        plugin = make_plugin()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.png"
+            second = root / "second.png"
+            first.write_bytes(b"same-image")
+            second.write_bytes(b"same-image")
+
+            first_key = plugin._request_cache_key(
+                FactCheckRequest("", "/事实核查", images=[ImageInput("", "first.png", str(first))]),
+            )
+            second_key = plugin._request_cache_key(
+                FactCheckRequest("", "/事实核查", images=[ImageInput("", "second.png", str(second))]),
+            )
+
+        self.assertEqual(first_key, second_key)
+
+    def test_duplicate_image_inputs_are_collapsed_by_content(self) -> None:
+        plugin = make_plugin()
+        images = [
+            ImageInput("https://example.com/a.png", content_sha256="abc"),
+            ImageInput("https://example.com/b.png", content_sha256="abc"),
+            ImageInput("https://example.com/c.png", content_sha256="def"),
+        ]
+
+        result = plugin._dedupe_image_inputs(images)
+
+        self.assertEqual([item.content_sha256 for item in result], ["abc", "def"])
+
     async def test_send_fact_check_reply_falls_back_to_onebot_text(self) -> None:
         plugin = object.__new__(main.FactCheckPlugin)
         plugin._dump_forward_failure = lambda *args, **kwargs: None
@@ -284,6 +331,61 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.stopped)
         self.assertEqual(len(event.sent), 1)
         self.assertIn("上下文已过期", event.sent[0]["plain"])
+
+    async def test_markerless_followup_matches_the_quoted_session_not_the_latest(self) -> None:
+        plugin = make_plugin()
+        older = main.FactCheckSession(
+            session_id="fc_11111111",
+            created_at=time.time() - 10,
+            group_id="123456",
+            user_id="654321",
+            request_data=FactCheckRequest("older", "/事实核查"),
+            reply="事实核查：部分存疑\n1. 核查点：旧事件是否发生。\n结论：证据不足。",
+        )
+        latest = main.FactCheckSession(
+            session_id="fc_22222222",
+            created_at=time.time(),
+            group_id="123456",
+            user_id="654321",
+            request_data=FactCheckRequest("latest", "/事实核查"),
+            reply="事实核查：可信\n1. 核查点：新事件已经发生。\n结论：已核实。",
+        )
+        plugin._fact_check_sessions = {older.session_id: older, latest.session_id: latest}
+        event = FakeEvent(
+            message_str="再解释一下",
+            messages=[Reply(id="1", message_str=older.reply)],
+            fail_send=False,
+        )
+
+        with patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)):
+            session, missing = await plugin._find_followup_session_with_state(event)
+
+        self.assertFalse(missing)
+        self.assertIs(session, older)
+
+    async def test_ambiguous_markerless_followup_does_not_guess_latest_session(self) -> None:
+        plugin = make_plugin()
+        for index in range(2):
+            session_id = f"fc_{index + 1:08d}"
+            plugin._fact_check_sessions[session_id] = main.FactCheckSession(
+                session_id=session_id,
+                created_at=time.time() + index,
+                group_id="123456",
+                user_id="654321",
+                request_data=FactCheckRequest(str(index), "/事实核查"),
+                reply=f"事实核查：可信\n核查点：事件 {index}。",
+            )
+        event = FakeEvent(
+            message_str="再解释一下",
+            messages=[Reply(id="1", message_str="事实核查：可信")],
+            fail_send=False,
+        )
+
+        with patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)):
+            session, missing = await plugin._find_followup_session_with_state(event)
+
+        self.assertIsNone(session)
+        self.assertTrue(missing)
 
     async def test_image_inputs_reject_untrusted_schemes_and_private_http(self) -> None:
         plugin = make_plugin()

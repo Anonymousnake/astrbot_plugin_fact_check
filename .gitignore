@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.codegraph/
 
 # Local secrets and machine-specific config
 .env
