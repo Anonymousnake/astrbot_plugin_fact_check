@@ -402,6 +402,23 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].url, "https://example.com/public.png")
 
+    async def test_image_inputs_snapshot_existing_component_path(self) -> None:
+        plugin = make_plugin()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "astrbot-temp.png"
+            source.write_bytes(b"stable-image-content")
+            component = Image(file="quoted.png", path=str(source))
+
+            with patch.object(main.StarTools, "get_data_dir", return_value=root / "plugin-data"):
+                result = await plugin._image_inputs([component], remaining=1)
+
+            self.assertEqual(len(result), 1)
+            self.assertNotEqual(result[0].path, str(source))
+            self.assertTrue(Path(result[0].path).is_file())
+            source.unlink()
+            self.assertEqual(Path(result[0].path).read_bytes(), b"stable-image-content")
+
 
 if __name__ == "__main__":
     unittest.main()

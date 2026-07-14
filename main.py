@@ -1515,7 +1515,12 @@ class FactCheckPlugin(Star):
                 continue
             file_name = str(comp.file or "").strip()
             path = str(getattr(comp, "path", "") or "").strip()
-            if not path:
+            if path:
+                path = self._snapshot_image_path(path, file_name=file_name)
+                logger.info(
+                    f"[astrbot-fact-check-image-local] {self._short_ref(file_name or str(comp.url or ''))}: {path}",
+                )
+            else:
                 try:
                     path = await asyncio.wait_for(comp.convert_to_file_path(), timeout=resolve_timeout)
                     path = self._snapshot_image_path(path, file_name=file_name)
