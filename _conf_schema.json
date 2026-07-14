@@ -44,8 +44,25 @@
   "fact_check_verdict_timeout_seconds": {
     "type": "int",
     "description": "Timeout seconds for the Gemini 3 evidence-only verdict review",
-    "hint": "On timeout or an empty reply, the plugin immediately sends the complete Gemini 2.5 grounded result.",
+    "hint": "On timeout or two incomplete replies, the plugin sends the complete Gemini 2.5 grounded result.",
     "default": 25
+  },
+  "fact_check_verdict_max_output_tokens": {
+    "type": "int",
+    "description": "Output-token limit for the first Gemini 3 verdict review",
+    "hint": "A truncated verdict is retried once with the larger retry limit before falling back to grounded evidence.",
+    "default": 2048
+  },
+  "fact_check_verdict_retry_max_output_tokens": {
+    "type": "int",
+    "description": "Output-token limit for one retry after a truncated Gemini 3 verdict",
+    "default": 4096
+  },
+  "fact_check_source_link_timeout_seconds": {
+    "type": "int",
+    "description": "Timeout seconds when resolving Google grounding redirect links",
+    "hint": "Failed redirect resolution keeps the source title but omits the long Google intermediate URL.",
+    "default": 4
   },
   "fact_check_max_images": {
     "type": "int",

@@ -25,6 +25,7 @@ from fact_check import (
     extract_claims_from_text,
     is_public_http_url,
     normalize_anysearch_query,
+    normalize_fact_check_sources,
     run_fact_check,
     read_image_input_bytes,
     sanitize_anysearch_evidence_text,
@@ -205,6 +206,34 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         self.assertIn("可核验链接：", reply)
         self.assertIn("https://example.com/report", reply)
+
+    def test_google_grounding_redirect_is_replaced_with_final_public_url(self) -> None:
+        source = (
+            "Official report：https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+            "AUZIYExample"
+        )
+        with patch(
+            "fact_check.resolve_google_grounding_redirect",
+            return_value="https://www.example.gov/report",
+        ):
+            sources = normalize_fact_check_sources([source], redirect_timeout=1)
+
+        self.assertEqual(sources, ["Official report：https://www.example.gov/report"])
+        reply = append_source_links("事实核查：可信", sources)
+        self.assertIn("https://www.example.gov/report", reply)
+        self.assertNotIn("vertexaisearch.cloud.google.com", reply)
+
+    def test_unresolved_google_grounding_redirect_keeps_title_without_long_url(self) -> None:
+        source = (
+            "Official report：https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+            "AUZIYExample"
+        )
+        with patch("fact_check.resolve_google_grounding_redirect", return_value=""):
+            sources = normalize_fact_check_sources([source], redirect_timeout=1)
+
+        self.assertEqual(sources, ["Official report"])
+        reply = append_source_links("事实核查：可信", sources)
+        self.assertNotIn("可核验链接：", reply)
 
     def test_extraction_prompt_splits_high_risk_composite_claims(self) -> None:
         captured: dict[str, str] = {}

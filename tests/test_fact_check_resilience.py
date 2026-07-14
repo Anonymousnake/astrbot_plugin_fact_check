@@ -407,6 +407,97 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.reply, "Fact check: grounded fallback.")
 
+    def test_truncated_verdict_is_retried_with_more_output_tokens(self) -> None:
+        evidence_response = {
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": "事实核查：证据模型的完整结果。"}]},
+            }],
+        }
+        truncated_verdict = {
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定，"}]},
+            }],
+        }
+        completed_verdict = {
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定。"}]},
+            }],
+        }
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("请核查：A 是否属实？")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                side_effect=[
+                    (evidence_response, "gemini-2.5-flash"),
+                    (truncated_verdict, "gemini-3-flash-preview"),
+                    (completed_verdict, "gemini-3-flash-preview"),
+                ],
+            ) as generate,
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A claim", trigger_text="/factcheck"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview"],
+            )
+
+        self.assertEqual(result.reply, "事实核查：混合结论\n结论：表述需限定。")
+        self.assertEqual(generate.call_count, 3)
+        self.assertEqual(generate.call_args_list[1].kwargs["max_output_tokens"], 2048)
+        self.assertEqual(generate.call_args_list[2].kwargs["max_output_tokens"], 4096)
+
+    def test_twice_truncated_verdict_falls_back_to_grounded_evidence(self) -> None:
+        evidence_response = {
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": "事实核查：证据模型的完整结果。"}]},
+            }],
+        }
+        truncated_verdict = {
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定，"}]},
+            }],
+        }
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("请核查：A 是否属实？")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                side_effect=[
+                    (evidence_response, "gemini-2.5-flash"),
+                    (truncated_verdict, "gemini-3-flash-preview"),
+                    (truncated_verdict, "gemini-3-flash-preview"),
+                ],
+            ),
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A claim", trigger_text="/factcheck"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview"],
+            )
+
+        self.assertEqual(result.reply, "事实核查：证据模型的完整结果。")
+
     def test_unavailable_best_model_is_skipped_during_cooldown(self) -> None:
         request = fact_check.httpx.Request("POST", "https://example.invalid/models/generateContent")
         response = fact_check.httpx.Response(503, request=request)

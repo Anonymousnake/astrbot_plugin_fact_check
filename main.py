@@ -195,6 +195,9 @@ class FactCheckPlugin(Star):
                         str(self.config.get("fact_check_evidence_model") or "gemini-2.5-flash").strip(),
                     ],
                     request_timeout=int(self.config.get("fact_check_main_timeout_seconds") or 45),
+                    source_link_timeout=int(
+                        self.config.get("fact_check_source_link_timeout_seconds") or 4,
+                    ),
                     total_timeout_seconds=total_timeout,
                 )
         except asyncio.TimeoutError:
@@ -390,6 +393,15 @@ class FactCheckPlugin(Star):
                     ),
                     verdict_request_timeout=int(
                         self.config.get("fact_check_verdict_timeout_seconds") or 25,
+                    ),
+                    verdict_max_output_tokens=int(
+                        self.config.get("fact_check_verdict_max_output_tokens") or 2048,
+                    ),
+                    verdict_retry_max_output_tokens=int(
+                        self.config.get("fact_check_verdict_retry_max_output_tokens") or 4096,
+                    ),
+                    source_link_timeout=int(
+                        self.config.get("fact_check_source_link_timeout_seconds") or 4,
                     ),
                     total_timeout_seconds=int(timeout_seconds),
                 )
@@ -722,6 +734,15 @@ class FactCheckPlugin(Star):
                 ),
                 "verdict_timeout_seconds": str(
                     cache_config_value("fact_check_verdict_timeout_seconds", 25),
+                ),
+                "verdict_max_output_tokens": str(
+                    cache_config_value("fact_check_verdict_max_output_tokens", 2048),
+                ),
+                "verdict_retry_max_output_tokens": str(
+                    cache_config_value("fact_check_verdict_retry_max_output_tokens", 4096),
+                ),
+                "source_link_timeout_seconds": str(
+                    cache_config_value("fact_check_source_link_timeout_seconds", 4),
                 ),
             },
             "anysearch": {

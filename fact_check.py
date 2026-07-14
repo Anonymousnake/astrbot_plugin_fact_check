@@ -121,6 +121,10 @@ class AnysearchEvidence:
     reason: str = ""
 
 
+class IncompleteGenerationError(RuntimeError):
+    """A model returned text but did not finish a usable answer."""
+
+
 def is_trigger(text: str) -> bool:
     return bool(TRIGGER_RE.search(_normalize(text)))
 
@@ -224,6 +228,9 @@ def run_fact_check(
     anysearch_content_types: list[str] | None = None,
     model_failure_cooldown_seconds: int = 0,
     verdict_request_timeout: int = 25,
+    verdict_max_output_tokens: int = 2048,
+    verdict_retry_max_output_tokens: int = 4096,
+    source_link_timeout: int = 4,
     total_timeout_seconds: int = 0,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
@@ -476,17 +483,52 @@ def run_fact_check(
                 api_key=api_key,
                 base_url=base_url,
                 temperature=0.1,
-                max_output_tokens=768,
+                max_output_tokens=_clamp_int(
+                    verdict_max_output_tokens,
+                    default=2048,
+                    lower=512,
+                    upper=8192,
+                ),
                 grounding=False,
                 thinking_level="medium",
                 model_failure_cooldown_seconds=model_failure_cooldown_seconds,
                 http_max_retries=0,
                 request_timeout=verdict_request_timeout,
             )
-            if not extract_text(verdict_body).strip():
-                raise RuntimeError("verdict model returned no readable text")
+            try:
+                validate_complete_verdict(verdict_body)
+            except IncompleteGenerationError as exc:
+                retry_tokens = _clamp_int(
+                    verdict_retry_max_output_tokens,
+                    default=4096,
+                    lower=1024,
+                    upper=8192,
+                )
+                print(
+                    "[astrbot-fact-check-verdict-retry] "
+                    f"model={verdict_model} max_output_tokens={retry_tokens} reason={exc}",
+                    flush=True,
+                )
+                verdict_body, verdict_model = generate_with_fallback(
+                    prompt=verdict_prompt,
+                    models=[verdict_model],
+                    api_key=api_key,
+                    base_url=base_url,
+                    temperature=0.1,
+                    max_output_tokens=retry_tokens,
+                    grounding=False,
+                    thinking_level="medium",
+                    model_failure_cooldown_seconds=model_failure_cooldown_seconds,
+                    http_max_retries=0,
+                    request_timeout=verdict_request_timeout,
+                )
+                validate_complete_verdict(verdict_body)
             body, used_model = verdict_body, verdict_model
-            print(f"[astrbot-fact-check-stage] verdict-review done model={used_model}", flush=True)
+            print(
+                "[astrbot-fact-check-stage] verdict-review done "
+                f"model={used_model} {generation_diagnostics(verdict_body)}",
+                flush=True,
+            )
         except Exception as exc:
             print(
                 "[astrbot-fact-check-verdict-fallback] "
@@ -494,10 +536,10 @@ def run_fact_check(
                 flush=True,
             )
     reply = sanitize_fact_check_reply(extract_text(body).strip())
-    sources = dedupe_sources(
+    sources = normalize_fact_check_sources(dedupe_sources(
         extract_sources(body) + extract_sources(evidence_body) + anysearch_evidence.sources,
         limit=5,
-    )
+    ), redirect_timeout=source_link_timeout)
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources[:3])
     reply = append_source_links(reply, sources)
@@ -626,6 +668,7 @@ def run_fact_check_followup(
     base_url: str,
     main_models: list[str],
     request_timeout: int = 45,
+    source_link_timeout: int = 4,
     total_timeout_seconds: int = 0,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
@@ -682,7 +725,10 @@ def run_fact_check_followup(
         request_timeout=request_timeout,
     )
     reply = sanitize_fact_check_reply(extract_text(body).strip())
-    sources = extract_sources(body)
+    sources = normalize_fact_check_sources(
+        extract_sources(body),
+        redirect_timeout=source_link_timeout,
+    )
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources)
     reply = append_source_links(reply, sources)
@@ -1573,6 +1619,59 @@ def dedupe_sources(sources: list[str], *, limit: int) -> list[str]:
     return deduped
 
 
+def normalize_fact_check_sources(sources: list[str], *, redirect_timeout: int = 4) -> list[str]:
+    normalized: list[str] = []
+    for source in sources:
+        title, url = split_source_title_url(source)
+        if is_google_grounding_redirect(url):
+            resolved = resolve_google_grounding_redirect(url, timeout=redirect_timeout)
+            source = f"{title}：{resolved}" if resolved and title else (resolved or title or "Google Search 来源")
+        elif url:
+            source = f"{title}：{url}" if title else url
+        else:
+            source = title
+        if source and source not in normalized:
+            normalized.append(source)
+    return normalized
+
+
+def split_source_title_url(source: str) -> tuple[str, str]:
+    text = str(source or "").strip()
+    match = URL_RE.search(text)
+    if not match:
+        return text, ""
+    url = normalize_url(match.group(1))
+    return text[: match.start()].rstrip(" ：:"), url
+
+
+def is_google_grounding_redirect(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    return (
+        (parsed.hostname or "").lower() == "vertexaisearch.cloud.google.com"
+        and parsed.path.startswith("/grounding-api-redirect/")
+    )
+
+
+def resolve_google_grounding_redirect(url: str, *, timeout: int) -> str:
+    current = normalize_url(url)
+    timeout = _clamp_int(timeout, default=4, lower=1, upper=10)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AstrBotFactCheck/1.0)"}
+    try:
+        with httpx.Client(follow_redirects=False, timeout=timeout, headers=headers) as client:
+            for _ in range(5):
+                ensure_public_url_target(current)
+                with client.stream("GET", current) as response:
+                    location = response.headers.get("location")
+                    if response.status_code not in {301, 302, 303, 307, 308} or not location:
+                        return current if is_public_http_url(current) and not is_google_grounding_redirect(current) else ""
+                current = normalize_url(urljoin(current, location))
+                if not current:
+                    return ""
+    except (httpx.HTTPError, OSError, ValueError):
+        return ""
+    return ""
+
+
 def compact_source_label(source: str) -> str:
     text = str(source or "").strip()
     if not text:
@@ -1615,6 +1714,29 @@ def extract_text(body: dict[str, Any]) -> str:
     parts = (candidate.get("content") or {}).get("parts") or []
     text = "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict))
     return strip_thinking(text)
+
+
+def generation_diagnostics(body: dict[str, Any]) -> str:
+    candidates = body.get("candidates", []) or []
+    candidate = candidates[0] if candidates else {}
+    usage = body.get("usageMetadata") or {}
+    finish = str(candidate.get("finishReason") or "unspecified")
+    output_tokens = usage.get("candidatesTokenCount", "?")
+    thought_tokens = usage.get("thoughtsTokenCount", "?")
+    return f"finish={finish} output_tokens={output_tokens} thought_tokens={thought_tokens}"
+
+
+def validate_complete_verdict(body: dict[str, Any]) -> None:
+    candidates = body.get("candidates", []) or []
+    candidate = candidates[0] if candidates else {}
+    finish_reason = str(candidate.get("finishReason") or "").strip().upper()
+    if finish_reason and finish_reason != "STOP":
+        raise IncompleteGenerationError(f"finish_reason={finish_reason}")
+    text = sanitize_fact_check_reply(extract_text(body).strip())
+    if not text:
+        raise IncompleteGenerationError("no readable text")
+    if text.rstrip().endswith((",", "，", "、", ":", "：", ";", "；", "/", "（")):
+        raise IncompleteGenerationError("reply ended mid-sentence")
 
 
 def sanitize_anysearch_evidence_text(text: str) -> str:
