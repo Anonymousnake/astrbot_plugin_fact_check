@@ -152,10 +152,11 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 {
                     "candidates": [
                         {
+                            "finishReason": "STOP",
                             "content": {
                                 "parts": [
                                     {
-                                        "text": "事实核查：大致可信\n要点：1. 有公开来源支持。"
+                                        "text": "事实核查：基本可信但需限定\n结论：已核实\n依据：有公开来源支持。"
                                     }
                                 ]
                             }
@@ -194,7 +195,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertIn("Anysearch 预检索证据", captured["prompt"])
         self.assertIn("https://example.com/source", captured["prompt"])
         self.assertEqual(result.sources, ["https://example.com/source"])
-        self.assertIn("事实核查：大致可信", result.reply)
+        self.assertIn("事实核查：基本可信但需限定", result.reply)
         self.assertIn("可核验链接：", result.reply)
         self.assertIn("https://example.com/source", result.reply)
 
@@ -235,6 +236,22 @@ class AnysearchEvidenceTests(unittest.TestCase):
         reply = append_source_links("事实核查：可信", sources)
         self.assertNotIn("可核验链接：", reply)
 
+    def test_grounding_source_resolution_uses_one_budget_and_only_visible_sources(self) -> None:
+        sources = [
+            f"Source {index}：https://vertexaisearch.cloud.google.com/grounding-api-redirect/{index}"
+            for index in range(5)
+        ]
+        with patch(
+            "fact_check.resolve_google_grounding_redirect",
+            side_effect=[f"https://example.com/{index}" for index in range(3)],
+        ) as resolve:
+            normalized = normalize_fact_check_sources(sources, redirect_timeout=4)
+
+        self.assertEqual(len(normalized), 3)
+        self.assertEqual(resolve.call_count, 3)
+        deadlines = [call.kwargs["deadline"] for call in resolve.call_args_list]
+        self.assertEqual(deadlines, [deadlines[0]] * 3)
+
     def test_extraction_prompt_splits_high_risk_composite_claims(self) -> None:
         captured: dict[str, str] = {}
 
@@ -244,6 +261,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 {
                     "candidates": [
                         {
+                            "finishReason": "STOP",
                             "content": {
                                 "parts": [
                                     {
@@ -285,13 +303,14 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 {
                     "candidates": [
                         {
+                            "finishReason": "STOP",
                             "content": {
                                 "parts": [
                                     {
-                                        "text": (
-                                            "事实核查：部分存疑\n"
-                                            "要点：1. 已证实：法规存在。"
-                                            "2. 未直接证实：未找到直接证据支持该具体推论。"
+                                            "text": (
+                                                "事实核查：部分存疑\n"
+                                                "结论：部分存疑\n"
+                                                "依据：法规存在，但未找到直接证据支持该具体推论。"
                                         )
                                     }
                                 ]
@@ -338,8 +357,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 {
                     "candidates": [
                         {
+                            "finishReason": "STOP",
                             "content": {
-                                "parts": [{"text": "事实核查：暂无法确认\n要点：搜索失败但主核查继续。"}]
+                                "parts": [{"text": "事实核查：证据不足\n结论：证据不足\n依据：搜索失败但主核查继续。"}]
                             }
                         }
                     ]
@@ -364,7 +384,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 anysearch_enabled=True,
             )
 
-        self.assertIn("事实核查：暂无法确认", result.reply)
+        self.assertIn("事实核查：证据不足", result.reply)
         self.assertEqual(result.sources, [])
         self.assertNotIn("搜索摘要：", captured["prompt"])
         self.assertNotIn("simulated timeout", captured["prompt"])

@@ -216,6 +216,8 @@ def run_fact_check(
     image_download_timeout: int = 10,
     pre_request_timeout: int = 25,
     main_request_timeout: int = 45,
+    evidence_max_output_tokens: int = 1536,
+    evidence_retry_max_output_tokens: int = 3072,
     anysearch_enabled: bool = False,
     anysearch_endpoint: str = ANYSEARCH_DEFAULT_ENDPOINT,
     anysearch_api_key: str = "",
@@ -436,21 +438,72 @@ def run_fact_check(
         f"model={evidence_model} candidates={len(deduped)}",
         flush=True,
     )
+    evidence_tokens = _clamp_int(
+        evidence_max_output_tokens,
+        default=1536,
+        lower=512,
+        upper=8192,
+    )
     evidence_body, evidence_used_model = generate_with_fallback(
         prompt=prompt,
         models=[evidence_model],
         api_key=api_key,
         base_url=base_url,
         temperature=0.1,
-        max_output_tokens=768,
+        max_output_tokens=evidence_tokens,
         grounding=True,
         model_failure_cooldown_seconds=model_failure_cooldown_seconds,
         extra_parts=main_image_parts,
         request_timeout=main_request_timeout,
     )
+    try:
+        validate_complete_fact_check_result(evidence_body)
+    except IncompleteGenerationError as exc:
+        retry_tokens = _clamp_int(
+            evidence_retry_max_output_tokens,
+            default=3072,
+            lower=1024,
+            upper=8192,
+        )
+        if not _retry_budget_available(minimum=5.0):
+            return FactCheckResult(
+                FAILED_REPLY,
+                f"grounded evidence incomplete and insufficient retry budget: {exc}",
+                candidates=deduped,
+            )
+        print(
+            "[astrbot-fact-check-evidence-retry] "
+            f"model={evidence_used_model} max_output_tokens={retry_tokens} reason={exc}",
+            flush=True,
+        )
+        try:
+            evidence_body, evidence_used_model = generate_with_fallback(
+                prompt=prompt,
+                models=[evidence_used_model],
+                api_key=api_key,
+                base_url=base_url,
+                temperature=0.1,
+                max_output_tokens=retry_tokens,
+                grounding=True,
+                model_failure_cooldown_seconds=model_failure_cooldown_seconds,
+                extra_parts=main_image_parts,
+                request_timeout=main_request_timeout,
+            )
+            validate_complete_fact_check_result(evidence_body)
+        except IncompleteGenerationError as retry_exc:
+            print(
+                "[astrbot-fact-check-evidence-incomplete] "
+                f"model={evidence_used_model} reason={retry_exc}",
+                flush=True,
+            )
+            return FactCheckResult(
+                FAILED_REPLY,
+                f"grounded evidence incomplete after retry: {retry_exc}",
+                candidates=deduped,
+            )
     print(
         "[astrbot-fact-check-stage] evidence-check done "
-        f"model={evidence_used_model}",
+        f"model={evidence_used_model} {generation_diagnostics(evidence_body)}",
         flush=True,
     )
 
@@ -496,7 +549,7 @@ def run_fact_check(
                 request_timeout=verdict_request_timeout,
             )
             try:
-                validate_complete_verdict(verdict_body)
+                validate_complete_fact_check_result(verdict_body)
             except IncompleteGenerationError as exc:
                 retry_tokens = _clamp_int(
                     verdict_retry_max_output_tokens,
@@ -522,7 +575,7 @@ def run_fact_check(
                     http_max_retries=0,
                     request_timeout=verdict_request_timeout,
                 )
-                validate_complete_verdict(verdict_body)
+                validate_complete_fact_check_result(verdict_body)
             body, used_model = verdict_body, verdict_model
             print(
                 "[astrbot-fact-check-stage] verdict-review done "
@@ -1620,11 +1673,27 @@ def dedupe_sources(sources: list[str], *, limit: int) -> list[str]:
 
 
 def normalize_fact_check_sources(sources: list[str], *, redirect_timeout: int = 4) -> list[str]:
+    budget_seconds = _clamp_int(redirect_timeout, default=4, lower=1, upper=10)
+    started_at = time.monotonic()
+    request_deadline = _REQUEST_DEADLINE.get()
+    deadline = started_at + budget_seconds
+    if request_deadline is not None:
+        deadline = min(deadline, request_deadline)
     normalized: list[str] = []
-    for source in sources:
+    resolved_count = 0
+    unresolved_count = 0
+    for source in sources[:3]:
         title, url = split_source_title_url(source)
         if is_google_grounding_redirect(url):
-            resolved = resolve_google_grounding_redirect(url, timeout=redirect_timeout)
+            resolved = resolve_google_grounding_redirect(
+                url,
+                timeout=budget_seconds,
+                deadline=deadline,
+            )
+            if resolved:
+                resolved_count += 1
+            else:
+                unresolved_count += 1
             source = f"{title}：{resolved}" if resolved and title else (resolved or title or "Google Search 来源")
         elif url:
             source = f"{title}：{url}" if title else url
@@ -1632,6 +1701,14 @@ def normalize_fact_check_sources(sources: list[str], *, redirect_timeout: int = 
             source = title
         if source and source not in normalized:
             normalized.append(source)
+    elapsed = time.monotonic() - started_at
+    if resolved_count or unresolved_count:
+        print(
+            "[astrbot-fact-check-source-links] "
+            f"resolved={resolved_count} unresolved={unresolved_count} elapsed={elapsed:.2f}s "
+            f"budget={budget_seconds}s",
+            flush=True,
+        )
     return normalized
 
 
@@ -1652,18 +1729,28 @@ def is_google_grounding_redirect(url: str) -> bool:
     )
 
 
-def resolve_google_grounding_redirect(url: str, *, timeout: int) -> str:
+def resolve_google_grounding_redirect(url: str, *, timeout: int, deadline: float | None = None) -> str:
     current = normalize_url(url)
     timeout = _clamp_int(timeout, default=4, lower=1, upper=10)
+    deadline = deadline if deadline is not None else time.monotonic() + timeout
     headers = {"User-Agent": "Mozilla/5.0 (compatible; AstrBotFactCheck/1.0)"}
     try:
-        with httpx.Client(follow_redirects=False, timeout=timeout, headers=headers) as client:
-            for _ in range(5):
+        with httpx.Client(follow_redirects=False, headers=headers) as client:
+            for _ in range(3):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return ""
                 ensure_public_url_target(current)
-                with client.stream("GET", current) as response:
+                with client.stream("GET", current, timeout=min(2.0, remaining)) as response:
                     location = response.headers.get("location")
                     if response.status_code not in {301, 302, 303, 307, 308} or not location:
-                        return current if is_public_http_url(current) and not is_google_grounding_redirect(current) else ""
+                        return (
+                            current
+                            if response.is_success
+                            and is_public_http_url(current)
+                            and not is_google_grounding_redirect(current)
+                            else ""
+                        )
                 current = normalize_url(urljoin(current, location))
                 if not current:
                     return ""
@@ -1726,17 +1813,26 @@ def generation_diagnostics(body: dict[str, Any]) -> str:
     return f"finish={finish} output_tokens={output_tokens} thought_tokens={thought_tokens}"
 
 
-def validate_complete_verdict(body: dict[str, Any]) -> None:
+def validate_complete_fact_check_result(body: dict[str, Any]) -> None:
     candidates = body.get("candidates", []) or []
     candidate = candidates[0] if candidates else {}
     finish_reason = str(candidate.get("finishReason") or "").strip().upper()
-    if finish_reason and finish_reason != "STOP":
+    if finish_reason != "STOP":
         raise IncompleteGenerationError(f"finish_reason={finish_reason}")
     text = sanitize_fact_check_reply(extract_text(body).strip())
     if not text:
         raise IncompleteGenerationError("no readable text")
+    if not re.search(r"(?:^|\n)事实核查[：:]\s*\S+", text):
+        raise IncompleteGenerationError("missing fact-check summary")
+    if not re.search(r"(?:^|\n)结论[：:]\s*\S+", text):
+        raise IncompleteGenerationError("missing claim verdict")
     if text.rstrip().endswith((",", "，", "、", ":", "：", ";", "；", "/", "（")):
         raise IncompleteGenerationError("reply ended mid-sentence")
+
+
+def validate_complete_verdict(body: dict[str, Any]) -> None:
+    """Backward-compatible name for callers that validate a final verdict."""
+    validate_complete_fact_check_result(body)
 
 
 def sanitize_anysearch_evidence_text(text: str) -> str:

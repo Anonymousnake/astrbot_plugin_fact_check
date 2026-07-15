@@ -356,6 +356,12 @@ class FactCheckPlugin(Star):
                     main_request_timeout=int(
                         self.config.get("fact_check_main_timeout_seconds") or 45,
                     ),
+                    evidence_max_output_tokens=int(
+                        self.config.get("fact_check_evidence_max_output_tokens") or 1536,
+                    ),
+                    evidence_retry_max_output_tokens=int(
+                        self.config.get("fact_check_evidence_retry_max_output_tokens") or 3072,
+                    ),
                     anysearch_enabled=bool(
                         self.config.get("fact_check_anysearch_enabled", False),
                     ),
@@ -728,6 +734,12 @@ class FactCheckPlugin(Star):
             "models": {
                 "pre": str(self.config.get("fact_check_pre_model") or "gemini-3.1-flash-lite").strip(),
                 "evidence": str(self.config.get("fact_check_evidence_model") or "gemini-2.5-flash").strip(),
+                "evidence_max_output_tokens": str(
+                    cache_config_value("fact_check_evidence_max_output_tokens", 1536),
+                ),
+                "evidence_retry_max_output_tokens": str(
+                    cache_config_value("fact_check_evidence_retry_max_output_tokens", 3072),
+                ),
                 "verdict": self._list_config(
                     "fact_check_verdict_models",
                     ["gemini-3-flash-preview"],

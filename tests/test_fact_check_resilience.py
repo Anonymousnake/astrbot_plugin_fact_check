@@ -13,6 +13,15 @@ from astrbot_plugin_fact_check import fact_check, main
 from astrbot_plugin_fact_check.fact_check import FactCheckRequest, ImageInput
 
 
+def complete_fact_check_body(text: str, **candidate_fields):
+    candidate = {
+        "finishReason": "STOP",
+        "content": {"parts": [{"text": text}]},
+        **candidate_fields,
+    }
+    return {"candidates": [candidate]}
+
+
 class LocalImage(Image):
     def __init__(self, source: Path) -> None:
         super().__init__(file=str(source))
@@ -50,27 +59,21 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["thinkingConfig"], {"thinkingBudget": 0})
 
     def test_grounding_support_mapping_and_anysearch_excerpts_reach_verdict(self) -> None:
-        evidence_response = {
-            "candidates": [
-                {
-                    "content": {"parts": [{"text": "The policy exists."}]},
-                    "groundingMetadata": {
+        evidence_response = complete_fact_check_body(
+            "事实核查：部分存疑\n结论：已核实\n依据：政策存在。",
+            groundingMetadata={
                         "groundingChunks": [
                             {"web": {"uri": "https://example.com/policy", "title": "Policy"}},
                         ],
                         "groundingSupports": [
                             {
-                                "segment": {"text": "The policy exists."},
+                                "segment": {"text": "政策存在。"},
                                 "groundingChunkIndices": [0],
                             },
                         ],
-                    },
-                },
-            ],
-        }
-        verdict_response = {
-            "candidates": [{"content": {"parts": [{"text": "事实核查：部分存疑"}]}}],
-        }
+            },
+        )
+        verdict_response = complete_fact_check_body("事实核查：部分存疑\n结论：部分存疑\n依据：具体适用范围未明确。")
 
         with (
             patch.object(
@@ -106,14 +109,14 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         verdict_prompt = generate.call_args_list[1].kwargs["prompt"]
-        self.assertIn("证据片段：The policy exists.", verdict_prompt)
+        self.assertIn("政策存在", verdict_prompt)
         self.assertIn("https://example.com/policy", verdict_prompt)
         self.assertIn("具体商品适用范围未明确", verdict_prompt)
         self.assertEqual(generate.call_args_list[1].kwargs["thinking_level"], "medium")
 
     def test_text_with_image_uses_one_multimodal_preprocess_and_reuses_inline_parts(self) -> None:
         inline_parts = [{"inline_data": {"mime_type": "image/png", "data": "AA=="}}]
-        response = {"candidates": [{"content": {"parts": [{"text": "事实核查：可信"}]}}]}
+        response = complete_fact_check_body("事实核查：可信\n结论：已核实\n依据：测试结果。")
 
         with (
             patch.object(fact_check, "build_inline_image_parts", return_value=inline_parts) as build_images,
@@ -144,7 +147,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
 
     def test_text_preprocess_is_used_as_fallback_when_multimodal_extracts_no_claims(self) -> None:
         inline_parts = [{"inline_data": {"mime_type": "image/png", "data": "AA=="}}]
-        response = {"candidates": [{"content": {"parts": [{"text": "事实核查：可信"}]}}]}
+        response = complete_fact_check_body("事实核查：可信\n结论：已核实\n依据：测试结果。")
 
         with (
             patch.object(fact_check, "build_inline_image_parts", return_value=inline_parts),
@@ -184,6 +187,18 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(observed[0], 0)
         self.assertLessEqual(observed[0], 1)
         self.assertIsNone(fact_check._REQUEST_DEADLINE.get())
+
+    def test_complete_fact_check_result_requires_stop_summary_and_claim_verdict(self) -> None:
+        invalid_bodies = [
+            {"candidates": [{"content": {"parts": [{"text": "事实核查：可信\n结论：已核实"}]}}]},
+            {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "结论：已核实"}]}}]},
+            {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "事实核查：可信"}]}}]},
+        ]
+
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                with self.assertRaises(fact_check.IncompleteGenerationError):
+                    fact_check.validate_complete_fact_check_result(body)
 
     def test_expired_total_deadline_prevents_a_new_http_attempt(self) -> None:
         token = fact_check._REQUEST_DEADLINE.set(fact_check.time.monotonic() - 1)
@@ -238,9 +253,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first_input[0].content_sha256, second_input[0].content_sha256)
 
     def test_text_preprocess_failure_falls_through_to_main_check(self) -> None:
-        response = {
-            "candidates": [{"content": {"parts": [{"text": "事实核查：证据不足"}]}}],
-        }
+        response = complete_fact_check_body("事实核查：证据不足\n结论：证据不足\n依据：测试结果。")
 
         with (
             patch.object(fact_check, "extract_claims_from_text", side_effect=RuntimeError("preprocess failed")),
@@ -254,13 +267,11 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 main_models=["gemini-2.5-flash"],
             )
 
-        self.assertEqual(result.reply, "事实核查：证据不足")
+        self.assertEqual(result.reply, "事实核查：证据不足\n结论：证据不足\n依据：测试结果。")
         self.assertTrue(result.reason.startswith("ok"))
 
     def test_image_preprocess_failure_still_sends_image_to_main_check(self) -> None:
-        response = {
-            "candidates": [{"content": {"parts": [{"text": "事实核查：证据不足"}]}}],
-        }
+        response = complete_fact_check_body("事实核查：证据不足\n结论：证据不足\n依据：测试结果。")
         attached = [{"inline_data": {"mime_type": "image/png", "data": "AA=="}}]
 
         with (
@@ -280,7 +291,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 main_models=["gemini-2.5-flash"],
             )
 
-        self.assertEqual(result.reply, "事实核查：证据不足")
+        self.assertEqual(result.reply, "事实核查：证据不足\n结论：证据不足\n依据：测试结果。")
         self.assertEqual(generate.call_args.kwargs["extra_parts"], attached)
 
     def test_best_model_can_use_anysearch_without_google_grounding(self) -> None:
@@ -305,12 +316,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(generate.call_args.kwargs["grounding"])
 
     def test_grounded_evidence_is_reviewed_by_ungrounded_gemini_3(self) -> None:
-        evidence_response = {
-            "candidates": [{"content": {"parts": [{"text": "Grounded evidence: the policy exists."}]}}],
-        }
-        verdict_response = {
-            "candidates": [{"content": {"parts": [{"text": "Fact check: partial support."}]}}],
-        }
+        evidence_response = complete_fact_check_body("事实核查：部分存疑\n结论：已核实\n依据：政策存在。")
+        verdict_response = complete_fact_check_body("事实核查：部分存疑\n结论：部分存疑\n依据：具体适用范围未明确。")
 
         with (
             patch.object(
@@ -341,13 +348,11 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(evidence_call.kwargs["grounding"])
         self.assertEqual(verdict_call.kwargs["models"], ["gemini-3-flash-preview"])
         self.assertFalse(verdict_call.kwargs["grounding"])
-        self.assertIn("Grounded evidence", verdict_call.kwargs["prompt"])
-        self.assertEqual(result.reply, "Fact check: partial support.")
+        self.assertIn("政策存在", verdict_call.kwargs["prompt"])
+        self.assertEqual(result.reply, "事实核查：部分存疑\n结论：部分存疑\n依据：具体适用范围未明确。")
 
     def test_grounded_evidence_is_the_complete_fallback_when_gemini_3_fails(self) -> None:
-        evidence_response = {
-            "candidates": [{"content": {"parts": [{"text": "Fact check: evidence-model fallback."}]}}],
-        }
+        evidence_response = complete_fact_check_body("事实核查：证据不足\n结论：证据不足\n依据：证据模型兜底。")
 
         with (
             patch.object(
@@ -373,11 +378,14 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 verdict_models=["gemini-3-flash-preview"],
             )
 
-        self.assertEqual(result.reply, "Fact check: evidence-model fallback.")
+        self.assertEqual(result.reply, "事实核查：证据不足\n结论：证据不足\n依据：证据模型兜底。")
 
     def test_grounded_evidence_is_used_when_gemini_3_returns_no_text(self) -> None:
         evidence_response = {
-            "candidates": [{"content": {"parts": [{"text": "Fact check: grounded fallback."}]}}],
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": "事实核查：证据不足\n结论：证据不足\n依据：已完成检索。"}]},
+            }],
         }
         empty_verdict = {"candidates": [{"content": {"parts": []}}]}
 
@@ -393,8 +401,9 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=[
                     (evidence_response, "gemini-2.5-flash"),
                     (empty_verdict, "gemini-3-flash-preview"),
+                    (empty_verdict, "gemini-3-flash-preview"),
                 ],
-            ),
+            ) as generate,
         ):
             result = fact_check.run_fact_check(
                 request_data=FactCheckRequest(text="A claim", trigger_text="/factcheck"),
@@ -405,13 +414,100 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 verdict_models=["gemini-3-flash-preview"],
             )
 
-        self.assertEqual(result.reply, "Fact check: grounded fallback.")
+        self.assertEqual(result.reply, "事实核查：证据不足\n结论：证据不足\n依据：已完成检索。")
+        self.assertEqual(generate.call_count, 3)
+
+    def test_truncated_grounded_evidence_is_retried_before_verdict_review(self) -> None:
+        truncated_evidence = {
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定，"}]},
+            }],
+        }
+        completed_evidence = {
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定\n依据：完整证据。"}]},
+            }],
+        }
+        completed_verdict = {
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定\n依据：完整复核。"}]},
+            }],
+        }
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("请核查：A 是否属实？")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                side_effect=[
+                    (truncated_evidence, "gemini-2.5-flash"),
+                    (completed_evidence, "gemini-2.5-flash"),
+                    (completed_verdict, "gemini-3-flash-preview"),
+                ],
+            ) as generate,
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A claim", trigger_text="/factcheck"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview"],
+            )
+
+        self.assertEqual(result.reply, "事实核查：混合结论\n结论：表述需限定\n依据：完整复核。")
+        self.assertEqual(generate.call_count, 3)
+        self.assertEqual(generate.call_args_list[0].kwargs["max_output_tokens"], 1536)
+        self.assertEqual(generate.call_args_list[1].kwargs["max_output_tokens"], 3072)
+
+    def test_twice_incomplete_grounded_evidence_is_not_sent_or_reviewed(self) -> None:
+        truncated_evidence = {
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定，"}]},
+            }],
+        }
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("请核查：A 是否属实？")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                side_effect=[
+                    (truncated_evidence, "gemini-2.5-flash"),
+                    (truncated_evidence, "gemini-2.5-flash"),
+                ],
+            ) as generate,
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A claim", trigger_text="/factcheck"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview"],
+            )
+
+        self.assertEqual(result.reply, fact_check.FAILED_REPLY)
+        self.assertIn("grounded evidence", result.reason)
+        self.assertEqual(generate.call_count, 2)
 
     def test_truncated_verdict_is_retried_with_more_output_tokens(self) -> None:
         evidence_response = {
             "candidates": [{
                 "finishReason": "STOP",
-                "content": {"parts": [{"text": "事实核查：证据模型的完整结果。"}]},
+                "content": {"parts": [{"text": "事实核查：证据模型的完整结果。\n结论：已核实\n依据：完整证据。"}]},
             }],
         }
         truncated_verdict = {
@@ -461,7 +557,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         evidence_response = {
             "candidates": [{
                 "finishReason": "STOP",
-                "content": {"parts": [{"text": "事实核查：证据模型的完整结果。"}]},
+                "content": {"parts": [{"text": "事实核查：证据模型的完整结果。\n结论：已核实\n依据：完整证据。"}]},
             }],
         }
         truncated_verdict = {
@@ -496,7 +592,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 verdict_models=["gemini-3-flash-preview"],
             )
 
-        self.assertEqual(result.reply, "事实核查：证据模型的完整结果。")
+        self.assertEqual(result.reply, "事实核查：证据模型的完整结果。\n结论：已核实\n依据：完整证据。")
 
     def test_unavailable_best_model_is_skipped_during_cooldown(self) -> None:
         request = fact_check.httpx.Request("POST", "https://example.invalid/models/generateContent")

@@ -27,6 +27,17 @@
     "hint": "This model performs Google Search grounding and returns a complete fallback fact-check result.",
     "default": "gemini-2.5-flash"
   },
+  "fact_check_evidence_max_output_tokens": {
+    "type": "int",
+    "description": "Output-token limit for the first grounded Gemini evidence result",
+    "hint": "Incomplete grounded evidence is retried once with the larger retry limit and is never sent as a fallback.",
+    "default": 1536
+  },
+  "fact_check_evidence_retry_max_output_tokens": {
+    "type": "int",
+    "description": "Output-token limit for one retry after incomplete grounded evidence",
+    "default": 3072
+  },
   "fact_check_verdict_models": {
     "type": "list",
     "description": "Evidence-only verdict editor fallback order",
@@ -60,8 +71,8 @@
   },
   "fact_check_source_link_timeout_seconds": {
     "type": "int",
-    "description": "Timeout seconds when resolving Google grounding redirect links",
-    "hint": "Failed redirect resolution keeps the source title but omits the long Google intermediate URL.",
+    "description": "Total timeout seconds for resolving displayed Google grounding redirect links",
+    "hint": "The first three displayed sources share this budget. Failed resolution keeps the source title but omits the long Google intermediate URL.",
     "default": 4
   },
   "fact_check_max_images": {
