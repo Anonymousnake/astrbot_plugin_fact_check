@@ -32,6 +32,7 @@ from .fact_check import (
     FactCheckResult,
     ImageInput,
     explain_failure,
+    ensure_claim_points_visible,
     is_public_http_url,
     is_trigger,
     remove_trigger,
@@ -266,6 +267,10 @@ class FactCheckPlugin(Star):
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             logger.info(f"[astrbot-fact-check-cache-hit] {self._event_label(event)}: key={cache_key[:12]}")
+            cached_result.reply = ensure_claim_points_visible(
+                cached_result.reply,
+                cached_result.candidates,
+            )
             session_id = self._remember_fact_check_session(event, request_data, cached_result)
             await self._send_fact_check_reply(
                 event,

@@ -21,6 +21,7 @@ from fact_check import (
     compact_source_label,
     collect_anysearch_evidence,
     dedupe_candidates,
+    ensure_claim_points_visible,
     extract_public_urls,
     extract_claims_from_text,
     is_public_http_url,
@@ -34,6 +35,32 @@ from fact_check import (
 
 
 class AnysearchEvidenceTests(unittest.TestCase):
+    def test_ensure_claim_points_visible_restores_omitted_questions(self) -> None:
+        reply = (
+            "事实核查：可信\n"
+            "结论：已核实。第一条依据。\n"
+            "结论：部分存疑。第二条依据。"
+        )
+        candidates = [
+            ClaimCandidate("第一条待核查问题"),
+            ClaimCandidate("第二条待核查问题"),
+        ]
+
+        rendered = ensure_claim_points_visible(reply, candidates)
+
+        self.assertIn("1. 核查点：第一条待核查问题", rendered)
+        self.assertIn("2. 核查点：第二条待核查问题", rendered)
+        self.assertLess(rendered.index("第一条待核查问题"), rendered.index("结论：已核实"))
+        self.assertLess(rendered.index("第二条待核查问题"), rendered.index("结论：部分存疑"))
+
+    def test_ensure_claim_points_visible_does_not_change_structured_reply(self) -> None:
+        reply = "事实核查：可信\n1. 核查点：已有问题\n结论：已核实\n依据：证据。"
+
+        self.assertEqual(
+            ensure_claim_points_visible(reply, [ClaimCandidate("已有问题")]),
+            reply,
+        )
+
     def test_normalize_anysearch_query_removes_fact_check_wrapping(self) -> None:
         self.assertEqual(
             normalize_anysearch_query("请核查：美国硅谷今天发生 6.0 级地震是否属实？"),

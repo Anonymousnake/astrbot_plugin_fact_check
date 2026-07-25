@@ -267,7 +267,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 main_models=["gemini-2.5-flash"],
             )
 
-        self.assertEqual(result.reply, "事实核查：证据不足\n结论：证据不足\n依据：测试结果。")
+        self.assertIn("1. 核查点：请核查下面聊天内容中涉及的事实是否准确：某条需要核查的消息", result.reply)
+        self.assertIn("结论：证据不足", result.reply)
         self.assertTrue(result.reason.startswith("ok"))
 
     def test_image_preprocess_failure_still_sends_image_to_main_check(self) -> None:
@@ -291,7 +292,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 main_models=["gemini-2.5-flash"],
             )
 
-        self.assertEqual(result.reply, "事实核查：证据不足\n结论：证据不足\n依据：测试结果。")
+        self.assertIn("1. 核查点：请核查图片中主要事实断言是否准确，并指出无法辨认或缺少证据的部分。", result.reply)
+        self.assertIn("结论：证据不足", result.reply)
         self.assertEqual(generate.call_args.kwargs["extra_parts"], attached)
 
     def test_best_model_can_use_anysearch_without_google_grounding(self) -> None:
@@ -349,7 +351,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verdict_call.kwargs["models"], ["gemini-3-flash-preview"])
         self.assertFalse(verdict_call.kwargs["grounding"])
         self.assertIn("政策存在", verdict_call.kwargs["prompt"])
-        self.assertEqual(result.reply, "事实核查：部分存疑\n结论：部分存疑\n依据：具体适用范围未明确。")
+        self.assertIn("1. 核查点：Check the policy and its product implication.", result.reply)
+        self.assertIn("结论：部分存疑", result.reply)
 
     def test_grounded_evidence_is_the_complete_fallback_when_gemini_3_fails(self) -> None:
         evidence_response = complete_fact_check_body("事实核查：证据不足\n结论：证据不足\n依据：证据模型兜底。")
@@ -378,7 +381,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 verdict_models=["gemini-3-flash-preview"],
             )
 
-        self.assertEqual(result.reply, "事实核查：证据不足\n结论：证据不足\n依据：证据模型兜底。")
+        self.assertIn("1. 核查点：Check the claim.", result.reply)
+        self.assertIn("结论：证据不足", result.reply)
 
     def test_grounded_evidence_is_used_when_gemini_3_returns_no_text(self) -> None:
         evidence_response = {
@@ -414,7 +418,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 verdict_models=["gemini-3-flash-preview"],
             )
 
-        self.assertEqual(result.reply, "事实核查：证据不足\n结论：证据不足\n依据：已完成检索。")
+        self.assertIn("1. 核查点：Check the claim.", result.reply)
+        self.assertIn("结论：证据不足", result.reply)
         self.assertEqual(generate.call_count, 3)
 
     def test_truncated_grounded_evidence_is_retried_before_verdict_review(self) -> None:
@@ -462,7 +467,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 verdict_models=["gemini-3-flash-preview"],
             )
 
-        self.assertEqual(result.reply, "事实核查：混合结论\n结论：表述需限定\n依据：完整复核。")
+        self.assertIn("1. 核查点：请核查：A 是否属实？", result.reply)
+        self.assertIn("结论：表述需限定", result.reply)
         self.assertEqual(generate.call_count, 3)
         self.assertEqual(generate.call_args_list[0].kwargs["max_output_tokens"], 1536)
         self.assertEqual(generate.call_args_list[1].kwargs["max_output_tokens"], 3072)
@@ -548,7 +554,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 verdict_models=["gemini-3-flash-preview"],
             )
 
-        self.assertEqual(result.reply, "事实核查：混合结论\n结论：表述需限定。")
+        self.assertIn("1. 核查点：请核查：A 是否属实？", result.reply)
+        self.assertIn("结论：表述需限定。", result.reply)
         self.assertEqual(generate.call_count, 3)
         self.assertEqual(generate.call_args_list[1].kwargs["max_output_tokens"], 2048)
         self.assertEqual(generate.call_args_list[2].kwargs["max_output_tokens"], 4096)
@@ -592,7 +599,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 verdict_models=["gemini-3-flash-preview"],
             )
 
-        self.assertEqual(result.reply, "事实核查：证据模型的完整结果。\n结论：已核实\n依据：完整证据。")
+        self.assertIn("1. 核查点：请核查：A 是否属实？", result.reply)
+        self.assertIn("结论：已核实", result.reply)
 
     def test_unavailable_best_model_is_skipped_during_cooldown(self) -> None:
         request = fact_check.httpx.Request("POST", "https://example.invalid/models/generateContent")

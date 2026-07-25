@@ -588,7 +588,10 @@ def run_fact_check(
                 f"model={','.join(verdict_models)} error={error_label(exc)}",
                 flush=True,
             )
-    reply = sanitize_fact_check_reply(extract_text(body).strip())
+    reply = ensure_claim_points_visible(
+        extract_text(body).strip(),
+        deduped,
+    )
     sources = normalize_fact_check_sources(dedupe_sources(
         extract_sources(body) + extract_sources(evidence_body) + anysearch_evidence.sources,
         limit=5,
@@ -670,7 +673,11 @@ Grounded source URLs:
 {sources}
 
 Write a concise Chinese QQ-ready result. Start with "事实核查：" and choose one overall verdict from: 可信 / 基本可信但需限定 / 条件性成立 / 混合结论 / 部分存疑 / 证据不足 / 基本不实 / 表述不准确.
-For every atomic claim write: "结论：" followed by one of: 已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断.
+For every atomic claim, preserve the order of Checkable claims and write this exact three-line block:
+1. 核查点：<do not omit or merge the claim>
+结论：<one allowed verdict>
+依据：<short evidence-based reason>
+Do not output bare repeated "结论：" lines without their matching "核查点：" lines.
 State clearly when the evidence does not directly support a key inference. End with at most three actual source domains or titles. Do not use Markdown headings, bold, code blocks, or fabricated citations."""
 
 
@@ -1854,6 +1861,34 @@ def sanitize_fact_check_reply(text: str) -> str:
     cleaned = _normalize_conditional_verdict(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def ensure_claim_points_visible(text: str, candidates: list[ClaimCandidate]) -> str:
+    """Restore deterministic claim labels when a verdict model omits them."""
+    cleaned = sanitize_fact_check_reply(text)
+    if not cleaned or not candidates:
+        return cleaned
+
+    point_count = len(re.findall(r"^\s*\d+\.\s*核查点[:：]", cleaned, flags=re.MULTILINE))
+    if point_count:
+        return cleaned
+
+    lines = cleaned.splitlines()
+    conclusion_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"^\s*结论[:：]", line)
+    ]
+    if len(conclusion_indexes) != len(candidates):
+        return cleaned
+
+    for number in range(len(candidates), 0, -1):
+        index = conclusion_indexes[number - 1]
+        candidate = candidates[number - 1]
+        claim = re.sub(r"\s+", " ", str(candidate.claim or "")).strip()
+        if claim:
+            lines.insert(index, f"{number}. 核查点：{claim[:1000]}")
+    return "\n".join(lines).strip()
 
 
 def _split_inline_fact_check_points(text: str) -> str:
