@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -23,6 +24,18 @@ class FakeBot:
         self.calls.append((action, payload))
         if self.fail_call_number == len(self.calls):
             raise RuntimeError("onebot send failed once")
+        return {"status": "ok"}
+
+
+class ConfirmTimeoutBot(FakeBot):
+    def __init__(self, *, timeout_call_number: int) -> None:
+        super().__init__()
+        self.timeout_call_number = timeout_call_number
+
+    async def call_action(self, action: str, **payload):
+        self.calls.append((action, payload))
+        if self.timeout_call_number == len(self.calls):
+            raise RuntimeError("confirm timeout")
         return {"status": "ok"}
 
 
@@ -174,7 +187,7 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             main.send_chain_result = original_send_chain_result
             main.asyncio.sleep = original_sleep
 
-        self.assertEqual(len(event.sent), 2)
+        self.assertEqual(len(event.sent), 1)
         self.assertEqual(event.bot.calls[0][0], "send_msg")
         sent_text = event.bot.calls[0][1]["message"][0]["data"]["text"]
         self.assertIn("事实核查：可信", sent_text)
@@ -298,6 +311,53 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         sent_chunks = [call[1]["message"][0]["data"]["text"] for call in event.bot.calls]
         self.assertEqual(sent_chunks, ["A" * 350, "A" * 10, "A" * 10])
 
+    async def test_onebot_confirm_timeout_continues_with_remaining_chunks(self) -> None:
+        plugin = make_plugin()
+        event = FakeEvent(fail_send=False, bot=ConfirmTimeoutBot(timeout_call_number=1))
+
+        with (
+            patch("astrbot_plugin_fact_check.main.is_confirm_timeout", return_value=True),
+            patch("astrbot_plugin_fact_check.main.asyncio.sleep", new=AsyncMock()),
+        ):
+            ok = await plugin._send_text_via_onebot(
+                event,
+                "A" * 360,
+                label="confirm-timeout-test",
+                prefer_send_msg=True,
+            )
+
+        self.assertTrue(ok)
+        sent_chunks = [call[1]["message"][0]["data"]["text"] for call in event.bot.calls]
+        self.assertEqual(sent_chunks, ["A" * 350, "A" * 10])
+
+    async def test_forward_rejection_skips_identical_forward_retry(self) -> None:
+        plugin = make_plugin()
+        event = FakeEvent(fail_send=False)
+        rejected = SimpleNamespace(
+            ok=False,
+            assumed_ok=False,
+            kind="forward_rejected",
+            error="rejected",
+        )
+
+        with (
+            patch(
+                "astrbot_plugin_fact_check.main.send_chain_result",
+                new=AsyncMock(return_value=rejected),
+            ) as send_forward,
+            patch("astrbot_plugin_fact_check.main.asyncio.sleep", new=AsyncMock()),
+        ):
+            await plugin._send_fact_check_reply(
+                event,
+                "事实核查：可信",
+                label="forward-rejection-test",
+                purpose="result",
+            )
+
+        self.assertEqual(send_forward.await_count, 1)
+        self.assertEqual(len(event.bot.calls), 1)
+        self.assertEqual(event.bot.calls[0][0], "send_msg")
+
     async def test_bare_chinese_fact_check_command_returns_usage(self) -> None:
         plugin = make_plugin()
         event = FakeEvent(
@@ -331,6 +391,50 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.stopped)
         self.assertEqual(len(event.sent), 1)
         self.assertIn("上下文已过期", event.sent[0]["plain"])
+
+    async def test_unrelated_reply_without_sessions_does_not_fetch_remote_payload(self) -> None:
+        plugin = make_plugin()
+        event = FakeEvent(
+            message_str="这是什么意思",
+            messages=[Reply(id="123", message_str="普通聊天内容")],
+            fail_send=False,
+        )
+
+        with patch.object(plugin, "_fetch_reply_payload", new=AsyncMock()) as fetch:
+            session, missing = await plugin._find_followup_session_with_state(event)
+
+        self.assertIsNone(session)
+        self.assertFalse(missing)
+        fetch.assert_not_awaited()
+
+    async def test_local_fact_check_marker_matches_session_without_remote_fetch(self) -> None:
+        plugin = make_plugin()
+        session = main.FactCheckSession(
+            session_id="fc_aaaabbbb",
+            created_at=time.time(),
+            group_id="123456",
+            user_id="654321",
+            request_data=FactCheckRequest("A 事件", "/事实核查"),
+            reply="事实核查：可信\n1. 核查点：A 事件。\n结论：已核实。",
+        )
+        plugin._fact_check_sessions[session.session_id] = session
+        event = FakeEvent(
+            message_str="再解释一下",
+            messages=[
+                Reply(
+                    id="123",
+                    message_str=f"{session.reply}\n核查ID：{session.session_id}",
+                ),
+            ],
+            fail_send=False,
+        )
+
+        with patch.object(plugin, "_fetch_reply_payload", new=AsyncMock()) as fetch:
+            matched, missing = await plugin._find_followup_session_with_state(event)
+
+        self.assertIs(matched, session)
+        self.assertFalse(missing)
+        fetch.assert_not_awaited()
 
     async def test_markerless_followup_matches_the_quoted_session_not_the_latest(self) -> None:
         plugin = make_plugin()

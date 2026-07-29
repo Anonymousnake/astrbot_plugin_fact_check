@@ -507,58 +507,64 @@ class FactCheckPlugin(Star):
                 f"method=event.send.forward kind={getattr(outcome, 'kind', None) or 'unknown'} error={exc!r}",
             )
 
-        await asyncio.sleep(1.0)
-        outcome = await send_chain_result(event, retry_result) if send_chain_result else None
-        try:
-            if safe_text != text:
+        if safe_text != text:
+            await asyncio.sleep(1.0)
+            outcome = await send_chain_result(event, retry_result) if send_chain_result else None
+            try:
                 logger.info(
                     f"[astrbot-fact-check-send-retry-sanitized] {label}: "
                     f"len={len(text)}->{len(safe_text)}",
                 )
-            if outcome is None:
-                await event.send(retry_result)
-            elif outcome.assumed_ok:
+                if outcome is None:
+                    await event.send(retry_result)
+                elif outcome.assumed_ok:
+                    logger.info(
+                        f"[astrbot-fact-check-send-assume-ok] {label}: "
+                        f"method=event.send.forward retry kind={outcome.kind} error={outcome.error}",
+                    )
+                    return
+                elif not outcome.ok:
+                    raise RuntimeError(f"{outcome.kind}: {outcome.error}")
                 logger.info(
-                    f"[astrbot-fact-check-send-assume-ok] {label}: "
-                    f"method=event.send.forward retry kind={outcome.kind} error={outcome.error}",
+                    f"[astrbot-fact-check-send-ok] {label}: method=event.send.forward retry"
                 )
                 return
-            elif not outcome.ok:
-                raise RuntimeError(f"{outcome.kind}: {outcome.error}")
-            logger.info(
-                f"[astrbot-fact-check-send-ok] {label}: method=event.send.forward retry"
-            )
-            return
-        except Exception as exc:
-            if self._looks_like_confirm_timeout(exc):
-                logger.info(
-                    f"[astrbot-fact-check-send-assume-ok] {label}: "
-                    f"method=event.send.forward retry error={exc!r}",
-                )
-                return
-            logger.error(
-                f"[astrbot-fact-check-send-failed] {label}: "
-                f"method=event.send.forward retry kind={getattr(outcome, 'kind', None) or 'unknown'} error={exc!r}",
-            )
-            self._dump_forward_failure(label, text, exc)
-            fallback_text = self._fact_check_text_with_session_marker(safe_text, session_id=session_id)
-            if await self._send_text_via_onebot(
-                event,
-                fallback_text,
-                label=label,
-                prefer_send_msg=True,
-                suppress_errors=True,
-            ):
-                logger.info(f"[astrbot-fact-check-send-ok] {label}: method=onebot fallback")
-                return
-            try:
-                await event.send(event.plain_result(fallback_text))
-                logger.info(f"[astrbot-fact-check-send-ok] {label}: method=plain fallback")
-            except Exception as fallback_exc:
+            except Exception as exc:
+                if self._looks_like_confirm_timeout(exc):
+                    logger.info(
+                        f"[astrbot-fact-check-send-assume-ok] {label}: "
+                        f"method=event.send.forward retry error={exc!r}",
+                    )
+                    return
                 logger.error(
                     f"[astrbot-fact-check-send-failed] {label}: "
-                    f"method=plain fallback error={fallback_exc!r}",
+                    f"method=event.send.forward retry kind={getattr(outcome, 'kind', None) or 'unknown'} error={exc!r}",
                 )
+                self._dump_forward_failure(label, text, exc)
+        else:
+            logger.info(
+                f"[astrbot-fact-check-send-skip-retry] {label}: "
+                "sanitized forward is identical",
+            )
+
+        fallback_text = self._fact_check_text_with_session_marker(safe_text, session_id=session_id)
+        if await self._send_text_via_onebot(
+            event,
+            fallback_text,
+            label=label,
+            prefer_send_msg=True,
+            suppress_errors=True,
+        ):
+            logger.info(f"[astrbot-fact-check-send-ok] {label}: method=onebot fallback")
+            return
+        try:
+            await event.send(event.plain_result(fallback_text))
+            logger.info(f"[astrbot-fact-check-send-ok] {label}: method=plain fallback")
+        except Exception as fallback_exc:
+            logger.error(
+                f"[astrbot-fact-check-send-failed] {label}: "
+                f"method=plain fallback error={fallback_exc!r}",
+            )
 
     async def _send_text_via_onebot(
 
@@ -613,12 +619,15 @@ class FactCheckPlugin(Star):
                 return True
             except Exception as exc:
                 if self._looks_like_confirm_timeout(exc):
+                    next_index = min(next_index + 1, len(chunks))
                     logger.info(
                         f"[astrbot-fact-check-send-assume-ok] {label}: "
                         f"method=onebot action={action} chunks={len(chunks)} "
                         f"sent={next_index} attempt={attempt} error={exc!r}",
                     )
-                    return True
+                    if next_index >= len(chunks):
+                        return True
+                    continue
                 message = (
                     f"[astrbot-fact-check-send-error] {label}: "
                     f"method=onebot action={action} chunks={len(chunks)} "
@@ -908,63 +917,97 @@ class FactCheckPlugin(Star):
         ids: list[str] = []
         quoted_looks_like_fact_check = False
         quoted_fact_check_texts: list[str] = []
+        replies_without_local_text: list[Reply] = []
         for text in _event_text_candidates(event):
             ids.extend(self._extract_fact_check_session_ids(text))
 
         for comp in event.get_messages():
             if not isinstance(comp, Reply):
                 continue
-            for text in [str(comp.message_str or "")] + self._plain_texts(comp.chain or []):
+            local_texts = [str(comp.message_str or "")] + self._plain_texts(comp.chain or [])
+            usable_local_texts = [
+                text
+                for text in local_texts
+                if text.strip() and not self._is_unusable_quoted_text(text)
+            ]
+            if not usable_local_texts:
+                replies_without_local_text.append(comp)
+            for text in usable_local_texts:
                 ids.extend(self._extract_fact_check_session_ids(text))
                 if self._looks_like_fact_check_reply(text):
                     quoted_looks_like_fact_check = True
                     quoted_fact_check_texts.append(text)
-            fetched = await self._fetch_reply_payload(event, comp)
-            if fetched:
-                fetched_texts, _, _ = fetched
-                for text in fetched_texts:
-                    ids.extend(self._extract_fact_check_session_ids(text))
-                    if self._looks_like_fact_check_reply(text):
-                        quoted_looks_like_fact_check = True
-                        quoted_fact_check_texts.append(text)
 
         for session_id in ids:
             session = self._fact_check_sessions.get(session_id)
             if session:
                 return session, False
+        if ids:
+            return None, True
 
-        # NapCat may omit the marker. Bind only when the quoted result itself matches a saved session.
-        if not quoted_looks_like_fact_check:
-            return None, bool(ids)
         candidates = [
             session
             for session in self._fact_check_sessions.values()
             if self._session_visible_to_event(session, event)
         ]
         if not candidates:
-            return None, True
-        ranked = sorted(
-            (
+            return None, quoted_looks_like_fact_check
+
+        def match_quoted_text() -> tuple[FactCheckSession | None, bool]:
+            if not quoted_fact_check_texts:
+                return None, False
+            ranked = sorted(
                 (
-                    max(
-                        (
-                            self._fact_check_reply_match_score(text, session.reply)
-                            for text in quoted_fact_check_texts
+                    (
+                        max(
+                            (
+                                self._fact_check_reply_match_score(text, session.reply)
+                                for text in quoted_fact_check_texts
+                            ),
+                            default=0.0,
                         ),
-                        default=0.0,
-                    ),
-                    session,
-                )
-                for session in candidates
-            ),
-            key=lambda item: item[0],
-            reverse=True,
-        )
-        best_score, best_session = ranked[0]
-        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
-        if best_score < 0.62 or (len(ranked) > 1 and best_score - second_score < 0.08):
+                        session,
+                    )
+                    for session in candidates
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            best_score, best_session = ranked[0]
+            second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+            if best_score < 0.62 or (len(ranked) > 1 and best_score - second_score < 0.08):
+                return None, True
+            return best_session, False
+
+        # NapCat usually includes enough quoted text locally. Match that before
+        # asking OneBot for the full message to avoid a network call on every reply.
+        if quoted_looks_like_fact_check:
+            return match_quoted_text()
+
+        if not replies_without_local_text:
+            return None, False
+
+        for comp in replies_without_local_text:
+            fetched = await self._fetch_reply_payload(event, comp)
+            if not fetched:
+                continue
+            fetched_texts, _, _ = fetched
+            for text in fetched_texts:
+                ids.extend(self._extract_fact_check_session_ids(text))
+                if self._looks_like_fact_check_reply(text):
+                    quoted_looks_like_fact_check = True
+                    quoted_fact_check_texts.append(text)
+
+        for session_id in ids:
+            session = self._fact_check_sessions.get(session_id)
+            if session:
+                return session, False
+        if ids:
             return None, True
-        return best_session, False
+        if not quoted_looks_like_fact_check:
+            return None, False
+
+        return match_quoted_text()
 
     @staticmethod
     def _fact_check_reply_match_score(quoted: str, saved: str) -> float:
