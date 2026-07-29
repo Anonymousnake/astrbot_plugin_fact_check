@@ -71,6 +71,44 @@ HIGH_RISK_VERDICT_CALIBRATION_RULES = """\
 - 若来源只支持法规/政策存在，但没有直接支持具体适用推论，整体结论最高为“部分存疑”，并明确写“未找到直接证据支持该具体推论”。
 - 总结论按最关键争议命题决定，不要因为任一子事实成立就把整体判成“可信”或“基本可信但需限定”。
 - 要点中尽量标出“已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断”。"""
+FACT_CHECK_SUMMARY_LABELS = (
+    "基本可信但需限定",
+    "条件性成立",
+    "表述不准确",
+    "混合结论",
+    "部分存疑",
+    "证据不足",
+    "基本不实",
+    "可信",
+)
+FACT_CHECK_CLAIM_LABELS = (
+    "条件性成立",
+    "表述需限定",
+    "部分存疑",
+    "证据不足",
+    "无法判断",
+    "不准确",
+    "已核实",
+)
+FOLLOWUP_CHANGE_LABELS = (
+    "原结论需要部分修正",
+    "原结论部分需要修正",
+    "原结论需要修正",
+    "原结论暂不改变",
+    "部分改变",
+    "不改变",
+    "改变",
+)
+WEAK_BASIS_VALUES = {
+    "",
+    "无",
+    "略",
+    "同上",
+    "如上",
+    "见上",
+    "见来源",
+    "参见来源",
+}
 CONDITIONAL_CLAIM_RE = re.compile(
     r"(可以被视为|可被视为|符合.+条件|满足.+条件|在满足.+条件下|"
     r"eligible|aligned|taxonomy[- ]?(?:compatible|eligible|aligned))",
@@ -871,7 +909,13 @@ def run_fact_check_followup(
                 candidates=candidates,
             )
     reply = sanitize_fact_check_reply(extract_text(body).strip())
-    sources = normalize_fact_check_sources(extract_sources(body))
+    sources = normalize_fact_check_sources(
+        select_fact_check_sources(
+            extract_sources(body),
+            previous_sources,
+            limit=3,
+        ),
+    )
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources)
     reply = append_source_links(reply, sources)
@@ -2052,36 +2096,46 @@ def validate_complete_fact_check_result(
     text = sanitize_fact_check_reply(extract_text(body).strip())
     if not text:
         raise IncompleteGenerationError("no readable text")
-    if not re.search(r"(?:^|\n)事实核查[：:]\s*\S+", text):
+    summary_match = re.search(r"(?:^|\n)事实核查[：:]\s*([^\n]+)", text)
+    if not summary_match:
         raise IncompleteGenerationError("missing fact-check summary")
-    if not re.search(r"(?:^|\n)结论[：:]\s*\S+", text):
-        raise IncompleteGenerationError("missing claim verdict")
+    if not _value_starts_with_allowed_label(
+        summary_match.group(1),
+        FACT_CHECK_SUMMARY_LABELS,
+    ):
+        raise IncompleteGenerationError("invalid fact-check summary label")
+
+    blocks = _parse_fact_check_blocks(text)
+    if not blocks:
+        raise IncompleteGenerationError("missing numbered claim blocks")
     expected_claim_count = max(0, int(expected_claim_count or 0))
-    if expected_claim_count > 1:
-        point_numbers = [
-            int(number)
-            for number in re.findall(
-                r"^\s*(\d+)\.\s*核查点[：:]\s*\S+",
-                text,
-                flags=re.MULTILINE,
+    if not expected_claim_count:
+        expected_claim_count = len(blocks)
+    point_numbers = [block[0] for block in blocks]
+    expected_numbers = list(range(1, expected_claim_count + 1))
+    if point_numbers != expected_numbers:
+        raise IncompleteGenerationError(
+            "incomplete claim coverage: "
+            f"expected={expected_claim_count} points={point_numbers}",
+        )
+
+    for number, point, conclusions, bases in blocks:
+        if not point.strip():
+            raise IncompleteGenerationError(f"claim {number} is missing its question")
+        if len(conclusions) != 1:
+            raise IncompleteGenerationError(
+                f"claim {number} must have exactly one conclusion",
             )
-        ]
-        conclusion_count = len(
-            re.findall(r"^\s*结论[：:]\s*\S+", text, flags=re.MULTILINE)
-        )
-        basis_count = len(
-            re.findall(r"^\s*依据[：:]\s*\S+", text, flags=re.MULTILINE)
-        )
-        expected_numbers = list(range(1, expected_claim_count + 1))
-        if (
-            point_numbers != expected_numbers
-            or conclusion_count != expected_claim_count
-            or basis_count != expected_claim_count
+        if not _value_starts_with_allowed_label(
+            conclusions[0],
+            FACT_CHECK_CLAIM_LABELS,
         ):
             raise IncompleteGenerationError(
-                "incomplete claim coverage: "
-                f"expected={expected_claim_count} points={point_numbers} "
-                f"conclusions={conclusion_count} bases={basis_count}"
+                f"claim {number} has an invalid conclusion label",
+            )
+        if len(bases) != 1 or _is_weak_basis(bases[0]):
+            raise IncompleteGenerationError(
+                f"claim {number} must have one meaningful basis",
             )
     if text.rstrip().endswith((",", "，", "、", ":", "：", ";", "；", "/", "（")):
         raise IncompleteGenerationError("reply ended mid-sentence")
@@ -2104,8 +2158,71 @@ def validate_complete_followup_result(body: dict[str, Any]) -> None:
     ]
     if missing:
         raise IncompleteGenerationError("missing follow-up fields: " + ",".join(missing))
+    change_match = re.search(
+        r"(?:^|\n)是否改变原结论[：:]\s*([^\n]+)",
+        text,
+    )
+    if not change_match or not _value_starts_with_allowed_label(
+        change_match.group(1),
+        FOLLOWUP_CHANGE_LABELS,
+    ):
+        raise IncompleteGenerationError("invalid follow-up change state")
     if text.rstrip().endswith((",", "，", "、", ":", "：", ";", "；", "/", "（")):
         raise IncompleteGenerationError("reply ended mid-sentence")
+
+
+def _value_starts_with_allowed_label(
+    value: str,
+    allowed_labels: tuple[str, ...],
+) -> bool:
+    normalized = str(value or "").strip().replace("**", "")
+    labels = "|".join(re.escape(label) for label in sorted(allowed_labels, key=len, reverse=True))
+    return bool(
+        re.match(
+            rf"^(?:{labels})(?=$|[\s，,。；;、:：（(])",
+            normalized,
+        ),
+    )
+
+
+def _parse_fact_check_blocks(
+    text: str,
+) -> list[tuple[int, str, list[str], list[str]]]:
+    point_pattern = re.compile(
+        r"^\s*(\d+)\.\s*核查点[：:]\s*([^\n]*)",
+        flags=re.MULTILINE,
+    )
+    matches = list(point_pattern.finditer(text))
+    blocks: list[tuple[int, str, list[str], list[str]]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        section = text[match.end() : end]
+        conclusions = re.findall(
+            r"^\s*结论[：:]\s*([^\n]+)",
+            section,
+            flags=re.MULTILINE,
+        )
+        bases = re.findall(
+            r"^\s*依据[：:]\s*([^\n]+)",
+            section,
+            flags=re.MULTILINE,
+        )
+        blocks.append(
+            (
+                int(match.group(1)),
+                match.group(2).strip(),
+                [item.strip() for item in conclusions],
+                [item.strip() for item in bases],
+            ),
+        )
+    return blocks
+
+
+def _is_weak_basis(value: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(value or "")).strip("。.!！；;，,")
+    if normalized in WEAK_BASIS_VALUES:
+        return True
+    return bool(re.fullmatch(r"(?:见|参见)(?:上述|上方|前述)?(?:来源|链接|证据)", normalized))
 
 
 def validate_complete_verdict(body: dict[str, Any]) -> None:

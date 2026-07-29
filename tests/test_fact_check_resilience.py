@@ -22,6 +22,23 @@ def complete_fact_check_body(text: str, **candidate_fields):
     return {"candidates": [candidate]}
 
 
+def complete_single_claim_body(
+    *,
+    summary: str = "可信",
+    claim: str = "测试命题是否属实。",
+    conclusion: str = "已核实",
+    basis: str = "公开证据支持该命题。",
+    **candidate_fields,
+):
+    return complete_fact_check_body(
+        f"事实核查：{summary}\n"
+        f"1. 核查点：{claim}\n"
+        f"结论：{conclusion}\n"
+        f"依据：{basis}",
+        **candidate_fields,
+    )
+
+
 class LocalImage(Image):
     def __init__(self, source: Path) -> None:
         super().__init__(file=str(source))
@@ -59,8 +76,11 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["thinkingConfig"], {"thinkingBudget": 0})
 
     def test_grounding_support_mapping_and_anysearch_excerpts_reach_verdict(self) -> None:
-        evidence_response = complete_fact_check_body(
-            "事实核查：部分存疑\n结论：已核实\n依据：政策存在。",
+        evidence_response = complete_single_claim_body(
+            summary="部分存疑",
+            claim="政策及其产品适用推论是否成立。",
+            conclusion="已核实",
+            basis="政策存在。",
             groundingMetadata={
                         "groundingChunks": [
                             {"web": {"uri": "https://example.com/policy", "title": "Policy"}},
@@ -73,7 +93,12 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                         ],
             },
         )
-        verdict_response = complete_fact_check_body("事实核查：部分存疑\n结论：部分存疑\n依据：具体适用范围未明确。")
+        verdict_response = complete_single_claim_body(
+            summary="部分存疑",
+            claim="政策及其产品适用推论是否成立。",
+            conclusion="部分存疑",
+            basis="具体适用范围未明确。",
+        )
 
         with (
             patch.object(
@@ -118,7 +143,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
 
     def test_text_with_image_uses_one_multimodal_preprocess_and_reuses_inline_parts(self) -> None:
         inline_parts = [{"inline_data": {"mime_type": "image/png", "data": "AA=="}}]
-        response = complete_fact_check_body("事实核查：可信\n结论：已核实\n依据：测试结果。")
+        response = complete_single_claim_body(claim="图片与文字中的命题是否属实。")
 
         with (
             patch.object(fact_check, "build_inline_image_parts", return_value=inline_parts) as build_images,
@@ -149,7 +174,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
 
     def test_text_preprocess_is_used_as_fallback_when_multimodal_extracts_no_claims(self) -> None:
         inline_parts = [{"inline_data": {"mime_type": "image/png", "data": "AA=="}}]
-        response = complete_fact_check_body("事实核查：可信\n结论：已核实\n依据：测试结果。")
+        response = complete_single_claim_body(claim="文字中的命题是否属实。")
 
         with (
             patch.object(fact_check, "build_inline_image_parts", return_value=inline_parts),
@@ -201,6 +226,59 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(body=body):
                 with self.assertRaises(fact_check.IncompleteGenerationError):
                     fact_check.validate_complete_fact_check_result(body)
+
+    def test_single_fact_check_requires_complete_block_and_allowed_labels(self) -> None:
+        invalid_bodies = [
+            complete_fact_check_body("事实核查：可信\n结论：已核实"),
+            complete_fact_check_body(
+                "事实核查：可信\n"
+                "1. 核查点：A 事件是否发生。\n"
+                "结论：可信\n"
+                "依据：来源支持。"
+            ),
+            complete_fact_check_body(
+                "事实核查：随便\n"
+                "1. 核查点：A 事件是否发生。\n"
+                "结论：已核实\n"
+                "依据：来源支持。"
+            ),
+            complete_fact_check_body(
+                "事实核查：可信\n"
+                "1. 核查点：A 事件是否发生。\n"
+                "结论：已核实\n"
+                "依据：见来源。"
+            ),
+        ]
+
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                with self.assertRaises(fact_check.IncompleteGenerationError):
+                    fact_check.validate_complete_fact_check_result(body, expected_claim_count=1)
+
+    def test_multi_claim_fact_check_rejects_invalid_child_label(self) -> None:
+        body = complete_fact_check_body(
+            "事实核查：混合结论\n"
+            "1. 核查点：A 事件是否发生。\n"
+            "结论：随便\n"
+            "依据：来源 A 支持。\n"
+            "2. 核查点：B 事件是否发生。\n"
+            "结论：证据不足\n"
+            "依据：没有找到直接证据。"
+        )
+
+        with self.assertRaises(fact_check.IncompleteGenerationError):
+            fact_check.validate_complete_fact_check_result(body, expected_claim_count=2)
+
+    def test_followup_requires_declared_change_state(self) -> None:
+        body = complete_fact_check_body(
+            "追问结论：补充信息成立。\n"
+            "补充依据：新增来源支持。\n"
+            "是否改变原结论：随便\n"
+            "来源：示例来源"
+        )
+
+        with self.assertRaises(fact_check.IncompleteGenerationError):
+            fact_check.validate_complete_followup_result(body)
 
     def test_expired_total_deadline_prevents_a_new_http_attempt(self) -> None:
         token = fact_check._REQUEST_DEADLINE.set(fact_check.time.monotonic() - 1)
@@ -314,7 +392,12 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parts, [first])
 
     def test_text_preprocess_failure_falls_through_to_main_check(self) -> None:
-        response = complete_fact_check_body("事实核查：证据不足\n结论：证据不足\n依据：测试结果。")
+        response = complete_single_claim_body(
+            summary="证据不足",
+            claim="请核查下面聊天内容中涉及的事实是否准确：某条需要核查的消息",
+            conclusion="证据不足",
+            basis="测试结果。",
+        )
 
         with (
             patch.object(fact_check, "extract_claims_from_text", side_effect=RuntimeError("preprocess failed")),
@@ -333,7 +416,12 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.reason.startswith("ok"))
 
     def test_image_preprocess_failure_still_sends_image_to_main_check(self) -> None:
-        response = complete_fact_check_body("事实核查：证据不足\n结论：证据不足\n依据：测试结果。")
+        response = complete_single_claim_body(
+            summary="证据不足",
+            claim="请核查图片中主要事实断言是否准确，并指出无法辨认或缺少证据的部分。",
+            conclusion="证据不足",
+            basis="测试结果。",
+        )
         attached = [{"inline_data": {"mime_type": "image/png", "data": "AA=="}}]
 
         with (
@@ -379,8 +467,18 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(generate.call_args.kwargs["grounding"])
 
     def test_grounded_evidence_is_reviewed_by_ungrounded_gemini_3(self) -> None:
-        evidence_response = complete_fact_check_body("事实核查：部分存疑\n结论：已核实\n依据：政策存在。")
-        verdict_response = complete_fact_check_body("事实核查：部分存疑\n结论：部分存疑\n依据：具体适用范围未明确。")
+        evidence_response = complete_single_claim_body(
+            summary="部分存疑",
+            claim="Check the policy and its product implication.",
+            conclusion="已核实",
+            basis="政策存在。",
+        )
+        verdict_response = complete_single_claim_body(
+            summary="部分存疑",
+            claim="Check the policy and its product implication.",
+            conclusion="部分存疑",
+            basis="具体适用范围未明确。",
+        )
 
         with (
             patch.object(
@@ -416,7 +514,12 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("结论：部分存疑", result.reply)
 
     def test_grounded_evidence_is_the_complete_fallback_when_gemini_3_fails(self) -> None:
-        evidence_response = complete_fact_check_body("事实核查：证据不足\n结论：证据不足\n依据：证据模型兜底。")
+        evidence_response = complete_single_claim_body(
+            summary="证据不足",
+            claim="Check the claim.",
+            conclusion="证据不足",
+            basis="证据模型兜底。",
+        )
 
         with (
             patch.object(
@@ -446,8 +549,11 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("结论：证据不足", result.reply)
 
     def test_verdict_policy_never_skips_gemini_3_review(self) -> None:
-        evidence_response = complete_fact_check_body(
-            "事实核查：可信\n结论：已核实\n依据：完整证据。"
+        evidence_response = complete_single_claim_body(
+            summary="可信",
+            claim="核查 A 事件",
+            conclusion="已核实",
+            basis="完整证据。",
         )
 
         with (
@@ -485,12 +591,12 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("rkey", label)
 
     def test_grounded_evidence_is_used_when_gemini_3_returns_no_text(self) -> None:
-        evidence_response = {
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {"parts": [{"text": "事实核查：证据不足\n结论：证据不足\n依据：已完成检索。"}]},
-            }],
-        }
+        evidence_response = complete_single_claim_body(
+            summary="证据不足",
+            claim="Check the claim.",
+            conclusion="证据不足",
+            basis="已完成检索。",
+        )
         empty_verdict = {"candidates": [{"content": {"parts": []}}]}
 
         with (
@@ -529,18 +635,18 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定，"}]},
             }],
         }
-        completed_evidence = {
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定\n依据：完整证据。"}]},
-            }],
-        }
-        completed_verdict = {
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定\n依据：完整复核。"}]},
-            }],
-        }
+        completed_evidence = complete_single_claim_body(
+            summary="混合结论",
+            claim="请核查：A 是否属实？",
+            conclusion="表述需限定",
+            basis="完整证据。",
+        )
+        completed_verdict = complete_single_claim_body(
+            summary="混合结论",
+            claim="请核查：A 是否属实？",
+            conclusion="表述需限定",
+            basis="完整复核。",
+        )
 
         with (
             patch.object(
@@ -610,24 +716,24 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generate.call_count, 2)
 
     def test_truncated_verdict_is_retried_with_more_output_tokens(self) -> None:
-        evidence_response = {
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {"parts": [{"text": "事实核查：证据模型的完整结果。\n结论：已核实\n依据：完整证据。"}]},
-            }],
-        }
+        evidence_response = complete_single_claim_body(
+            summary="可信",
+            claim="请核查：A 是否属实？",
+            conclusion="已核实",
+            basis="完整证据。",
+        )
         truncated_verdict = {
             "candidates": [{
                 "finishReason": "MAX_TOKENS",
                 "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定，"}]},
             }],
         }
-        completed_verdict = {
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定。"}]},
-            }],
-        }
+        completed_verdict = complete_single_claim_body(
+            summary="混合结论",
+            claim="请核查：A 是否属实？",
+            conclusion="表述需限定",
+            basis="完整复核。",
+        )
 
         with (
             patch.object(
@@ -655,18 +761,18 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn("1. 核查点：请核查：A 是否属实？", result.reply)
-        self.assertIn("结论：表述需限定。", result.reply)
+        self.assertIn("结论：表述需限定", result.reply)
         self.assertEqual(generate.call_count, 3)
         self.assertEqual(generate.call_args_list[1].kwargs["max_output_tokens"], 2048)
         self.assertEqual(generate.call_args_list[2].kwargs["max_output_tokens"], 4096)
 
     def test_twice_truncated_verdict_falls_back_to_grounded_evidence(self) -> None:
-        evidence_response = {
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {"parts": [{"text": "事实核查：证据模型的完整结果。\n结论：已核实\n依据：完整证据。"}]},
-            }],
-        }
+        evidence_response = complete_single_claim_body(
+            summary="可信",
+            claim="请核查：A 是否属实？",
+            conclusion="已核实",
+            basis="完整证据。",
+        )
         truncated_verdict = {
             "candidates": [{
                 "finishReason": "MAX_TOKENS",

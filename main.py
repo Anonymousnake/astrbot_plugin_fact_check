@@ -107,6 +107,7 @@ class FactCheckSession:
     user_id: str
     request_data: FactCheckRequest
     reply: str
+    updated_at: float = 0.0
     candidates: list = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
 
@@ -240,13 +241,22 @@ class FactCheckPlugin(Star):
             f"[astrbot-fact-check-followup-done] {label}: "
             f"session={session.session_id} {time.perf_counter() - started_at:.2f}s",
         )
-        await self._send_fact_check_reply(
+        sent = await self._send_fact_check_reply(
             event,
             result.reply or FAILED_REPLY,
             label=label,
             purpose="followup",
             session_id=session.session_id,
         )
+        if sent and self._is_successful_result(result):
+            session.reply = result.reply or session.reply
+            session.sources = self._merge_sources(
+                result.sources,
+                session.sources,
+                limit=5,
+            )
+            session.updated_at = time.time()
+            self._persist_fact_check_sessions()
 
     @filter.custom_filter(FactCheckWakeFilter, priority=998_000)
     async def fact_check(self, event: AstrMessageEvent):
@@ -495,7 +505,7 @@ class FactCheckPlugin(Star):
         label: str,
         purpose: str,
         session_id: str | None = None,
-    ) -> None:
+    ) -> bool:
         text = str(text or FAILED_REPLY).strip() or FAILED_REPLY
         logger.info(
             f"[astrbot-fact-check-send] {label}: purpose={purpose} len={len(text)}",
@@ -517,18 +527,18 @@ class FactCheckPlugin(Star):
                     f"[astrbot-fact-check-send-assume-ok] {label}: "
                     f"method=event.send.forward kind={outcome.kind} error={outcome.error}",
                 )
-                return
+                return True
             elif not outcome.ok:
                 raise RuntimeError(f"{outcome.kind}: {outcome.error}")
             logger.info(f"[astrbot-fact-check-send-ok] {label}: method=event.send.forward")
-            return
+            return True
         except Exception as exc:
             if self._looks_like_confirm_timeout(exc):
                 logger.info(
                     f"[astrbot-fact-check-send-assume-ok] {label}: "
                     f"method=event.send.forward error={exc!r}",
                 )
-                return
+                return True
             logger.warning(
                 f"[astrbot-fact-check-send-error] {label}: "
                 f"method=event.send.forward kind={getattr(outcome, 'kind', None) or 'unknown'} error={exc!r}",
@@ -549,20 +559,20 @@ class FactCheckPlugin(Star):
                         f"[astrbot-fact-check-send-assume-ok] {label}: "
                         f"method=event.send.forward retry kind={outcome.kind} error={outcome.error}",
                     )
-                    return
+                    return True
                 elif not outcome.ok:
                     raise RuntimeError(f"{outcome.kind}: {outcome.error}")
                 logger.info(
                     f"[astrbot-fact-check-send-ok] {label}: method=event.send.forward retry"
                 )
-                return
+                return True
             except Exception as exc:
                 if self._looks_like_confirm_timeout(exc):
                     logger.info(
                         f"[astrbot-fact-check-send-assume-ok] {label}: "
                         f"method=event.send.forward retry error={exc!r}",
                     )
-                    return
+                    return True
                 logger.error(
                     f"[astrbot-fact-check-send-failed] {label}: "
                     f"method=event.send.forward retry kind={getattr(outcome, 'kind', None) or 'unknown'} error={exc!r}",
@@ -583,15 +593,17 @@ class FactCheckPlugin(Star):
             suppress_errors=True,
         ):
             logger.info(f"[astrbot-fact-check-send-ok] {label}: method=onebot fallback")
-            return
+            return True
         try:
             await event.send(event.plain_result(fallback_text))
             logger.info(f"[astrbot-fact-check-send-ok] {label}: method=plain fallback")
+            return True
         except Exception as fallback_exc:
             logger.error(
                 f"[astrbot-fact-check-send-failed] {label}: "
                 f"method=plain fallback error={fallback_exc!r}",
             )
+            return False
 
     async def _send_text_via_onebot(
 
@@ -861,6 +873,26 @@ class FactCheckPlugin(Star):
         return not result.reason or result.reason.startswith("ok")
 
     @staticmethod
+    def _merge_sources(
+        preferred: Iterable[str],
+        existing: Iterable[str],
+        *,
+        limit: int,
+    ) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for source in [*preferred, *existing]:
+            item = str(source or "").strip()
+            key = re.sub(r"\s+", "", item).lower()
+            if not item or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+            if len(merged) >= max(1, int(limit or 1)):
+                break
+        return merged
+
+    @staticmethod
     def _image_input_digest(image: ImageInput) -> str:
         if image.content_sha256:
             return image.content_sha256
@@ -922,13 +954,15 @@ class FactCheckPlugin(Star):
     ) -> str:
         self._cleanup_fact_check_sessions()
         session_id = "fc_" + uuid.uuid4().hex[:8]
+        now = time.time()
         self._fact_check_sessions[session_id] = FactCheckSession(
             session_id=session_id,
-            created_at=time.time(),
+            created_at=now,
             group_id=str(event.get_group_id() or "").strip(),
             user_id=str(event.get_sender_id() or "").strip(),
             request_data=request_data,
             reply=result.reply or FAILED_REPLY,
+            updated_at=now,
             candidates=list(result.candidates or []),
             sources=list(result.sources or []),
         )
@@ -945,11 +979,12 @@ class FactCheckPlugin(Star):
             return
         path = self._session_store_path()
         payload = {
-            "version": 1,
+            "version": 2,
             "sessions": [
                 {
                     "session_id": session.session_id,
                     "created_at": session.created_at,
+                    "updated_at": session.updated_at or session.created_at,
                     "group_id": session.group_id,
                     "user_id": session.user_id,
                     "reply": session.reply,
@@ -1017,6 +1052,11 @@ class FactCheckPlugin(Star):
                     user_id=str(record.get("user_id") or "").strip(),
                     request_data=FactCheckRequest(text="", trigger_text=""),
                     reply=str(record.get("reply") or FAILED_REPLY),
+                    updated_at=float(
+                        record.get("updated_at")
+                        or record.get("created_at")
+                        or 0
+                    ),
                     candidates=candidates,
                     sources=[
                         str(source).strip()
@@ -1040,14 +1080,17 @@ class FactCheckPlugin(Star):
         expired = [
             session_id
             for session_id, session in self._fact_check_sessions.items()
-            if now - session.created_at > ttl
+            if now - (session.updated_at or session.created_at) > ttl
         ]
         for session_id in expired:
             self._fact_check_sessions.pop(session_id, None)
         changed = bool(expired)
         if len(self._fact_check_sessions) <= max_entries:
             return changed
-        stale = sorted(self._fact_check_sessions.values(), key=lambda item: item.created_at)
+        stale = sorted(
+            self._fact_check_sessions.values(),
+            key=lambda item: item.updated_at or item.created_at,
+        )
         for session in stale[: len(self._fact_check_sessions) - max_entries]:
             self._fact_check_sessions.pop(session.session_id, None)
             changed = True

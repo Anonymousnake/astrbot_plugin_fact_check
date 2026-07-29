@@ -379,6 +379,112 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(event.sent), 1)
         self.assertIn("队列满", event.sent[0]["plain"])
 
+    async def test_successful_followup_advances_and_persists_session(self) -> None:
+        plugin = make_plugin()
+        request = FactCheckRequest(text="A 事件是真的", trigger_text="/事实核查")
+        session = main.FactCheckSession(
+            session_id="fc_abcd1234",
+            created_at=time.time() - 30,
+            group_id="123456",
+            user_id="654321",
+            request_data=request,
+            reply="事实核查：部分存疑",
+            candidates=[ClaimCandidate("请核查：A 事件是否属实？")],
+            sources=["旧来源：https://example.com/old"],
+        )
+        plugin._fact_check_sessions[session.session_id] = session
+        event = FakeEvent(
+            message_str="新证据会改变结论吗",
+            messages=[
+                Reply(
+                    id="1",
+                    message_str=f"{session.reply}\n核查ID：{session.session_id}",
+                ),
+            ],
+            fail_send=False,
+        )
+        followup_result = FactCheckResult(
+            reply=(
+                "追问结论：新证据成立。\n"
+                "补充依据：官方来源确认。\n"
+                "是否改变原结论：原结论需要修正\n"
+                "来源：官方来源"
+            ),
+            reason="ok; follow-up",
+            sources=["官方来源：https://example.gov/new"],
+            candidates=session.candidates,
+        )
+
+        with (
+            patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)),
+            patch.object(plugin, "_send_fact_check_reply", new=AsyncMock(return_value=True)),
+            patch.object(plugin, "_persist_fact_check_sessions") as persist,
+            patch("astrbot_plugin_fact_check.main.is_plugin_allowed", None),
+            patch(
+                "astrbot_plugin_fact_check.main.run_fact_check_followup",
+                return_value=followup_result,
+            ) as followup,
+        ):
+            await plugin.fact_check_followup(event)
+
+        self.assertEqual(session.reply, followup_result.reply)
+        self.assertEqual(
+            session.sources,
+            [
+                "官方来源：https://example.gov/new",
+                "旧来源：https://example.com/old",
+            ],
+        )
+        self.assertGreater(session.updated_at, session.created_at)
+        persist.assert_called_once()
+        self.assertEqual(
+            followup.call_args.kwargs["previous_reply"],
+            "事实核查：部分存疑",
+        )
+
+    async def test_failed_followup_send_does_not_advance_session(self) -> None:
+        plugin = make_plugin()
+        session = main.FactCheckSession(
+            session_id="fc_dcba4321",
+            created_at=time.time(),
+            group_id="123456",
+            user_id="654321",
+            request_data=FactCheckRequest("A 事件", "/事实核查"),
+            reply="事实核查：证据不足",
+            sources=["https://example.com/old"],
+        )
+        plugin._fact_check_sessions[session.session_id] = session
+        event = FakeEvent(
+            message_str="再查一下",
+            messages=[Reply(id="1", message_str=f"{session.reply}\n核查ID：{session.session_id}")],
+            fail_send=False,
+        )
+
+        with (
+            patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)),
+            patch.object(plugin, "_send_fact_check_reply", new=AsyncMock(return_value=False)),
+            patch.object(plugin, "_persist_fact_check_sessions") as persist,
+            patch("astrbot_plugin_fact_check.main.is_plugin_allowed", None),
+            patch(
+                "astrbot_plugin_fact_check.main.run_fact_check_followup",
+                return_value=FactCheckResult(
+                    reply=(
+                        "追问结论：新信息。\n"
+                        "补充依据：新依据。\n"
+                        "是否改变原结论：原结论暂不改变\n"
+                        "来源：新来源"
+                    ),
+                    reason="ok; follow-up",
+                    sources=["https://example.com/new"],
+                ),
+            ),
+        ):
+            await plugin.fact_check_followup(event)
+
+        self.assertEqual(session.reply, "事实核查：证据不足")
+        self.assertEqual(session.sources, ["https://example.com/old"])
+        persist.assert_not_called()
+
     async def test_onebot_text_retry_resumes_failed_chunk_without_duplicates(self) -> None:
         plugin = make_plugin()
         event = FakeEvent(fail_send=False, bot=FakeBot(fail_call_number=2))

@@ -267,7 +267,12 @@ class AnysearchEvidenceTests(unittest.TestCase):
                             "content": {
                                 "parts": [
                                     {
-                                        "text": "事实核查：基本可信但需限定\n结论：已核实\n依据：有公开来源支持。"
+                                        "text": (
+                                            "事实核查：基本可信但需限定\n"
+                                            "1. 核查点：请核查：A 事件是否属实？\n"
+                                            "结论：已核实\n"
+                                            "依据：有公开来源支持。"
+                                        )
                                     }
                                 ]
                             }
@@ -541,7 +546,14 @@ class AnysearchEvidenceTests(unittest.TestCase):
                         {
                             "finishReason": "STOP",
                             "content": {
-                                "parts": [{"text": "事实核查：证据不足\n结论：证据不足\n依据：搜索失败但主核查继续。"}]
+                                "parts": [{
+                                    "text": (
+                                        "事实核查：证据不足\n"
+                                        "1. 核查点：请核查：A 事件是否属实？\n"
+                                        "结论：证据不足\n"
+                                        "依据：搜索失败但主核查继续。"
+                                    )
+                                }]
                             }
                         }
                     ]
