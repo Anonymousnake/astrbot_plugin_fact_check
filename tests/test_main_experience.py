@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -92,6 +93,18 @@ class FakeEvent:
 
 class NoLocalImage(Image):
     async def convert_to_file_path(self):
+        raise RuntimeError("no local file")
+
+
+class CountingImage(Image):
+    resolve_calls: int = 0
+
+    def __init__(self, *, file: str, url: str) -> None:
+        super().__init__(file=file, url=url)
+        self.resolve_calls = 0
+
+    async def convert_to_file_path(self):
+        self.resolve_calls += 1
         raise RuntimeError("no local file")
 
 
@@ -295,7 +308,10 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
                 plugin._dump_forward_failure(
                     "group:123:user:456",
                     "敏感事实核查正文 https://example.com/?token=secret",
-                    RuntimeError("send failed"),
+                    RuntimeError(
+                        "send failed for https://example.com/image.png?token=secret "
+                        "at C:\\Users\\test\\private.png",
+                    ),
                 )
             payload = json.loads(
                 (root / "last_forward_failure.json").read_text(encoding="utf-8"),
@@ -305,6 +321,8 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("chunks", payload)
         self.assertEqual(payload["length"], len("敏感事实核查正文 https://example.com/?token=secret"))
         self.assertIn("text_sha256", payload)
+        self.assertNotIn("secret", payload["error"])
+        self.assertNotIn("private.png", payload["error"])
 
     def test_model_cooling_error_starts_user_facing_cooldown(self) -> None:
         plugin = make_plugin()
@@ -719,6 +737,119 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(Path(result[0].path).is_file())
             source.unlink()
             self.assertEqual(Path(result[0].path).read_bytes(), b"stable-image-content")
+
+    async def test_image_inputs_skip_duplicate_reference_before_resolution(self) -> None:
+        plugin = make_plugin()
+        first = CountingImage(
+            file="same.png",
+            url="https://example.com/same.png?token=secret",
+        )
+        duplicate = CountingImage(
+            file="same.png",
+            url="https://example.com/same.png?token=secret",
+        )
+        seen_refs: set[str] = set()
+
+        first_result = await plugin._image_inputs(
+            [first],
+            remaining=2,
+            seen_refs=seen_refs,
+        )
+        duplicate_result = await plugin._image_inputs(
+            [duplicate],
+            remaining=2,
+            seen_refs=seen_refs,
+        )
+
+        self.assertEqual(len(first_result), 1)
+        self.assertEqual(duplicate_result, [])
+        self.assertEqual(first.resolve_calls, 1)
+        self.assertEqual(duplicate.resolve_calls, 0)
+
+    async def test_image_inputs_keep_same_filename_with_different_urls(self) -> None:
+        plugin = make_plugin()
+        first = CountingImage(file="image.png", url="https://a.example/image.png")
+        second = CountingImage(file="image.png", url="https://b.example/image.png")
+        seen_refs: set[str] = set()
+
+        result = await plugin._image_inputs(
+            [first, second],
+            remaining=2,
+            seen_refs=seen_refs,
+        )
+
+        self.assertEqual([item.url for item in result], [first.url, second.url])
+        self.assertEqual(first.resolve_calls, 1)
+        self.assertEqual(second.resolve_calls, 1)
+
+    async def test_image_input_logs_hide_signed_url_and_local_path(self) -> None:
+        plugin = make_plugin()
+        component = CountingImage(
+            file="https://gchat.qpic.cn/path/image.png?rkey=secret",
+            url="https://gchat.qpic.cn/path/image.png?rkey=secret",
+        )
+
+        with (
+            patch.object(main.logger, "info") as info,
+            patch.object(main.logger, "warning") as warning,
+        ):
+            await plugin._image_inputs([component], remaining=1)
+
+        logs = "\n".join(
+            str(call.args[0])
+            for call in [*info.call_args_list, *warning.call_args_list]
+            if call.args
+        )
+        self.assertNotIn("secret", logs)
+        self.assertNotIn("rkey", logs)
+        self.assertNotIn("gchat.qpic.cn/path", logs)
+        self.assertIn("image.png", logs)
+
+    def test_image_cache_prunes_by_age_size_and_file_count(self) -> None:
+        plugin = make_plugin()
+        plugin.config.update(
+            {
+                "fact_check_image_cache_ttl_seconds": 60,
+                "fact_check_image_cache_max_bytes": 12,
+                "fact_check_image_cache_max_files": 2,
+            },
+        )
+        plugin._image_cache_last_prune = 0.0
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            expired = cache_dir / "expired.img"
+            oldest = cache_dir / "oldest.img"
+            newest = cache_dir / "newest.img"
+            extra = cache_dir / "extra.img"
+            for item in (expired, oldest, newest, extra):
+                item.write_bytes(b"123456")
+            now = time.time()
+            os.utime(expired, (now - 120, now - 120))
+            os.utime(oldest, (now - 30, now - 30))
+            os.utime(newest, (now - 20, now - 20))
+            os.utime(extra, (now - 10, now - 10))
+
+            plugin._prune_image_input_cache(cache_dir, force=True)
+
+            self.assertFalse(expired.exists())
+            self.assertFalse(oldest.exists())
+            self.assertTrue(newest.exists())
+            self.assertTrue(extra.exists())
+
+    def test_image_cache_hit_refreshes_lru_timestamp(self) -> None:
+        plugin = make_plugin()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.png"
+            source.write_bytes(b"same-image")
+            with patch.object(main.StarTools, "get_data_dir", return_value=root / "data"):
+                target = Path(plugin._snapshot_image_path(str(source), file_name="source.png"))
+                old_time = time.time() - 100
+                os.utime(target, (old_time, old_time))
+                refreshed = Path(plugin._snapshot_image_path(str(source), file_name="source.png"))
+
+            self.assertEqual(refreshed, target)
+            self.assertGreater(refreshed.stat().st_mtime, old_time)
 
 
 if __name__ == "__main__":

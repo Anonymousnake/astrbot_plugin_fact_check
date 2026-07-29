@@ -259,8 +259,8 @@ def run_fact_check(
     main_models: list[str] | None = None,
     max_image_bytes: int = 5 * 1024 * 1024,
     image_download_hard_limit_bytes: int = 20 * 1024 * 1024,
-    image_max_pixels: int = 40_000_000,
-    image_total_inline_bytes: int = 12 * 1024 * 1024,
+    image_max_pixels: int = 20_000_000,
+    image_total_inline_bytes: int = 10 * 1024 * 1024,
     long_image_chunk_height: int = 2200,
     long_image_max_parts: int = 8,
     long_image_max_width: int = 1280,
@@ -1251,8 +1251,8 @@ def build_inline_image_parts(
     image_download_timeout: int,
     stage: str,
     download_hard_limit_bytes: int = 20 * 1024 * 1024,
-    max_pixels: int = 40_000_000,
-    total_inline_bytes: int = 12 * 1024 * 1024,
+    max_pixels: int = 20_000_000,
+    total_inline_bytes: int = 10 * 1024 * 1024,
 ) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
     seen_image_payloads: set[str] = set()
@@ -1322,10 +1322,7 @@ def append_unique_inline_parts(
 
 def inline_image_payload_size(part: dict[str, Any]) -> int:
     payload = str((part.get("inline_data") or {}).get("data") or "").strip()
-    if not payload:
-        return 0
-    padding = len(payload) - len(payload.rstrip("="))
-    return max(0, (len(payload) * 3) // 4 - padding)
+    return len(payload.encode("ascii")) if payload else 0
 
 
 def download_image_as_inline_parts(
@@ -1336,7 +1333,7 @@ def download_image_as_inline_parts(
     long_image_max_parts: int,
     long_image_max_width: int,
     download_hard_limit_bytes: int = 20 * 1024 * 1024,
-    max_pixels: int = 40_000_000,
+    max_pixels: int = 20_000_000,
     timeout: int = 10,
 ) -> list[dict[str, Any]]:
     label = safe_image_log_label(item)
@@ -1370,7 +1367,11 @@ def download_image_as_inline_parts(
 
 def safe_image_log_label(item: ImageInput) -> str:
     source = "local" if item.path else "remote"
-    name = Path(str(item.file_name or "")).name
+    raw_name = str(item.file_name or "").strip()
+    if raw_name.startswith(("http://", "https://")):
+        name = Path(urlparse(raw_name).path).name
+    else:
+        name = Path(raw_name).name
     if not name and item.path:
         name = Path(str(item.path).removeprefix("file:///").removeprefix("file://")).name
     if not name and item.url:

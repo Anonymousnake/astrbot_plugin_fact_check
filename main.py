@@ -39,6 +39,7 @@ from .fact_check import (
     remove_trigger,
     run_fact_check,
     run_fact_check_followup,
+    safe_image_log_label,
 )
 
 try:
@@ -371,11 +372,11 @@ class FactCheckPlugin(Star):
                         or 20 * 1024 * 1024,
                     ),
                     image_max_pixels=int(
-                        self.config.get("fact_check_image_max_pixels") or 40_000_000,
+                        self.config.get("fact_check_image_max_pixels") or 20_000_000,
                     ),
                     image_total_inline_bytes=int(
                         self.config.get("fact_check_image_total_inline_bytes")
-                        or 12 * 1024 * 1024,
+                        or 10 * 1024 * 1024,
                     ),
                     long_image_chunk_height=int(
                         self.config.get("fact_check_long_image_chunk_height") or 2200,
@@ -753,7 +754,7 @@ class FactCheckPlugin(Star):
                 "label": label,
                 "length": len(text),
                 "chunk_lengths": [len(chunk) for chunk in chunks],
-                "error": repr(exc),
+                "error": type(exc).__name__,
                 "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             }
             if bool(self.config.get("fact_check_debug_store_full_failure_text", False)):
@@ -834,12 +835,12 @@ class FactCheckPlugin(Star):
                     ),
                 ),
                 "max_pixels": str(
-                    cache_config_value("fact_check_image_max_pixels", 40_000_000),
+                    cache_config_value("fact_check_image_max_pixels", 20_000_000),
                 ),
                 "total_inline_bytes": str(
                     cache_config_value(
                         "fact_check_image_total_inline_bytes",
-                        12 * 1024 * 1024,
+                        10 * 1024 * 1024,
                     ),
                 ),
             },
@@ -1394,6 +1395,7 @@ class FactCheckPlugin(Star):
         speaker = ""
         quoted_texts: list[str] = []
         images: list[ImageInput] = []
+        seen_image_refs: set[str] = set()
         max_images = max(0, int(self.config.get("fact_check_max_images") or 2))
         collect_limit = max(max_images + 4, max_images * 3)
 
@@ -1411,7 +1413,13 @@ class FactCheckPlugin(Star):
                 if comp.chain:
                     local_texts.extend(self._plain_texts(comp.chain))
                     local_forward_ids.extend(self._extract_forward_ids_from_components(comp.chain))
-                    images.extend(await self._image_inputs(comp.chain, remaining=collect_limit - len(images)))
+                    images.extend(
+                        await self._image_inputs(
+                            comp.chain,
+                            remaining=collect_limit - len(images),
+                            seen_refs=seen_image_refs,
+                        ),
+                    )
                 local_text = "\n".join(part for part in local_texts if part).strip()
                 if local_text and not self._is_unusable_quoted_text(local_text):
                     quoted_texts.append(local_text)
@@ -1429,7 +1437,13 @@ class FactCheckPlugin(Star):
                         for fetched_text in fetched_texts:
                             if fetched_text and fetched_text not in quoted_texts:
                                 quoted_texts.append(fetched_text)
-                        images.extend(await self._image_inputs(fetched_images, remaining=collect_limit - len(images)))
+                        images.extend(
+                            await self._image_inputs(
+                                fetched_images,
+                                remaining=collect_limit - len(images),
+                                seen_refs=seen_image_refs,
+                            ),
+                        )
                 if local_forward_ids:
                     speaker = await self._append_forward_payloads(
                         event,
@@ -1439,6 +1453,7 @@ class FactCheckPlugin(Star):
                         max_images=collect_limit,
                         speaker=speaker,
                         label=f"reply:{getattr(comp, 'id', '')}",
+                        seen_image_refs=seen_image_refs,
                     )
             elif isinstance(comp, Forward):
                 speaker = await self._append_forward_payloads(
@@ -1449,6 +1464,7 @@ class FactCheckPlugin(Star):
                     max_images=collect_limit,
                     speaker=speaker,
                     label="direct",
+                    seen_image_refs=seen_image_refs,
                 )
             elif isinstance(comp, Plain):
                 forward_ids = self._extract_forward_ids_from_text(str(comp.text or ""))
@@ -1461,9 +1477,16 @@ class FactCheckPlugin(Star):
                         max_images=collect_limit,
                         speaker=speaker,
                         label="plain",
+                        seen_image_refs=seen_image_refs,
                     )
             elif isinstance(comp, Image):
-                images.extend(await self._image_inputs([comp], remaining=collect_limit - len(images)))
+                images.extend(
+                    await self._image_inputs(
+                        [comp],
+                        remaining=collect_limit - len(images),
+                        seen_refs=seen_image_refs,
+                    ),
+                )
 
             if len(images) >= collect_limit:
                 images = images[:collect_limit]
@@ -1535,6 +1558,7 @@ class FactCheckPlugin(Star):
         max_images: int,
         speaker: str,
         label: str,
+        seen_image_refs: set[str],
     ) -> str:
         fetched = await self._fetch_forward_payloads(event, forward_ids, label=label)
         if not fetched:
@@ -1545,7 +1569,13 @@ class FactCheckPlugin(Star):
         for fetched_text in fetched_texts:
             if fetched_text and fetched_text not in quoted_texts:
                 quoted_texts.append(fetched_text)
-        images.extend(await self._image_inputs(fetched_images, remaining=max_images - len(images)))
+        images.extend(
+            await self._image_inputs(
+                fetched_images,
+                remaining=max_images - len(images),
+                seen_refs=seen_image_refs,
+            ),
+        )
         return speaker
 
     async def _fetch_forward_payloads(
@@ -1801,39 +1831,67 @@ class FactCheckPlugin(Star):
                 texts.append(comp.text.strip())
         return texts
 
-    async def _image_inputs(self, components: Iterable[object], *, remaining: int) -> list[ImageInput]:
+    async def _image_inputs(
+        self,
+        components: Iterable[object],
+        *,
+        remaining: int,
+        seen_refs: set[str] | None = None,
+    ) -> list[ImageInput]:
         if remaining <= 0:
             return []
         images: list[ImageInput] = []
+        seen_refs = seen_refs if seen_refs is not None else set()
         resolve_timeout = max(1.0, float(self.config.get("fact_check_image_download_timeout_seconds") or 10))
         for comp in components:
             if not isinstance(comp, Image):
                 continue
             file_name = str(comp.file or "").strip()
-            path = str(getattr(comp, "path", "") or "").strip()
+            original_path = str(getattr(comp, "path", "") or "").strip()
+            url = str(comp.url or "").strip()
+            if not url and is_public_http_url(file_name):
+                url = file_name
+            ref_key = self._image_component_ref_key(
+                url=url,
+                path=original_path,
+                file_name=file_name,
+            )
+            log_label = safe_image_log_label(
+                ImageInput(
+                    url=url,
+                    file_name=file_name,
+                    path=original_path,
+                ),
+            )
+            if ref_key and ref_key in seen_refs:
+                logger.info(
+                    f"[astrbot-fact-check-image-ref-dedupe] skipped {log_label}",
+                )
+                continue
+            if ref_key:
+                seen_refs.add(ref_key)
+
+            path = original_path
             if path:
                 path = self._snapshot_image_path(path, file_name=file_name)
                 logger.info(
-                    f"[astrbot-fact-check-image-local] {self._short_ref(file_name or str(comp.url or ''))}: {path}",
+                    f"[astrbot-fact-check-image-local] {log_label} snapshot={'ok' if path else 'missing'}",
                 )
             else:
                 try:
                     path = await asyncio.wait_for(comp.convert_to_file_path(), timeout=resolve_timeout)
                     path = self._snapshot_image_path(path, file_name=file_name)
                     logger.info(
-                        f"[astrbot-fact-check-image-local] {self._short_ref(file_name or str(comp.url or ''))}: {path}",
+                        f"[astrbot-fact-check-image-local] {log_label} snapshot={'ok' if path else 'missing'}",
                     )
                 except Exception as exc:
                     logger.warning(
                         f"[astrbot-fact-check-image-local-error] "
-                        f"{self._short_ref(file_name or str(comp.url or ''))}: {exc!r}",
+                        f"{log_label}: {type(exc).__name__}",
                     )
-            url = str(comp.url or "").strip()
-            if not url and is_public_http_url(file_name):
-                url = file_name
             if url and not is_public_http_url(url):
                 logger.warning(
-                    f"[astrbot-fact-check-image-skip] non-public url={self._short_ref(url)}",
+                    f"[astrbot-fact-check-image-skip] non-public {log_label}",
                 )
                 url = ""
             if not path and not url:
@@ -1852,6 +1910,23 @@ class FactCheckPlugin(Star):
             if len(images) >= remaining:
                 break
         return images
+
+    @staticmethod
+    def _image_component_ref_key(
+        *,
+        url: str,
+        path: str,
+        file_name: str,
+    ) -> str:
+        remote = str(url or "").strip()
+        if remote:
+            return "url:" + remote.split("#", 1)[0]
+        local = str(path or "").strip()
+        if not local and file_name and not is_public_http_url(file_name):
+            local = str(file_name).strip()
+        if not local:
+            return ""
+        return "local:" + local.replace("\\", "/").casefold()
 
     def _snapshot_image_path(self, path_value: str, *, file_name: str = "") -> str:
         source = Path(str(path_value or "").removeprefix("file:///").removeprefix("file://"))
@@ -1873,27 +1948,82 @@ class FactCheckPlugin(Star):
             target = cache_dir / f"{digest.hexdigest()}{suffix}"
             if not target.exists():
                 shutil.copy2(source, target)
+            target.touch()
+            self._prune_image_input_cache(
+                cache_dir,
+                force=True,
+                protected=target,
+            )
             return str(target)
         except Exception as exc:
             logger.warning(
-                f"[astrbot-fact-check-image-snapshot-error] {self._short_ref(str(source))}: {exc!r}",
+                f"[astrbot-fact-check-image-snapshot-error] "
+                f"local:{source.name or 'image'}: {type(exc).__name__}",
             )
             return str(path_value or "")
 
-    def _prune_image_input_cache(self, cache_dir: Path) -> None:
+    def _prune_image_input_cache(
+        self,
+        cache_dir: Path,
+        *,
+        force: bool = False,
+        protected: Path | None = None,
+    ) -> None:
         now = time.time()
         last_prune = float(getattr(self, "_image_cache_last_prune", 0.0) or 0.0)
-        if now - last_prune < 300:
+        if not force and now - last_prune < 300:
             return
         self._image_cache_last_prune = now
-        max_age = max(
+        default_ttl = max(
             7200,
             int(self.config.get("fact_check_followup_ttl_seconds") or 3600) + 600,
         )
+        max_age = max(
+            60,
+            int(self.config.get("fact_check_image_cache_ttl_seconds") or default_ttl),
+        )
+        max_bytes = max(
+            1,
+            int(self.config.get("fact_check_image_cache_max_bytes") or 64 * 1024 * 1024),
+        )
+        max_files = max(
+            1,
+            int(self.config.get("fact_check_image_cache_max_files") or 100),
+        )
+        protected_path = protected.resolve() if protected else None
+        entries: list[tuple[Path, float, int]] = []
         for item in cache_dir.iterdir():
             try:
-                if item.is_file() and now - item.stat().st_mtime > max_age:
+                if not item.is_file():
+                    continue
+                stat = item.stat()
+                if (
+                    now - stat.st_mtime > max_age
+                    and (protected_path is None or item.resolve() != protected_path)
+                ):
                     item.unlink()
+                    continue
+                entries.append((item, stat.st_mtime, stat.st_size))
+            except OSError:
+                continue
+
+        total_bytes = sum(size for _, _, size in entries)
+        entries.sort(key=lambda entry: entry[1])
+        while len(entries) > max_files or total_bytes > max_bytes:
+            removable_index = next(
+                (
+                    index
+                    for index, (item, _, _) in enumerate(entries)
+                    if protected_path is None or item.resolve() != protected_path
+                ),
+                None,
+            )
+            if removable_index is None:
+                break
+            item, _, size = entries.pop(removable_index)
+            try:
+                item.unlink()
+                total_bytes -= size
             except OSError:
                 continue
 
