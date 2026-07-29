@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -214,6 +215,149 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(observed[0], 0)
         self.assertLessEqual(observed[0], 1)
         self.assertIsNone(fact_check._REQUEST_DEADLINE.get())
+
+    def test_request_deadline_is_reset_when_http_client_construction_fails(self) -> None:
+        @fact_check._with_request_deadline
+        def sample(*, total_timeout_seconds: int) -> None:
+            self.fail("decorated function must not run when client construction fails")
+
+        with (
+            patch.object(
+                fact_check.httpx,
+                "Client",
+                side_effect=RuntimeError("client construction failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "client construction failed"),
+        ):
+            sample(total_timeout_seconds=1)
+
+        self.assertIsNone(fact_check._REQUEST_DEADLINE.get())
+        self.assertIsNone(fact_check._GEMINI_HTTP_CLIENT.get())
+
+    def test_request_context_keeps_the_earliest_inherited_deadline(self) -> None:
+        observed: list[float] = []
+
+        @fact_check._with_request_deadline
+        def sample(*, total_timeout_seconds: int) -> None:
+            observed.append(fact_check._REQUEST_DEADLINE.get())
+
+        inherited = time.monotonic() + 1
+        token = fact_check._REQUEST_DEADLINE.set(inherited)
+        try:
+            sample(total_timeout_seconds=30)
+        finally:
+            fact_check._REQUEST_DEADLINE.reset(token)
+
+        self.assertEqual(len(observed), 1)
+        self.assertLessEqual(observed[0], inherited)
+
+    def test_client_close_failure_does_not_mask_request_failure(self) -> None:
+        client = MagicMock()
+        client.close.side_effect = RuntimeError("close failed")
+
+        @fact_check._with_request_deadline
+        def sample(*, total_timeout_seconds: int) -> None:
+            raise ValueError("request failed")
+
+        with (
+            patch.object(fact_check.httpx, "Client", return_value=client),
+            self.assertRaisesRegex(ValueError, "request failed"),
+        ):
+            sample(total_timeout_seconds=1)
+
+        client.close.assert_called_once()
+        self.assertIsNone(fact_check._REQUEST_DEADLINE.get())
+        self.assertIsNone(fact_check._GEMINI_HTTP_CLIENT.get())
+
+    def test_request_context_uses_one_gemini_client_and_closes_it(self) -> None:
+        clients = [MagicMock(), MagicMock()]
+
+        @fact_check._with_request_deadline
+        def sample(*, total_timeout_seconds: int):
+            return fact_check._GEMINI_HTTP_CLIENT.get()
+
+        with patch.object(fact_check.httpx, "Client", side_effect=clients) as client_factory:
+            first = sample(total_timeout_seconds=1)
+            second = sample(total_timeout_seconds=1)
+
+        self.assertIs(first, clients[0])
+        self.assertIs(second, clients[1])
+        self.assertEqual(client_factory.call_count, 2)
+        clients[0].close.assert_called_once()
+        clients[1].close.assert_called_once()
+        self.assertIsNone(fact_check._GEMINI_HTTP_CLIENT.get())
+
+    def test_http_retries_reuse_request_scoped_gemini_client(self) -> None:
+        request = fact_check.httpx.Request("POST", "https://example.invalid")
+        busy = fact_check.httpx.Response(503, request=request)
+        success = fact_check.httpx.Response(
+            200,
+            request=request,
+            json={"candidates": []},
+        )
+        client = MagicMock()
+        client.post.side_effect = [busy, success]
+        token = fact_check._GEMINI_HTTP_CLIENT.set(client)
+        try:
+            with patch.object(fact_check, "_sleep_with_deadline"):
+                result = fact_check.post_json_with_timeout(
+                    "https://example.invalid",
+                    {},
+                    api_key="test-key",
+                    timeout=30,
+                    max_retries=1,
+                )
+        finally:
+            fact_check._GEMINI_HTTP_CLIENT.reset(token)
+
+        self.assertEqual(result, {"candidates": []})
+        self.assertEqual(client.post.call_count, 2)
+        client.close.assert_not_called()
+
+    def test_standalone_client_close_failure_does_not_hide_success(self) -> None:
+        request = fact_check.httpx.Request("POST", "https://example.invalid")
+        client = MagicMock()
+        client.post.return_value = fact_check.httpx.Response(
+            200,
+            request=request,
+            json={"candidates": []},
+        )
+        client.close.side_effect = RuntimeError("close failed")
+
+        with patch.object(fact_check.httpx, "Client", return_value=client):
+            result = fact_check.post_json_with_timeout(
+                "https://example.invalid",
+                {},
+                api_key="test-key",
+                timeout=30,
+                max_retries=0,
+            )
+
+        self.assertEqual(result, {"candidates": []})
+        client.close.assert_called_once()
+
+    def test_standalone_client_close_failure_does_not_mask_request_error(self) -> None:
+        request = fact_check.httpx.Request("POST", "https://example.invalid")
+        client = MagicMock()
+        client.post.side_effect = fact_check.httpx.ConnectError(
+            "request failed",
+            request=request,
+        )
+        client.close.side_effect = RuntimeError("close failed")
+
+        with (
+            patch.object(fact_check.httpx, "Client", return_value=client),
+            self.assertRaisesRegex(fact_check.httpx.ConnectError, "request failed"),
+        ):
+            fact_check.post_json_with_timeout(
+                "https://example.invalid",
+                {},
+                api_key="test-key",
+                timeout=30,
+                max_retries=0,
+            )
+
+        client.close.assert_called_once()
 
     def test_complete_fact_check_result_requires_stop_summary_and_claim_verdict(self) -> None:
         invalid_bodies = [

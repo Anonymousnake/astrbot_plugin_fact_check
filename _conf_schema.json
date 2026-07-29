@@ -156,6 +156,12 @@
     "description": "Max queued/running fact-check jobs before rejecting new requests",
     "default": 4
   },
+  "fact_check_metrics_log_every": {
+    "type": "int",
+    "description": "Log one aggregate performance summary after this many completed requests",
+    "hint": "Metrics contain counts and timings only, never request text or image references.",
+    "default": 20
+  },
   "fact_check_cache_ttl_seconds": {
     "type": "int",
     "description": "Seconds to reuse the same fact-check reply for identical input",

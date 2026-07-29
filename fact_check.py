@@ -13,6 +13,7 @@ import re
 import socket
 import threading
 import time
+from collections import Counter
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,10 @@ _DNS_RESOLVER = concurrent.futures.ThreadPoolExecutor(
 )
 _REQUEST_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "fact_check_request_deadline",
+    default=None,
+)
+_GEMINI_HTTP_CLIENT: contextvars.ContextVar[httpx.Client | None] = contextvars.ContextVar(
+    "fact_check_gemini_http_client",
     default=None,
 )
 META_CLAIM_RE = re.compile(
@@ -208,11 +213,43 @@ def _with_request_deadline(func):
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
         seconds = float(kwargs.get("total_timeout_seconds") or 0)
-        token = _REQUEST_DEADLINE.set(time.monotonic() + seconds if seconds > 0 else None)
+        inherited_deadline = _REQUEST_DEADLINE.get()
+        requested_deadline = time.monotonic() + seconds if seconds > 0 else None
+        effective_deadline = requested_deadline
+        if inherited_deadline is not None:
+            effective_deadline = (
+                min(inherited_deadline, requested_deadline)
+                if requested_deadline is not None
+                else inherited_deadline
+            )
+        deadline_token = _REQUEST_DEADLINE.set(
+            effective_deadline,
+        )
+        existing_client = _GEMINI_HTTP_CLIENT.get()
+        client = existing_client
+        client_token = None
         try:
+            if client is None:
+                client = httpx.Client(
+                    follow_redirects=True,
+                    trust_env=True,
+                )
+                client_token = _GEMINI_HTTP_CLIENT.set(client)
             return func(*args, **kwargs)
         finally:
-            _REQUEST_DEADLINE.reset(token)
+            try:
+                if client_token is not None:
+                    _GEMINI_HTTP_CLIENT.reset(client_token)
+                    try:
+                        client.close()
+                    except Exception as exc:
+                        print(
+                            "[astrbot-fact-check-http-client-close] "
+                            f"error={error_label(exc)}",
+                            flush=True,
+                        )
+            finally:
+                _REQUEST_DEADLINE.reset(deadline_token)
 
     return wrapped
 
@@ -670,6 +707,7 @@ def run_fact_check(
         select_fact_check_sources(
             extract_sources(evidence_body),
             anysearch_evidence.sources,
+            claims=[candidate.claim for candidate in deduped],
             limit=3,
         ),
     )
@@ -913,6 +951,7 @@ def run_fact_check_followup(
         select_fact_check_sources(
             extract_sources(body),
             previous_sources,
+            claims=[candidate.claim for candidate in candidates],
             limit=3,
         ),
     )
@@ -1919,62 +1958,296 @@ def select_fact_check_sources(
     grounding_sources: list[str],
     extracted_sources: list[str],
     *,
+    claims: list[str] | None = None,
     limit: int = 3,
 ) -> list[str]:
-    """Prefer supported, specific pages while avoiding repeated source domains."""
-    candidates = dedupe_sources(grounding_sources + extracted_sources, limit=20)
-
-    def source_priority(source: str) -> int:
-        _, url = split_source_title_url(source)
-        if not url:
-            return 1
-        parsed = urlparse(url)
-        return 1 if parsed.path in {"", "/"} and not parsed.query else 0
-
-    selected: list[str] = []
-    seen_domains: set[str] = set()
-    seen_labels: set[str] = set()
-    for source in sorted(candidates, key=source_priority):
-        title, url = split_source_title_url(source)
-        parsed = urlparse(url) if url else None
-        domain = str(parsed.hostname or "").lower() if parsed else ""
-        if is_google_grounding_redirect(url):
-            domain = ""
-        if domain.startswith("www."):
-            domain = domain[4:]
-        label_key = re.sub(r"\s+", "", title).lower()
-        if domain:
-            if domain in seen_domains:
-                continue
-            seen_domains.add(domain)
-        elif label_key:
-            if label_key in seen_labels:
-                continue
-            seen_labels.add(label_key)
-        selected.append(source)
-        if len(selected) >= max(1, int(limit or 3)):
+    """Prefer claim-covering primary pages, then diversify organizations."""
+    candidates: list[tuple[str, bool, int]] = []
+    seen_sources: set[str] = set()
+    for index, source in enumerate(grounding_sources + extracted_sources):
+        item = str(source or "").strip()
+        key = re.sub(r"\s+", "", item).lower()
+        if not item or key in seen_sources:
+            continue
+        seen_sources.add(key)
+        candidates.append((item, index < len(grounding_sources), index))
+        if len(candidates) >= 20:
             break
 
-    has_clickable_source = any(
-        url and not is_google_grounding_redirect(url)
-        for _, url in (split_source_title_url(source) for source in selected)
+    claim_terms = [_source_match_terms(claim) for claim in (claims or []) if str(claim).strip()]
+    term_claim_counts = Counter(
+        term
+        for terms_for_claim in claim_terms
+        for term in terms_for_claim
     )
-    if not has_clickable_source:
-        direct_extracted = next(
-            (
-                source
-                for source in dedupe_sources(extracted_sources, limit=20)
-                if (url := split_source_title_url(source)[1])
-                and not is_google_grounding_redirect(url)
-            ),
-            "",
+    distinguishing_claim_terms = [
+        {term for term in terms_for_claim if term_claim_counts[term] == 1}
+        for terms_for_claim in claim_terms
+    ]
+
+    def source_details(candidate: tuple[str, bool, int]):
+        source, grounded, index = candidate
+        title, url = split_source_title_url(source)
+        parsed = urlparse(url) if url else None
+        domain = str(parsed.hostname or "").strip(".").lower() if parsed else ""
+        if domain.startswith("www."):
+            domain = domain[4:]
+        if is_google_grounding_redirect(url):
+            domain = ""
+        domain_group = _source_domain_group(domain)
+        terms = _source_match_terms(
+            title + " " + (str(parsed.path or "") if parsed else ""),
         )
-        if direct_extracted:
-            if len(selected) >= max(1, int(limit or 3)):
-                selected[-1] = direct_extracted
+        coverage = {
+            claim_index
+            for claim_index, terms_for_claim in enumerate(claim_terms)
+            if terms
+            and terms_for_claim
+            and (
+                terms.intersection(distinguishing_claim_terms[claim_index])
+                if distinguishing_claim_terms[claim_index]
+                else terms.intersection(terms_for_claim)
+            )
+        }
+        official = _is_official_source_domain(domain)
+        spoof_like = _looks_like_official_domain_spoof(domain)
+        clickable = bool(url and not is_google_grounding_redirect(url))
+        specific = bool(parsed and (parsed.path not in {"", "/"} or parsed.query))
+        fresh = bool(
+            re.search(
+                r"(?:19|20)\d{2}[-_/年.]?(?:0?[1-9]|1[0-2])?",
+                title + " " + url,
+            ),
+        )
+        quality = (
+            len(coverage),
+            1 if official else 0,
+            1 if grounded else 0,
+            1 if clickable else 0,
+            1 if specific else 0,
+            1 if fresh else 0,
+            -index,
+        )
+        return (
+            source,
+            title,
+            url,
+            domain_group,
+            coverage,
+            quality,
+            clickable,
+            spoof_like,
+        )
+
+    ranked = []
+    for candidate in candidates:
+        details = source_details(candidate)
+        if not details[7]:
+            ranked.append(details)
+    ranked.sort(key=lambda item: item[5], reverse=True)
+    selected: list[tuple] = []
+    seen_domain_groups: set[str] = set()
+    seen_labels: set[str] = set()
+
+    def add_source(details, *, require_new_domain: bool = False) -> bool:
+        source, title, _, domain_group, _, _, _, _ = details
+        label_key = re.sub(r"\s+", "", title).lower()
+        if domain_group:
+            if require_new_domain and domain_group in seen_domain_groups:
+                return False
+            seen_domain_groups.add(domain_group)
+        elif label_key:
+            if label_key in seen_labels:
+                return False
+            seen_labels.add(label_key)
+        selected.append(details)
+        return True
+
+    max_sources = max(1, int(limit or 3))
+    uncovered_claims = set(range(len(claim_terms)))
+    while uncovered_claims and len(selected) < max_sources:
+        covering = [
+            details
+            for details in ranked
+            if details not in selected
+            and details[4].intersection(uncovered_claims)
+        ]
+        if not covering:
+            break
+        covering.sort(
+            key=lambda details: (
+                len(details[4].intersection(uncovered_claims)),
+                details[5],
+            ),
+            reverse=True,
+        )
+        chosen = next((details for details in covering if add_source(details)), None)
+        if chosen is None:
+            break
+        uncovered_claims.difference_update(chosen[4])
+
+    # Prefer different organizations when filling unused slots.
+    for details in ranked:
+        if len(selected) >= max_sources:
+            break
+        if details in selected:
+            continue
+        add_source(details, require_new_domain=True)
+
+    has_clickable_source = any(details[6] for details in selected)
+    if not has_clickable_source:
+        direct_candidate = next(
+            (details for details in ranked if details[6] and details not in selected),
+            None,
+        )
+        if direct_candidate is not None:
+            if len(selected) < max_sources:
+                add_source(direct_candidate)
             else:
-                selected.append(direct_extracted)
-    return selected
+                current_coverage = set().union(
+                    *(details[4] for details in selected),
+                )
+                replacement_index = None
+                for index in sorted(
+                    range(len(selected)),
+                    key=lambda item: selected[item][5],
+                ):
+                    replacement_coverage = set(direct_candidate[4])
+                    replacement_coverage.update(
+                        *(
+                            details[4]
+                            for selected_index, details in enumerate(selected)
+                            if selected_index != index
+                        ),
+                    )
+                    if current_coverage.issubset(replacement_coverage):
+                        replacement_index = index
+                        break
+                if replacement_index is not None:
+                    selected[replacement_index] = direct_candidate
+    return [details[0] for details in selected]
+
+
+_OFFICIAL_DOMAIN_SUFFIXES = (
+    "gov.cn",
+    "gov",
+    "mil",
+    "edu.cn",
+    "edu",
+    "court.gov.cn",
+    "who.int",
+    "un.org",
+    "europa.eu",
+    "gov.uk",
+)
+
+
+def _host_matches_suffix(host: str, suffix: str) -> bool:
+    host = str(host or "").strip(".").lower()
+    suffix = str(suffix or "").strip(".").lower()
+    return bool(host and suffix and (host == suffix or host.endswith("." + suffix)))
+
+
+def _is_official_source_domain(host: str) -> bool:
+    return any(_host_matches_suffix(host, suffix) for suffix in _OFFICIAL_DOMAIN_SUFFIXES)
+
+
+def _looks_like_official_domain_spoof(host: str) -> bool:
+    normalized = str(host or "").strip(".").lower()
+    padded = f".{normalized}."
+    return bool(
+        normalized
+        and not _is_official_source_domain(normalized)
+        and any(f".{suffix}." in padded for suffix in _OFFICIAL_DOMAIN_SUFFIXES)
+    )
+
+
+def _source_domain_group(host: str) -> str:
+    normalized = str(host or "").strip(".").lower()
+    if normalized.startswith("www."):
+        normalized = normalized[4:]
+    if not normalized:
+        return ""
+    for suffix in sorted(_OFFICIAL_DOMAIN_SUFFIXES, key=len, reverse=True):
+        if _host_matches_suffix(normalized, suffix):
+            return suffix
+    labels = normalized.split(".")
+    if len(labels) <= 2:
+        return normalized
+    if len(labels[-1]) == 2 and labels[-2] in {
+        "ac",
+        "co",
+        "com",
+        "edu",
+        "gov",
+        "net",
+        "org",
+    }:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+_SOURCE_MATCH_STOPWORDS = {
+    "about",
+    "claim",
+    "claims",
+    "did",
+    "does",
+    "fact",
+    "false",
+    "have",
+    "news",
+    "report",
+    "reports",
+    "said",
+    "that",
+    "this",
+    "true",
+    "whether",
+    "which",
+}
+_SOURCE_MATCH_CJK_STOPWORDS = {
+    "事实",
+    "传闻",
+    "关于",
+    "声称",
+    "是否",
+    "最新",
+    "核查",
+    "消息",
+    "真的",
+    "真假",
+    "结论",
+    "网传",
+    "讨论",
+    "说法",
+    "问题",
+}
+
+
+def _source_match_terms(text: str) -> set[str]:
+    normalized = str(text or "").lower()
+    terms = {
+        token
+        for token in re.findall(r"[a-z0-9]{3,}", normalized)
+        if not token.isdigit()
+        and token not in {"https", "http", "www", "com", "html"}
+        and token not in _SOURCE_MATCH_STOPWORDS
+    }
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", normalized):
+        cleaned = run
+        for stopword in _SOURCE_MATCH_CJK_STOPWORDS:
+            cleaned = cleaned.replace(stopword, " ")
+        for part in cleaned.split():
+            if len(part) < 2:
+                continue
+            terms.add(part)
+            terms.update(
+                token
+                for index in range(len(part) - 1)
+                if (token := part[index : index + 2]) not in _SOURCE_MATCH_CJK_STOPWORDS
+            )
+    return terms
 
 
 def normalize_fact_check_sources(sources: list[str]) -> list[str]:
@@ -2519,42 +2792,58 @@ def post_json_with_timeout(
     max_retries: int = 1,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            bounded = _bounded_timeout(timeout)
-            http_timeout = httpx.Timeout(
-                bounded,
-                connect=min(8.0, bounded),
-                read=bounded,
-                write=min(8.0, bounded),
-            )
-            with httpx.Client(timeout=http_timeout, follow_redirects=True, trust_env=True) as client:
+    _bounded_timeout(timeout)
+    client = _GEMINI_HTTP_CLIENT.get()
+    owns_client = client is None
+    if client is None:
+        client = httpx.Client(follow_redirects=True, trust_env=True)
+    try:
+        for attempt in range(max_retries + 1):
+            try:
+                bounded = _bounded_timeout(timeout)
+                http_timeout = httpx.Timeout(
+                    bounded,
+                    connect=min(8.0, bounded),
+                    read=bounded,
+                    write=min(8.0, bounded),
+                )
                 response = client.post(
                     url,
                     json=payload,
                     headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                    timeout=http_timeout,
                 )
                 response.raise_for_status()
                 return response.json()
-        except httpx.HTTPStatusError as exc:
-            last_error = exc
-            if not is_retryable(exc) or attempt >= max_retries or not _retry_budget_available():
-                raise
-        except httpx.RequestError as exc:
-            last_error = exc
-            if attempt >= max_retries or not _retry_budget_available():
-                raise
-        wait = backoff_seconds(attempt, last_error or RuntimeError("request failed"))
-        print(
-            "[astrbot-fact-check-http-retry] "
-            f"attempt={attempt + 1}/{max_retries + 1} wait={wait:.1f}s "
-            f"error={error_label(last_error)}",
-            flush=True,
-        )
-        _sleep_with_deadline(wait)
-    if last_error:
-        raise last_error
-    raise RuntimeError("HTTP request failed without a specific error")
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if not is_retryable(exc) or attempt >= max_retries or not _retry_budget_available():
+                    raise
+            except httpx.RequestError as exc:
+                last_error = exc
+                if attempt >= max_retries or not _retry_budget_available():
+                    raise
+            wait = backoff_seconds(attempt, last_error or RuntimeError("request failed"))
+            print(
+                "[astrbot-fact-check-http-retry] "
+                f"attempt={attempt + 1}/{max_retries + 1} wait={wait:.1f}s "
+                f"error={error_label(last_error)}",
+                flush=True,
+            )
+            _sleep_with_deadline(wait)
+        if last_error:
+            raise last_error
+        raise RuntimeError("HTTP request failed without a specific error")
+    finally:
+        if owns_client:
+            try:
+                client.close()
+            except Exception as exc:
+                print(
+                    "[astrbot-fact-check-http-client-close] "
+                    f"error={error_label(exc)}",
+                    flush=True,
+                )
 
 
 def read_image_input_bytes(item: ImageInput, *, max_bytes: int | None, timeout: int) -> tuple[bytes, str]:

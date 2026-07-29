@@ -126,6 +126,7 @@ class FactCheckPlugin(Star):
         self._active_followup_jobs = 0
         self._reply_cache: dict[str, tuple[float, FactCheckResult]] = {}
         self._fact_check_sessions: dict[str, FactCheckSession] = {}
+        self._fact_check_metrics: dict[str, float] = {}
         self._cooldown_until = 0.0
         self._session_store_enabled = True
         self._load_fact_check_sessions()
@@ -216,6 +217,11 @@ class FactCheckPlugin(Star):
                 )
         except asyncio.TimeoutError:
             reason = f"follow-up timeout after {time.perf_counter() - started_at:.1f}s"
+            self._record_fact_check_metric(
+                success=False,
+                elapsed=time.perf_counter() - started_at,
+                followup=True,
+            )
             logger.error(f"[astrbot-fact-check-followup-error] {label}: {reason}")
             await self._send_fact_check_reply(
                 event,
@@ -226,6 +232,11 @@ class FactCheckPlugin(Star):
             return
         except Exception as exc:
             reason = f"follow-up exception: {exc!r}"
+            self._record_fact_check_metric(
+                success=False,
+                elapsed=time.perf_counter() - started_at,
+                followup=True,
+            )
             logger.error(f"[astrbot-fact-check-followup-error] {label}: {exc!r}")
             self._maybe_start_cooldown(reason)
             await self._send_fact_check_reply(
@@ -241,6 +252,11 @@ class FactCheckPlugin(Star):
         logger.info(
             f"[astrbot-fact-check-followup-done] {label}: "
             f"session={session.session_id} {time.perf_counter() - started_at:.2f}s",
+        )
+        self._record_fact_check_metric(
+            success=self._is_successful_result(result),
+            elapsed=time.perf_counter() - started_at,
+            followup=True,
         )
         sent = await self._send_fact_check_reply(
             event,
@@ -294,6 +310,11 @@ class FactCheckPlugin(Star):
                 cached_result.candidates,
             )
             session_id = self._remember_fact_check_session(event, request_data, cached_result)
+            self._record_fact_check_metric(
+                success=True,
+                elapsed=time.perf_counter() - started_at,
+                cache_hit=True,
+            )
             await self._send_fact_check_reply(
                 event,
                 cached_result.reply or FAILED_REPLY,
@@ -457,6 +478,7 @@ class FactCheckPlugin(Star):
         except asyncio.TimeoutError:
             elapsed = time.perf_counter() - started_at
             reason = f"timeout after {elapsed:.1f}s"
+            self._record_fact_check_metric(success=False, elapsed=elapsed)
             logger.error(f"[astrbot-fact-check-error] {label}: {reason}")
             logger.info(f"[astrbot-fact-check-reason] {label}: {reason}")
             await self._send_fact_check_reply(
@@ -468,6 +490,10 @@ class FactCheckPlugin(Star):
             return
         except Exception as exc:
             reason = f"exception: {exc!r}"
+            self._record_fact_check_metric(
+                success=False,
+                elapsed=time.perf_counter() - started_at,
+            )
             logger.error(f"[astrbot-fact-check-error] {label}: {exc!r}")
             logger.info(f"[astrbot-fact-check-reason] {label}: {reason}")
             self._maybe_start_cooldown(reason)
@@ -486,6 +512,10 @@ class FactCheckPlugin(Star):
             f"{time.perf_counter() - started_at:.2f}s",
         )
         successful = self._is_successful_result(result)
+        self._record_fact_check_metric(
+            success=successful,
+            elapsed=time.perf_counter() - started_at,
+        )
         session_id = None
         if successful:
             self._set_cached_result(cache_key, result)
@@ -946,6 +976,48 @@ class FactCheckPlugin(Star):
 
     def _fact_check_queue_full(self) -> bool:
         return self._active_fact_check_jobs() >= self._max_fact_check_queue()
+
+    def _record_fact_check_metric(
+        self,
+        *,
+        success: bool,
+        elapsed: float,
+        cache_hit: bool = False,
+        followup: bool = False,
+    ) -> None:
+        metrics = getattr(self, "_fact_check_metrics", None)
+        if not isinstance(metrics, dict):
+            metrics = {}
+            self._fact_check_metrics = metrics
+        metrics["requests"] = metrics.get("requests", 0.0) + 1
+        result_key = "pipeline_success" if success else "pipeline_failure"
+        metrics[result_key] = metrics.get(result_key, 0.0) + 1
+        metrics["elapsed_total"] = metrics.get("elapsed_total", 0.0) + max(
+            0.0,
+            float(elapsed or 0.0),
+        )
+        if cache_hit:
+            metrics["cache_hits"] = metrics.get("cache_hits", 0.0) + 1
+        if followup:
+            metrics["followups"] = metrics.get("followups", 0.0) + 1
+
+        requests = int(metrics["requests"])
+        log_every = max(
+            1,
+            int(self.config.get("fact_check_metrics_log_every") or 20),
+        )
+        if requests % log_every:
+            return
+        average = metrics["elapsed_total"] / max(1, requests)
+        logger.info(
+            "[astrbot-fact-check-metrics] "
+            f"requests={requests} "
+            f"pipeline_success={int(metrics.get('pipeline_success', 0))} "
+            f"pipeline_failure={int(metrics.get('pipeline_failure', 0))} "
+            f"cache_hits={int(metrics.get('cache_hits', 0))} "
+            f"followups={int(metrics.get('followups', 0))} "
+            f"avg_seconds={average:.2f}",
+        )
 
     def _remember_fact_check_session(
         self,

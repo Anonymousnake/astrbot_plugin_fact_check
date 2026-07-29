@@ -385,8 +385,8 @@ class AnysearchEvidenceTests(unittest.TestCase):
     def test_source_selection_prefers_specific_pages_and_domain_diversity(self) -> None:
         selected = select_fact_check_sources(
             [
-                "Official report：https://gov.example/report/123",
-                "Official home：https://gov.example/",
+                "Primary report：https://agency.example/report/123",
+                "Primary home：https://agency.example/",
             ],
             [
                 "News report：https://news.example/articles/456",
@@ -396,7 +396,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, [
-            "Official report：https://gov.example/report/123",
+            "Primary report：https://agency.example/report/123",
             "News report：https://news.example/articles/456",
         ])
 
@@ -434,6 +434,142 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertIn("Direct report：https://news.example/report/123", selected)
         self.assertTrue(any("https://news.example/report/123" in source for source in normalized))
+
+    def test_source_selection_prefers_official_suffix_without_spoofing(self) -> None:
+        selected = select_fact_check_sources(
+            [],
+            [
+                "伪官方说明：https://court.gov.cn.evil.example/policy",
+                "官方判决：https://wenshu.court.gov.cn/case/123",
+                "普通博客：https://blog.example/policy",
+            ],
+            limit=3,
+        )
+
+        self.assertEqual(selected[0], "官方判决：https://wenshu.court.gov.cn/case/123")
+        self.assertIn("普通博客：https://blog.example/policy", selected)
+        self.assertNotIn("伪官方说明：https://court.gov.cn.evil.example/policy", selected)
+
+    def test_source_selection_covers_distinct_claims_before_redundant_sources(self) -> None:
+        selected = select_fact_check_sources(
+            [],
+            [
+                "签证政策官方说明：https://www.gov.cn/visa/policy",
+                "签证政策新闻解读：https://news.example/visa",
+                "法院赔偿判决全文：https://court.gov.cn/case/compensation",
+            ],
+            claims=[
+                "签证政策是否已经生效",
+                "法院是否判决承担赔偿责任",
+            ],
+            limit=2,
+        )
+
+        self.assertIn("签证政策官方说明：https://www.gov.cn/visa/policy", selected)
+        self.assertIn("法院赔偿判决全文：https://court.gov.cn/case/compensation", selected)
+
+    def test_source_selection_keeps_unique_claim_evidence_from_the_same_domain(self) -> None:
+        alpha_source = (
+            "Alpha vaccine efficacy report:"
+            "https://research.example/reports/alpha-vaccine-efficacy"
+        )
+        beta_source = (
+            "Beta earthquake casualty report:"
+            "https://research.example/reports/beta-earthquake-casualties"
+        )
+
+        selected = select_fact_check_sources(
+            [],
+            [alpha_source, beta_source],
+            claims=[
+                "Alpha vaccine efficacy was confirmed.",
+                "Beta earthquake casualties were confirmed.",
+            ],
+            limit=2,
+        )
+
+        self.assertEqual(selected, [alpha_source, beta_source])
+
+    def test_generic_question_terms_do_not_create_claim_coverage(self) -> None:
+        generic_official = "2026 whether 是否：https://www.gov.cn/2026/whether"
+        relevant_report = (
+            "Mars liquid water research:"
+            "https://science.example/research/mars-liquid-water"
+        )
+
+        selected = select_fact_check_sources(
+            [],
+            [generic_official, relevant_report],
+            claims=["Whether 2026 火星 liquid water 发现是否属实"],
+            limit=1,
+        )
+
+        self.assertEqual(selected, [relevant_report])
+
+    def test_dated_official_lookalike_ranks_below_normal_source(self) -> None:
+        dated_spoof = (
+            "Dated court lookalike:"
+            "https://court.gov.cn.evil.example/2026/report"
+        )
+        normal_source = "Independent report:https://news.example/report"
+
+        selected = select_fact_check_sources(
+            [],
+            [dated_spoof, normal_source],
+            limit=2,
+        )
+
+        self.assertEqual(selected, [normal_source])
+
+    def test_bare_official_suffix_lookalike_is_excluded(self) -> None:
+        spoof = "Agency report:https://agency.gov.evil.example/report"
+        normal_source = "Independent report:https://news.example/report"
+
+        selected = select_fact_check_sources(
+            [],
+            [spoof, normal_source],
+            limit=2,
+        )
+
+        self.assertEqual(selected, [normal_source])
+
+    def test_shared_entity_alone_does_not_cover_distinct_claims(self) -> None:
+        redirect_root = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        generic = f"Apple:{redirect_root}apple"
+        release = "Apple iPhone release date:https://news.example/apple-iphone-release"
+        lawsuit = "Apple antitrust lawsuit:https://law.example/apple-antitrust-lawsuit"
+
+        selected = select_fact_check_sources(
+            [generic],
+            [release, lawsuit],
+            claims=[
+                "Apple iPhone release date was announced.",
+                "Apple antitrust lawsuit was filed.",
+            ],
+            limit=2,
+        )
+
+        self.assertEqual(selected, [release, lawsuit])
+        self.assertNotIn(generic, selected)
+
+    def test_clickable_fallback_does_not_replace_unique_claim_evidence(self) -> None:
+        redirect_root = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        alpha_source = f"Alpha vaccine evidence:{redirect_root}alpha"
+        beta_source = f"Beta earthquake evidence:{redirect_root}beta"
+        unrelated_clickable = "General newsroom:https://news.example/home"
+
+        selected = select_fact_check_sources(
+            [alpha_source, beta_source],
+            [unrelated_clickable],
+            claims=[
+                "Alpha vaccine efficacy was confirmed.",
+                "Beta earthquake casualties were confirmed.",
+            ],
+            limit=2,
+        )
+
+        self.assertEqual(selected, [alpha_source, beta_source])
+        self.assertNotIn(unrelated_clickable, selected)
 
     def test_extraction_prompt_splits_high_risk_composite_claims(self) -> None:
         captured: dict[str, str] = {}

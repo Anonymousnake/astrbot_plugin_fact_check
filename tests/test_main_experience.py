@@ -298,6 +298,39 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.request_data.images, [])
         self.assertEqual(session.candidates[0].claim, "请核查：A 事件是否属实？")
 
+    def test_v1_session_store_loads_and_is_rewritten_as_v2(self) -> None:
+        created_at = time.time() - 10
+        payload = {
+            "version": 1,
+            "sessions": [
+                {
+                    "session_id": "fc_1234abcd",
+                    "created_at": created_at,
+                    "group_id": "123456",
+                    "user_id": "654321",
+                    "reply": "事实核查：证据不足",
+                    "candidates": [],
+                    "sources": [],
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = root / "fact_check_sessions.json"
+            store.write_text(json.dumps(payload), encoding="utf-8")
+            plugin = make_plugin()
+            plugin._session_store_enabled = True
+            with patch.object(main.StarTools, "get_data_dir", return_value=root):
+                plugin._load_fact_check_sessions()
+                session = plugin._fact_check_sessions["fc_1234abcd"]
+                plugin._persist_fact_check_sessions()
+                rewritten = json.loads(store.read_text(encoding="utf-8"))
+
+        self.assertEqual(session.updated_at, created_at)
+        self.assertEqual(rewritten["version"], 2)
+        self.assertEqual(rewritten["sessions"][0]["updated_at"], created_at)
+
     def test_forward_failure_dump_omits_reply_text_by_default(self) -> None:
         plugin = object.__new__(main.FactCheckPlugin)
         plugin.config = {"fact_check_debug_store_full_failure_text": False}
@@ -333,6 +366,31 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertGreater(plugin._cooldown_left(), 80)
+
+    def test_fact_check_metrics_log_aggregate_without_request_content(self) -> None:
+        plugin = make_plugin()
+        plugin.config["fact_check_metrics_log_every"] = 3
+
+        with patch.object(main.logger, "info") as info:
+            plugin._record_fact_check_metric(success=True, elapsed=2.0)
+            plugin._record_fact_check_metric(
+                success=True,
+                elapsed=0.1,
+                cache_hit=True,
+            )
+            plugin._record_fact_check_metric(
+                success=False,
+                elapsed=4.0,
+                followup=True,
+            )
+
+        logs = "\n".join(str(call.args[0]) for call in info.call_args_list if call.args)
+        self.assertIn("requests=3", logs)
+        self.assertIn("pipeline_success=2", logs)
+        self.assertIn("pipeline_failure=1", logs)
+        self.assertIn("cache_hits=1", logs)
+        self.assertIn("followups=1", logs)
+        self.assertNotIn("request_data", logs)
 
     async def test_followup_respects_cooldown_before_progress_message(self) -> None:
         plugin = make_plugin()
