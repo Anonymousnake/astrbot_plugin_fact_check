@@ -43,6 +43,10 @@ _MODEL_FAILURE_UNTIL: dict[str, float] = {}
 _MODEL_FAILURE_LOCK = threading.Lock()
 _PUBLIC_HOST_CACHE: dict[str, tuple[float, bool]] = {}
 _PUBLIC_HOST_CACHE_LOCK = threading.Lock()
+_DNS_RESOLVER = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="fact-check-dns",
+)
 _REQUEST_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "fact_check_request_deadline",
     default=None,
@@ -139,7 +143,9 @@ def remove_trigger(text: str) -> str:
 
 def explain_failure(reason: str) -> str:
     lowered = str(reason or "").lower()
-    if "429" in lowered or "too many requests" in lowered or "rate limit" in lowered:
+    if "cooling down" in lowered or "cooldown" in lowered or "high demand" in lowered:
+        detail = "核查模型暂时繁忙，正在短暂冷却。"
+    elif "429" in lowered or "too many requests" in lowered or "rate limit" in lowered:
         detail = "API 在限流。"
     elif "api key" in lowered or "unauthorized" in lowered or "401" in lowered:
         detail = "Gemini key 没配好或被拒了。"
@@ -214,6 +220,9 @@ def run_fact_check(
     verdict_models: list[str] | None = None,
     main_models: list[str] | None = None,
     max_image_bytes: int = 5 * 1024 * 1024,
+    image_download_hard_limit_bytes: int = 20 * 1024 * 1024,
+    image_max_pixels: int = 40_000_000,
+    image_total_inline_bytes: int = 12 * 1024 * 1024,
     long_image_chunk_height: int = 2200,
     long_image_max_parts: int = 8,
     long_image_max_width: int = 1280,
@@ -236,7 +245,8 @@ def run_fact_check(
     verdict_request_timeout: int = 25,
     verdict_max_output_tokens: int = 2048,
     verdict_retry_max_output_tokens: int = 4096,
-    source_link_timeout: int = 4,
+    verdict_policy: str = "always",
+    verdict_thinking_level: str = "medium",
     total_timeout_seconds: int = 0,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
@@ -261,6 +271,9 @@ def run_fact_check(
         long_image_max_width=long_image_max_width,
         image_download_timeout=image_download_timeout,
         stage="shared-reference",
+        download_hard_limit_bytes=image_download_hard_limit_bytes,
+        max_pixels=image_max_pixels,
+        total_inline_bytes=image_total_inline_bytes,
     )
     if text_context and not request_data.images:
         text_preprocess_attempted = True
@@ -525,7 +538,11 @@ def run_fact_check(
     # atomic-claim verdicts. The grounded result remains a complete fallback.
     body = evidence_body
     used_model = evidence_used_model
-    if verdict_models:
+    if verdict_models and should_run_verdict_review(
+        verdict_policy,
+        candidates=deduped,
+        evidence_text=extract_text(evidence_body),
+    ):
         evidence_text = shorten_text(extract_text(evidence_body).strip(), 9000)
         evidence_sources = dedupe_sources(extract_sources(evidence_body) + anysearch_evidence.sources, limit=5)
         grounding_evidence = extract_grounding_evidence(evidence_body)
@@ -556,7 +573,7 @@ def run_fact_check(
                     upper=8192,
                 ),
                 grounding=False,
-                thinking_level="medium",
+                thinking_level=verdict_thinking_level,
                 model_failure_cooldown_seconds=model_failure_cooldown_seconds,
                 http_max_retries=0,
                 request_timeout=verdict_request_timeout,
@@ -586,7 +603,7 @@ def run_fact_check(
                     temperature=0.1,
                     max_output_tokens=retry_tokens,
                     grounding=False,
-                    thinking_level="medium",
+                    thinking_level=verdict_thinking_level,
                     model_failure_cooldown_seconds=model_failure_cooldown_seconds,
                     http_max_retries=0,
                     request_timeout=verdict_request_timeout,
@@ -617,7 +634,6 @@ def run_fact_check(
             anysearch_evidence.sources,
             limit=3,
         ),
-        redirect_timeout=source_link_timeout,
     )
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources[:3])
@@ -754,7 +770,8 @@ def run_fact_check_followup(
     base_url: str,
     main_models: list[str],
     request_timeout: int = 45,
-    source_link_timeout: int = 4,
+    max_output_tokens: int = 1024,
+    retry_max_output_tokens: int = 2048,
     total_timeout_seconds: int = 0,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
@@ -806,15 +823,55 @@ def run_fact_check_followup(
         api_key=api_key,
         base_url=base_url,
         temperature=0.1,
-        max_output_tokens=640,
+        max_output_tokens=_clamp_int(
+            max_output_tokens,
+            default=1024,
+            lower=512,
+            upper=8192,
+        ),
         grounding=True,
         request_timeout=request_timeout,
     )
+    try:
+        validate_complete_followup_result(body)
+    except IncompleteGenerationError as exc:
+        retry_tokens = _clamp_int(
+            retry_max_output_tokens,
+            default=2048,
+            lower=1024,
+            upper=8192,
+        )
+        if not _retry_budget_available(minimum=5.0):
+            return FactCheckResult(
+                FAILED_REPLY,
+                f"follow-up incomplete and insufficient retry budget: {exc}",
+                candidates=candidates,
+            )
+        print(
+            "[astrbot-fact-check-followup-retry] "
+            f"model={used_model} max_output_tokens={retry_tokens} reason={exc}",
+            flush=True,
+        )
+        try:
+            body, used_model = generate_with_fallback(
+                prompt=prompt,
+                models=[used_model],
+                api_key=api_key,
+                base_url=base_url,
+                temperature=0.1,
+                max_output_tokens=retry_tokens,
+                grounding=True,
+                request_timeout=request_timeout,
+            )
+            validate_complete_followup_result(body)
+        except IncompleteGenerationError as retry_exc:
+            return FactCheckResult(
+                FAILED_REPLY,
+                f"follow-up incomplete after retry: {retry_exc}",
+                candidates=candidates,
+            )
     reply = sanitize_fact_check_reply(extract_text(body).strip())
-    sources = normalize_fact_check_sources(
-        extract_sources(body),
-        redirect_timeout=source_link_timeout,
-    )
+    sources = normalize_fact_check_sources(extract_sources(body))
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources)
     reply = append_source_links(reply, sources)
@@ -1149,10 +1206,14 @@ def build_inline_image_parts(
     long_image_max_width: int,
     image_download_timeout: int,
     stage: str,
+    download_hard_limit_bytes: int = 20 * 1024 * 1024,
+    max_pixels: int = 40_000_000,
+    total_inline_bytes: int = 12 * 1024 * 1024,
 ) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
     seen_image_payloads: set[str] = set()
     for item in images:
+        label = safe_image_log_label(item)
         try:
             append_unique_inline_parts(
                 parts,
@@ -1162,16 +1223,19 @@ def build_inline_image_parts(
                     long_image_chunk_height=long_image_chunk_height,
                     long_image_max_parts=long_image_max_parts,
                     long_image_max_width=long_image_max_width,
+                    download_hard_limit_bytes=download_hard_limit_bytes,
+                    max_pixels=max_pixels,
                     timeout=image_download_timeout,
                 ),
                 seen_image_payloads,
                 stage=stage,
-                label=item.file_name or item.url or item.path,
+                label=label,
+                max_total_bytes=total_inline_bytes,
             )
         except Exception as exc:
             print(
                 f"[astrbot-fact-check-image-{stage}-error] "
-                f"{item.file_name or item.url}: {exc!r}",
+                f"{label}: {redact_sensitive_urls(repr(exc))}",
                 flush=True,
             )
     if parts:
@@ -1189,15 +1253,35 @@ def append_unique_inline_parts(
     *,
     stage: str,
     label: str,
+    max_total_bytes: int = 0,
 ) -> None:
+    total_bytes = sum(inline_image_payload_size(part) for part in target)
     for part in new_parts:
         payload = ((part.get("inline_data") or {}).get("data") or "").strip()
         if payload and payload in seen_payloads:
             print(f"[astrbot-fact-check-image-{stage}-dedupe] skipped duplicate {label}", flush=True)
             continue
+        payload_bytes = inline_image_payload_size(part)
+        if max_total_bytes > 0 and total_bytes + payload_bytes > max_total_bytes:
+            print(
+                f"[astrbot-fact-check-image-{stage}-budget] "
+                f"skipped={label} bytes={payload_bytes} "
+                f"used={total_bytes} limit={max_total_bytes}",
+                flush=True,
+            )
+            continue
         if payload:
             seen_payloads.add(payload)
         target.append(part)
+        total_bytes += payload_bytes
+
+
+def inline_image_payload_size(part: dict[str, Any]) -> int:
+    payload = str((part.get("inline_data") or {}).get("data") or "").strip()
+    if not payload:
+        return 0
+    padding = len(payload) - len(payload.rstrip("="))
+    return max(0, (len(payload) * 3) // 4 - padding)
 
 
 def download_image_as_inline_parts(
@@ -1207,11 +1291,18 @@ def download_image_as_inline_parts(
     long_image_chunk_height: int,
     long_image_max_parts: int,
     long_image_max_width: int,
+    download_hard_limit_bytes: int = 20 * 1024 * 1024,
+    max_pixels: int = 40_000_000,
     timeout: int = 10,
 ) -> list[dict[str, Any]]:
-    ref = item.path or item.url
-    print(f"[astrbot-fact-check-image-download] start {item.file_name or ref}", flush=True)
-    body, content_type = read_image_input_bytes(item, max_bytes=None, timeout=timeout)
+    label = safe_image_log_label(item)
+    print(f"[astrbot-fact-check-image-download] start {label}", flush=True)
+    body, content_type = read_image_input_bytes(
+        item,
+        max_bytes=max(1, int(download_hard_limit_bytes)),
+        timeout=timeout,
+    )
+    validate_image_pixel_count(body, max_pixels=max_pixels)
     print(
         f"[astrbot-fact-check-image-download] done bytes={len(body)} source={'local' if item.path else 'remote'}",
         flush=True,
@@ -1225,12 +1316,43 @@ def download_image_as_inline_parts(
         ]
     return split_large_image_as_inline_parts(
         body,
-        source_label=item.file_name or ref,
+        source_label=label,
         max_bytes=max_bytes,
         chunk_height=long_image_chunk_height,
         max_parts=long_image_max_parts,
         max_width=long_image_max_width,
     )
+
+
+def safe_image_log_label(item: ImageInput) -> str:
+    source = "local" if item.path else "remote"
+    name = Path(str(item.file_name or "")).name
+    if not name and item.path:
+        name = Path(str(item.path).removeprefix("file:///").removeprefix("file://")).name
+    if not name and item.url:
+        parsed = urlparse(item.url)
+        name = Path(parsed.path).name or str(parsed.hostname or "image")
+    digest = str(item.content_sha256 or "").strip()[:8]
+    return f"{source}:{name or 'image'}" + (f" sha256={digest}" if digest else "")
+
+
+def redact_sensitive_urls(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        parsed = urlparse(match.group(0))
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    return re.sub(r"https?://[^\s<>\]\"']+", replace, str(text or ""))
+
+
+def validate_image_pixel_count(body: bytes, *, max_pixels: int) -> None:
+    limit = max(1, int(max_pixels))
+    with Image.open(io.BytesIO(body)) as image:
+        width, height = image.size
+    pixels = width * height
+    if pixels > limit:
+        raise ValueError(
+            f"image pixel count too large: {pixels} pixels > limit {limit}",
+        )
 
 
 def make_inline_image_part(body: bytes, *, mime_type: str) -> dict[str, Any]:
@@ -1436,51 +1558,63 @@ def collect_anysearch_evidence(
         return AnysearchEvidence(reason="skipped: no search queries")
 
     try:
-        if len(query_payloads) == 1:
-            search_text = anysearch_call_tool(
-                tool_name="search",
-                arguments=query_payloads[0],
-                endpoint=endpoint,
-                api_key=api_key,
-                timeout=timeout,
-            )
-        else:
-            search_text = anysearch_call_tool(
-                tool_name="batch_search",
-                arguments={"queries": query_payloads},
-                endpoint=endpoint,
-                api_key=api_key,
-                timeout=timeout,
-            )
+        ensure_public_url_target(endpoint)
+        with httpx.Client(follow_redirects=True, trust_env=True) as shared_client:
+            if len(query_payloads) == 1:
+                search_text = anysearch_call_tool(
+                    tool_name="search",
+                    arguments=query_payloads[0],
+                    endpoint=endpoint,
+                    api_key=api_key,
+                    timeout=timeout,
+                    client=shared_client,
+                    endpoint_validated=True,
+                )
+            else:
+                search_text = anysearch_call_tool(
+                    tool_name="batch_search",
+                    arguments={"queries": query_payloads},
+                    endpoint=endpoint,
+                    api_key=api_key,
+                    timeout=timeout,
+                    client=shared_client,
+                    endpoint_validated=True,
+                )
+
+            urls = [url for url in extract_public_urls(search_text) if is_public_http_url(url)]
+            extract_urls = urls[: max(0, _clamp_int(extract_top_urls, default=2, lower=0, upper=5))]
+            request_deadline = _REQUEST_DEADLINE.get()
+
+            def extract_page(url: str) -> tuple[str, str, str]:
+                token = _REQUEST_DEADLINE.set(request_deadline)
+                try:
+                    # Anysearch fetches this URL remotely. Local validation only
+                    # checks the URL syntax/literal host to avoid DNS stalls and
+                    # false negatives caused by split-horizon DNS.
+                    extracted = anysearch_call_tool(
+                        tool_name="extract",
+                        arguments={"url": url},
+                        endpoint=endpoint,
+                        api_key=api_key,
+                        timeout=min(max(3, timeout), 10),
+                        max_retries=0,
+                        client=shared_client,
+                        endpoint_validated=True,
+                    )
+                except Exception as exc:
+                    return url, "", error_label(exc)
+                finally:
+                    _REQUEST_DEADLINE.reset(token)
+                return url, extracted, ""
+
+            extract_results: list[tuple[str, str, str]] = []
+            if extract_urls:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(2, len(extract_urls)),
+                ) as executor:
+                    extract_results = list(executor.map(extract_page, extract_urls))
     except Exception as exc:
         return AnysearchEvidence(reason=f"search failed: {error_label(exc)}")
-
-    urls = [url for url in extract_public_urls(search_text) if is_public_http_url(url)]
-    extract_urls = urls[: max(0, _clamp_int(extract_top_urls, default=2, lower=0, upper=5))]
-    request_deadline = _REQUEST_DEADLINE.get()
-
-    def extract_page(url: str) -> tuple[str, str, str]:
-        token = _REQUEST_DEADLINE.set(request_deadline)
-        try:
-            ensure_public_url_target(url)
-            extracted = anysearch_call_tool(
-                tool_name="extract",
-                arguments={"url": url},
-                endpoint=endpoint,
-                api_key=api_key,
-                timeout=min(max(3, timeout), 10),
-                max_retries=0,
-            )
-        except Exception as exc:
-            return url, "", error_label(exc)
-        finally:
-            _REQUEST_DEADLINE.reset(token)
-        return url, extracted, ""
-
-    extract_results: list[tuple[str, str, str]] = []
-    if extract_urls:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(extract_urls))) as executor:
-            extract_results = list(executor.map(extract_page, extract_urls))
 
     excerpts: list[str] = []
     excerpt_sources: list[str] = []
@@ -1560,11 +1694,14 @@ def anysearch_call_tool(
     api_key: str,
     timeout: int,
     max_retries: int = 1,
+    client: httpx.Client | None = None,
+    endpoint_validated: bool = False,
 ) -> str:
     endpoint = (endpoint or ANYSEARCH_DEFAULT_ENDPOINT).strip()
     if not is_public_http_url(endpoint):
         raise ValueError("Anysearch endpoint must be a public http(s) URL")
-    ensure_public_url_target(endpoint)
+    if not endpoint_validated:
+        ensure_public_url_target(endpoint)
     clean_api_key = (api_key or os.getenv("ANYSEARCH_API_KEY") or "").strip()
     headers = {"Content-Type": "application/json"}
     if clean_api_key:
@@ -1576,46 +1713,56 @@ def anysearch_call_tool(
         "params": {"name": tool_name, "arguments": arguments},
     }
     last_error: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            bounded = _bounded_timeout(max(3, timeout))
-            http_timeout = httpx.Timeout(
-                bounded,
-                connect=min(6.0, bounded),
-                read=bounded,
-                write=min(6.0, bounded),
-            )
-            with httpx.Client(timeout=http_timeout, follow_redirects=True, trust_env=True) as client:
-                response = client.post(endpoint, json=payload, headers=headers)
+    owned_client = client is None
+    request_client = client or httpx.Client(follow_redirects=True, trust_env=True)
+    try:
+        for attempt in range(max_retries + 1):
+            try:
+                bounded = _bounded_timeout(max(3, timeout))
+                http_timeout = httpx.Timeout(
+                    bounded,
+                    connect=min(6.0, bounded),
+                    read=bounded,
+                    write=min(6.0, bounded),
+                )
+                response = request_client.post(
+                    endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=http_timeout,
+                )
                 response.raise_for_status()
                 data = response.json()
-            if "error" in data:
-                error = data["error"]
-                if isinstance(error, dict):
-                    message = error.get("message") or json.dumps(error, ensure_ascii=False)
-                else:
-                    message = str(error)
-                raise RuntimeError(f"Anysearch API error: {message}")
-            return extract_anysearch_text(data)
-        except httpx.HTTPStatusError as exc:
-            last_error = exc
-            if not is_retryable(exc) or attempt >= max_retries or not _retry_budget_available():
-                raise
-        except (httpx.RequestError, json.JSONDecodeError, RuntimeError) as exc:
-            last_error = exc
-            if attempt >= max_retries or not _retry_budget_available():
-                raise
-        wait = backoff_seconds(attempt, last_error or RuntimeError("Anysearch request failed"))
-        print(
-            "[astrbot-fact-check-anysearch-retry] "
-            f"attempt={attempt + 1}/{max_retries + 1} tool={tool_name} "
-            f"wait={wait:.1f}s error={error_label(last_error)}",
-            flush=True,
-        )
-        _sleep_with_deadline(wait)
-    if last_error:
-        raise last_error
-    raise RuntimeError("Anysearch request failed without a specific error")
+                if "error" in data:
+                    error = data["error"]
+                    if isinstance(error, dict):
+                        message = error.get("message") or json.dumps(error, ensure_ascii=False)
+                    else:
+                        message = str(error)
+                    raise RuntimeError(f"Anysearch API error: {message}")
+                return extract_anysearch_text(data)
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if not is_retryable(exc) or attempt >= max_retries or not _retry_budget_available():
+                    raise
+            except (httpx.RequestError, json.JSONDecodeError, RuntimeError) as exc:
+                last_error = exc
+                if attempt >= max_retries or not _retry_budget_available():
+                    raise
+            wait = backoff_seconds(attempt, last_error or RuntimeError("Anysearch request failed"))
+            print(
+                "[astrbot-fact-check-anysearch-retry] "
+                f"attempt={attempt + 1}/{max_retries + 1} tool={tool_name} "
+                f"wait={wait:.1f}s error={error_label(last_error)}",
+                flush=True,
+            )
+            _sleep_with_deadline(wait)
+        if last_error:
+            raise last_error
+        raise RuntimeError("Anysearch request failed without a specific error")
+    finally:
+        if owned_client:
+            request_client.close()
 
 
 def extract_anysearch_text(data: dict[str, Any]) -> str:
@@ -1680,12 +1827,23 @@ def ensure_public_url_target(url: str) -> None:
             if not cached[1]:
                 raise ValueError("URL hostname resolves to a non-public address")
             return
+    future = _DNS_RESOLVER.submit(
+        socket.getaddrinfo,
+        host,
+        None,
+        0,
+        socket.SOCK_STREAM,
+    )
     try:
+        records = future.result(timeout=_bounded_timeout(3.0))
         addresses = {
             item[4][0]
-            for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            for item in records
             if item and item[4]
         }
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        raise ValueError(f"URL hostname resolution timed out: {host}") from exc
     except OSError as exc:
         raise ValueError(f"URL hostname could not be resolved: {host}") from exc
     public = bool(addresses) and all(ipaddress.ip_address(address).is_global for address in addresses)
@@ -1751,11 +1909,30 @@ def select_fact_check_sources(
         selected.append(source)
         if len(selected) >= max(1, int(limit or 3)):
             break
+
+    has_clickable_source = any(
+        url and not is_google_grounding_redirect(url)
+        for _, url in (split_source_title_url(source) for source in selected)
+    )
+    if not has_clickable_source:
+        direct_extracted = next(
+            (
+                source
+                for source in dedupe_sources(extracted_sources, limit=20)
+                if (url := split_source_title_url(source)[1])
+                and not is_google_grounding_redirect(url)
+            ),
+            "",
+        )
+        if direct_extracted:
+            if len(selected) >= max(1, int(limit or 3)):
+                selected[-1] = direct_extracted
+            else:
+                selected.append(direct_extracted)
     return selected
 
 
-def normalize_fact_check_sources(sources: list[str], *, redirect_timeout: int = 4) -> list[str]:
-    del redirect_timeout
+def normalize_fact_check_sources(sources: list[str]) -> list[str]:
     normalized: list[str] = []
     for source in sources[:3]:
         title, url = split_source_title_url(source)
@@ -1841,6 +2018,27 @@ def generation_diagnostics(body: dict[str, Any]) -> str:
     return f"finish={finish} output_tokens={output_tokens} thought_tokens={thought_tokens}"
 
 
+def should_run_verdict_review(
+    policy: str,
+    *,
+    candidates: list[ClaimCandidate],
+    evidence_text: str,
+) -> bool:
+    normalized = str(policy or "always").strip().lower()
+    if normalized == "never":
+        return False
+    if normalized != "risk_based":
+        return True
+    combined = "\n".join(item.claim for item in candidates) + "\n" + str(evidence_text or "")
+    return len(candidates) > 1 or bool(
+        re.search(
+            r"(法规|政策|法律|违法|医学|疾病|治疗|药物|金融|投资|证券|安全|事故|伤亡)",
+            combined,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def validate_complete_fact_check_result(
     body: dict[str, Any],
     *,
@@ -1885,6 +2083,27 @@ def validate_complete_fact_check_result(
                 f"expected={expected_claim_count} points={point_numbers} "
                 f"conclusions={conclusion_count} bases={basis_count}"
             )
+    if text.rstrip().endswith((",", "，", "、", ":", "：", ";", "；", "/", "（")):
+        raise IncompleteGenerationError("reply ended mid-sentence")
+
+
+def validate_complete_followup_result(body: dict[str, Any]) -> None:
+    candidates = body.get("candidates", []) or []
+    candidate = candidates[0] if candidates else {}
+    finish_reason = str(candidate.get("finishReason") or "").strip().upper()
+    if finish_reason != "STOP":
+        raise IncompleteGenerationError(f"finish_reason={finish_reason}")
+    text = sanitize_fact_check_reply(extract_text(body).strip())
+    if not text:
+        raise IncompleteGenerationError("no readable text")
+    required_fields = ("追问结论", "补充依据", "是否改变原结论", "来源")
+    missing = [
+        field
+        for field in required_fields
+        if not re.search(rf"(?:^|\n){re.escape(field)}[：:]\s*\S+", text)
+    ]
+    if missing:
+        raise IncompleteGenerationError("missing follow-up fields: " + ",".join(missing))
     if text.rstrip().endswith((",", "，", "、", ":", "：", ";", "；", "/", "（")):
         raise IncompleteGenerationError("reply ended mid-sentence")
 

@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -113,6 +114,7 @@ def make_plugin() -> main.FactCheckPlugin:
     plugin._active_followup_jobs = 0
     plugin._cooldown_until = 0.0
     plugin._fact_check_semaphore = main.asyncio.Semaphore(1)
+    plugin._session_store_enabled = False
     plugin._dump_forward_failure = lambda *args, **kwargs: None
     return plugin
 
@@ -151,6 +153,24 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(first_key, second_key)
+
+    def test_request_cache_key_changes_for_different_image_content(self) -> None:
+        plugin = make_plugin()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.png"
+            second = root / "second.png"
+            first.write_bytes(b"first-image")
+            second.write_bytes(b"second-image")
+
+            first_key = plugin._request_cache_key(
+                FactCheckRequest("", "/事实核查", images=[ImageInput("", "first.png", str(first))]),
+            )
+            second_key = plugin._request_cache_key(
+                FactCheckRequest("", "/事实核查", images=[ImageInput("", "second.png", str(second))]),
+            )
+
+        self.assertNotEqual(first_key, second_key)
 
     def test_duplicate_image_inputs_are_collapsed_by_content(self) -> None:
         plugin = make_plugin()
@@ -224,6 +244,77 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         session = plugin._fact_check_sessions[session_id]
         self.assertEqual([item.claim for item in session.candidates], ["请核查：A 事件是否属实？"])
         self.assertEqual(session.sources, ["https://example.com/source"])
+
+    def test_followup_sessions_persist_without_original_media_or_text(self) -> None:
+        event = FakeEvent(fail_send=False)
+        result = FactCheckResult(
+            reply="事实核查：部分存疑",
+            reason="ok",
+            sources=["https://example.com/report"],
+            candidates=[ClaimCandidate("请核查：A 事件是否属实？", "图片", 5)],
+        )
+        request = FactCheckRequest(
+            text="含敏感原文",
+            trigger_text="/事实核查",
+            images=[
+                ImageInput(
+                    url="https://example.com/private.png?token=secret",
+                    path="C:/temp/private.png",
+                ),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plugin = make_plugin()
+            plugin._session_store_enabled = True
+            with patch.object(main.StarTools, "get_data_dir", return_value=root):
+                session_id = plugin._remember_fact_check_session(event, request, result)
+                raw = (root / "fact_check_sessions.json").read_text(encoding="utf-8")
+
+                restored = make_plugin()
+                restored._session_store_enabled = True
+                restored._load_fact_check_sessions()
+
+        self.assertNotIn("含敏感原文", raw)
+        self.assertNotIn("private.png", raw)
+        self.assertNotIn("secret", raw)
+        self.assertIn(session_id, restored._fact_check_sessions)
+        session = restored._fact_check_sessions[session_id]
+        self.assertEqual(session.request_data.text, "")
+        self.assertEqual(session.request_data.images, [])
+        self.assertEqual(session.candidates[0].claim, "请核查：A 事件是否属实？")
+
+    def test_forward_failure_dump_omits_reply_text_by_default(self) -> None:
+        plugin = object.__new__(main.FactCheckPlugin)
+        plugin.config = {"fact_check_debug_store_full_failure_text": False}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.object(main.StarTools, "get_data_dir", return_value=root):
+                plugin._dump_forward_failure(
+                    "group:123:user:456",
+                    "敏感事实核查正文 https://example.com/?token=secret",
+                    RuntimeError("send failed"),
+                )
+            payload = json.loads(
+                (root / "last_forward_failure.json").read_text(encoding="utf-8"),
+            )
+
+        self.assertNotIn("text", payload)
+        self.assertNotIn("chunks", payload)
+        self.assertEqual(payload["length"], len("敏感事实核查正文 https://example.com/?token=secret"))
+        self.assertIn("text_sha256", payload)
+
+    def test_model_cooling_error_starts_user_facing_cooldown(self) -> None:
+        plugin = make_plugin()
+        plugin.config["fact_check_rate_limit_cooldown_seconds"] = 90
+
+        plugin._maybe_start_cooldown(
+            "all configured fact-check models are cooling down: gemini-2.5-flash",
+        )
+
+        self.assertGreater(plugin._cooldown_left(), 80)
 
     async def test_followup_respects_cooldown_before_progress_message(self) -> None:
         plugin = make_plugin()

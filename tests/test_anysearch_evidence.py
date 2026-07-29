@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -22,6 +22,7 @@ from fact_check import (
     collect_anysearch_evidence,
     dedupe_candidates,
     ensure_claim_points_visible,
+    ensure_public_url_target,
     extract_sources,
     extract_public_urls,
     extract_claims_from_text,
@@ -105,7 +106,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
     def test_collect_anysearch_evidence_uses_batch_search_and_extracts_public_pages(self) -> None:
         calls: list[tuple[str, dict]] = []
 
-        def fake_call_tool(*, tool_name, arguments, endpoint, api_key, timeout, max_retries=1):
+        def fake_call_tool(*, tool_name, arguments, endpoint, api_key, timeout, max_retries=1, **kwargs):
             calls.append((tool_name, arguments))
             if tool_name == "batch_search":
                 return (
@@ -149,6 +150,82 @@ class AnysearchEvidenceTests(unittest.TestCase):
             "https://example.org/source-b",
         ])
         self.assertIn("ok; queries=2", evidence.reason)
+
+    def test_anysearch_remote_extract_url_is_not_dns_resolved_locally(self) -> None:
+        def fake_call_tool(*, tool_name, arguments, **kwargs):
+            if tool_name == "search":
+                return "- **URL**: https://remote-news.example/report"
+            if tool_name == "extract":
+                return "Remote extraction result"
+            raise AssertionError(f"unexpected tool: {tool_name}")
+
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target") as validate_target,
+        ):
+            evidence = collect_anysearch_evidence(
+                [ClaimCandidate("核查新闻")],
+                enabled=True,
+                endpoint="https://api.anysearch.com/mcp",
+                api_key="",
+                timeout=5,
+                max_claims=1,
+                max_results_per_claim=1,
+                extract_top_urls=1,
+                max_chars=4000,
+            )
+
+        validated_urls = [call.args[0] for call in validate_target.call_args_list]
+        self.assertIn("https://api.anysearch.com/mcp", validated_urls)
+        self.assertNotIn("https://remote-news.example/report", validated_urls)
+        self.assertEqual(evidence.sources, ["https://remote-news.example/report"])
+
+    def test_anysearch_call_tool_reuses_supplied_http_client(self) -> None:
+        response = MagicMock()
+        response.json.return_value = {
+            "result": {"content": [{"type": "text", "text": "ok"}]},
+        }
+        client = MagicMock()
+        client.post.return_value = response
+
+        with patch("fact_check.httpx.Client") as client_factory:
+            from fact_check import anysearch_call_tool
+
+            first = anysearch_call_tool(
+                tool_name="search",
+                arguments={"query": "one"},
+                endpoint="https://api.anysearch.com/mcp",
+                api_key="",
+                timeout=5,
+                client=client,
+                endpoint_validated=True,
+            )
+            second = anysearch_call_tool(
+                tool_name="search",
+                arguments={"query": "two"},
+                endpoint="https://api.anysearch.com/mcp",
+                api_key="",
+                timeout=5,
+                client=client,
+                endpoint_validated=True,
+            )
+
+        client_factory.assert_not_called()
+        self.assertEqual(client.post.call_count, 2)
+        self.assertEqual((first, second), ("ok", "ok"))
+
+    def test_public_url_dns_resolution_timeout_fails_closed(self) -> None:
+        future = MagicMock()
+        future.result.side_effect = TimeoutError
+
+        with (
+            patch("fact_check._PUBLIC_HOST_CACHE", {}),
+            patch("fact_check._DNS_RESOLVER.submit", return_value=future),
+        ):
+            with self.assertRaisesRegex(ValueError, "timed out"):
+                ensure_public_url_target("https://slow.example/report")
+
+        future.cancel.assert_called_once()
 
     def test_collect_anysearch_evidence_disabled_does_not_call_network(self) -> None:
         with patch("fact_check.anysearch_call_tool") as mocked:
@@ -250,7 +327,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
             "AUZIYExample"
         )
         with patch("fact_check.httpx.Client") as client:
-            sources = normalize_fact_check_sources([source], redirect_timeout=1)
+            sources = normalize_fact_check_sources([source])
 
         client.assert_not_called()
         self.assertEqual(sources, ["Official report"])
@@ -263,7 +340,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
             "Official report：https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
             "AUZIYExample"
         )
-        sources = normalize_fact_check_sources([source], redirect_timeout=1)
+        sources = normalize_fact_check_sources([source])
 
         self.assertEqual(sources, ["Official report"])
         reply = append_source_links("事实核查：可信", sources)
@@ -274,7 +351,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
             f"Source {index}：https://example{index}.com/report"
             for index in range(5)
         ]
-        normalized = normalize_fact_check_sources(sources, redirect_timeout=4)
+        normalized = normalize_fact_check_sources(sources)
 
         self.assertEqual(len(normalized), 3)
         self.assertEqual(normalized[0], "Source 0：https://example0.com/report")
@@ -334,6 +411,24 @@ class AnysearchEvidenceTests(unittest.TestCase):
             f"Official A：{redirect_root}a",
             f"Official B：{redirect_root}b",
         ])
+
+    def test_source_selection_reserves_a_clickable_extracted_source(self) -> None:
+        redirect_root = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+
+        selected = select_fact_check_sources(
+            [
+                f"Grounding A：{redirect_root}a",
+                f"Grounding B：{redirect_root}b",
+                f"Grounding C：{redirect_root}c",
+            ],
+            ["Direct report：https://news.example/report/123"],
+            limit=3,
+        )
+        normalized = normalize_fact_check_sources(selected)
+
+        self.assertEqual(len(selected), 3)
+        self.assertIn("Direct report：https://news.example/report/123", selected)
+        self.assertTrue(any("https://news.example/report/123" in source for source in normalized))
 
     def test_extraction_prompt_splits_high_risk_composite_claims(self) -> None:
         captured: dict[str, str] = {}

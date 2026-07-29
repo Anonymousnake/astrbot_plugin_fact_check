@@ -254,6 +254,65 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first_input[0].path, second_input[0].path)
             self.assertEqual(first_input[0].content_sha256, second_input[0].content_sha256)
 
+    def test_image_download_hard_limit_rejects_large_local_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "oversized.png"
+            source.write_bytes(b"x" * 1025)
+
+            with self.assertRaisesRegex(ValueError, "image too large"):
+                fact_check.download_image_as_inline_parts(
+                    ImageInput(url="", file_name="oversized.png", path=str(source)),
+                    max_bytes=512,
+                    download_hard_limit_bytes=1024,
+                    max_pixels=40_000_000,
+                    long_image_chunk_height=2200,
+                    long_image_max_parts=8,
+                    long_image_max_width=1280,
+                )
+
+    def test_image_pixel_limit_rejects_decompression_bomb_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "wide.png"
+            fact_check.Image.new("RGB", (101, 100), "white").save(source)
+
+            with self.assertRaisesRegex(ValueError, "image pixel count"):
+                fact_check.download_image_as_inline_parts(
+                    ImageInput(url="", file_name="wide.png", path=str(source)),
+                    max_bytes=5 * 1024 * 1024,
+                    download_hard_limit_bytes=20 * 1024 * 1024,
+                    max_pixels=10_000,
+                    long_image_chunk_height=2200,
+                    long_image_max_parts=8,
+                    long_image_max_width=1280,
+                )
+
+    def test_total_inline_image_budget_caps_attached_payloads(self) -> None:
+        first = fact_check.make_inline_image_part(b"a" * 8, mime_type="image/png")
+        second = fact_check.make_inline_image_part(b"b" * 8, mime_type="image/png")
+
+        with patch.object(
+            fact_check,
+            "download_image_as_inline_parts",
+            side_effect=[[first], [second]],
+        ):
+            parts = fact_check.build_inline_image_parts(
+                [
+                    ImageInput(url="https://example.com/a.png"),
+                    ImageInput(url="https://example.com/b.png"),
+                ],
+                max_image_bytes=5 * 1024 * 1024,
+                download_hard_limit_bytes=20 * 1024 * 1024,
+                max_pixels=40_000_000,
+                total_inline_bytes=12,
+                long_image_chunk_height=2200,
+                long_image_max_parts=8,
+                long_image_max_width=1280,
+                image_download_timeout=10,
+                stage="test",
+            )
+
+        self.assertEqual(parts, [first])
+
     def test_text_preprocess_failure_falls_through_to_main_check(self) -> None:
         response = complete_fact_check_body("事实核查：证据不足\n结论：证据不足\n依据：测试结果。")
 
@@ -385,6 +444,45 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("1. 核查点：Check the claim.", result.reply)
         self.assertIn("结论：证据不足", result.reply)
+
+    def test_verdict_policy_never_skips_gemini_3_review(self) -> None:
+        evidence_response = complete_fact_check_body(
+            "事实核查：可信\n结论：已核实\n依据：完整证据。"
+        )
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("核查 A 事件")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                return_value=(evidence_response, "gemini-2.5-flash"),
+            ) as generate,
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A 事件", trigger_text="/事实核查"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview"],
+                verdict_policy="never",
+            )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertIn("事实核查：可信", result.reply)
+
+    def test_image_log_label_strips_query_and_fragment(self) -> None:
+        label = fact_check.safe_image_log_label(
+            ImageInput(url="https://gchat.qpic.cn/image.png?rkey=secret#fragment"),
+        )
+
+        self.assertIn("image.png", label)
+        self.assertNotIn("secret", label)
+        self.assertNotIn("rkey", label)
 
     def test_grounded_evidence_is_used_when_gemini_3_returns_no_text(self) -> None:
         evidence_response = {
@@ -721,6 +819,70 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             complete,
             expected_claim_count=2,
         )
+
+    def test_followup_retries_incomplete_generation_with_larger_budget(self) -> None:
+        incomplete = {
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {"parts": [{"text": "追问结论：旧结论需要修正，"}]},
+            }],
+        }
+        complete = complete_fact_check_body(
+            "追问结论：新证据支持限定原说法。\n"
+            "补充依据：官方资料给出了适用范围。\n"
+            "是否改变原结论：原结论需要修正。\n"
+            "来源：官方资料。"
+        )
+
+        with patch.object(
+            fact_check,
+            "generate_with_fallback",
+            side_effect=[
+                (incomplete, "gemini-2.5-flash"),
+                (complete, "gemini-2.5-flash"),
+            ],
+        ) as generate:
+            result = fact_check.run_fact_check_followup(
+                original_text="原始说法",
+                candidates=[fact_check.ClaimCandidate("核查原始说法")],
+                previous_reply="事实核查：部分存疑",
+                previous_sources=[],
+                question="那适用范围是什么？",
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                main_models=["gemini-2.5-flash"],
+            )
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(generate.call_args_list[0].kwargs["max_output_tokens"], 1024)
+        self.assertEqual(generate.call_args_list[1].kwargs["max_output_tokens"], 2048)
+        self.assertIn("追问结论：新证据支持限定原说法", result.reply)
+        self.assertEqual(result.reason, "ok; follow-up")
+
+    def test_followup_rejects_incomplete_result_after_retry(self) -> None:
+        incomplete = complete_fact_check_body("追问结论：只有这一段。")
+
+        with patch.object(
+            fact_check,
+            "generate_with_fallback",
+            side_effect=[
+                (incomplete, "gemini-2.5-flash"),
+                (incomplete, "gemini-2.5-flash"),
+            ],
+        ):
+            result = fact_check.run_fact_check_followup(
+                original_text="原始说法",
+                candidates=[fact_check.ClaimCandidate("核查原始说法")],
+                previous_reply="事实核查：部分存疑",
+                previous_sources=[],
+                question="还有依据吗？",
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                main_models=["gemini-2.5-flash"],
+            )
+
+        self.assertEqual(result.reply, fact_check.FAILED_REPLY)
+        self.assertIn("follow-up incomplete after retry", result.reason)
 
 
 if __name__ == "__main__":

@@ -13,9 +13,13 @@
   "fact_check_verdict_timeout_seconds": 25,
   "fact_check_verdict_max_output_tokens": 2048,
   "fact_check_verdict_retry_max_output_tokens": 4096,
-  "fact_check_source_link_timeout_seconds": 4,
+  "fact_check_verdict_policy": "always",
+  "fact_check_verdict_thinking_level": "medium",
   "fact_check_max_images": 2,
   "fact_check_max_image_bytes": 5242880,
+  "fact_check_image_download_hard_limit_bytes": 20971520,
+  "fact_check_image_max_pixels": 40000000,
+  "fact_check_image_total_inline_bytes": 12582912,
   "fact_check_long_image_chunk_height": 2200,
   "fact_check_long_image_max_parts": 8,
   "fact_check_long_image_max_width": 1280,
@@ -26,6 +30,8 @@
   "fact_check_cache_max_entries": 32,
   "fact_check_followup_ttl_seconds": 3600,
   "fact_check_followup_max_sessions": 50,
+  "fact_check_followup_max_output_tokens": 1024,
+  "fact_check_followup_retry_max_output_tokens": 2048,
   "fact_check_rate_limit_cooldown_seconds": 90,
   "fact_check_image_download_timeout_seconds": 10,
   "fact_check_forward_max_fetch": 3,
@@ -44,5 +50,6 @@
     "web",
     "news"
   ],
-  "fact_check_show_failure_reason": true
+  "fact_check_show_failure_reason": true,
+  "fact_check_debug_store_full_failure_text": false
 }

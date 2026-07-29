@@ -28,6 +28,7 @@ from astrbot.core.star.filter.custom_filter import CustomFilter
 
 from .fact_check import (
     FAILED_REPLY,
+    ClaimCandidate,
     FactCheckRequest,
     FactCheckResult,
     ImageInput,
@@ -124,6 +125,9 @@ class FactCheckPlugin(Star):
         self._reply_cache: dict[str, tuple[float, FactCheckResult]] = {}
         self._fact_check_sessions: dict[str, FactCheckSession] = {}
         self._cooldown_until = 0.0
+        self._session_store_enabled = True
+        self._load_fact_check_sessions()
+        self._cleanup_forward_failure_dump()
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=998_500)
     async def fact_check_followup(self, event: AstrMessageEvent):
@@ -159,7 +163,11 @@ class FactCheckPlugin(Star):
                 f"[astrbot-fact-check-followup-cooldown] {label}: "
                 f"left={cooldown_left:.1f}s session={session.session_id}",
             )
-            await event.send(event.plain_result(f"Gemini 刚被限流，先冷却 {int(cooldown_left) + 1} 秒。"))
+            await event.send(
+                event.plain_result(
+                    f"核查模型暂时繁忙，先冷却 {int(cooldown_left) + 1} 秒。",
+                ),
+            )
             return
         if self._fact_check_queue_full():
             logger.warning(
@@ -196,8 +204,11 @@ class FactCheckPlugin(Star):
                         str(self.config.get("fact_check_evidence_model") or "gemini-2.5-flash").strip(),
                     ],
                     request_timeout=int(self.config.get("fact_check_main_timeout_seconds") or 45),
-                    source_link_timeout=int(
-                        self.config.get("fact_check_source_link_timeout_seconds") or 4,
+                    max_output_tokens=int(
+                        self.config.get("fact_check_followup_max_output_tokens") or 1024,
+                    ),
+                    retry_max_output_tokens=int(
+                        self.config.get("fact_check_followup_retry_max_output_tokens") or 2048,
                     ),
                     total_timeout_seconds=total_timeout,
                 )
@@ -287,7 +298,9 @@ class FactCheckPlugin(Star):
                 f"[astrbot-fact-check-cooldown] {self._event_label(event)}: "
                 f"left={cooldown_left:.1f}s key={cache_key[:12]}",
             )
-            yield event.plain_result(f"Gemini 刚被限流，先冷却 {int(cooldown_left) + 1} 秒。")
+            yield event.plain_result(
+                f"核查模型暂时繁忙，先冷却 {int(cooldown_left) + 1} 秒。",
+            )
             return
 
         if self._fact_check_queue_full():
@@ -343,6 +356,17 @@ class FactCheckPlugin(Star):
                         ["gemini-3-flash-preview"],
                     ),
                     max_image_bytes=int(self.config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024),
+                    image_download_hard_limit_bytes=int(
+                        self.config.get("fact_check_image_download_hard_limit_bytes")
+                        or 20 * 1024 * 1024,
+                    ),
+                    image_max_pixels=int(
+                        self.config.get("fact_check_image_max_pixels") or 40_000_000,
+                    ),
+                    image_total_inline_bytes=int(
+                        self.config.get("fact_check_image_total_inline_bytes")
+                        or 12 * 1024 * 1024,
+                    ),
                     long_image_chunk_height=int(
                         self.config.get("fact_check_long_image_chunk_height") or 2200,
                     ),
@@ -411,8 +435,11 @@ class FactCheckPlugin(Star):
                     verdict_retry_max_output_tokens=int(
                         self.config.get("fact_check_verdict_retry_max_output_tokens") or 4096,
                     ),
-                    source_link_timeout=int(
-                        self.config.get("fact_check_source_link_timeout_seconds") or 4,
+                    verdict_policy=str(
+                        self.config.get("fact_check_verdict_policy") or "always",
+                    ),
+                    verdict_thinking_level=str(
+                        self.config.get("fact_check_verdict_thinking_level") or "medium",
                     ),
                     total_timeout_seconds=int(timeout_seconds),
                 )
@@ -712,16 +739,26 @@ class FactCheckPlugin(Star):
             payload = {
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "label": label,
-                "text": text,
                 "length": len(text),
-                "chunks": chunks,
                 "chunk_lengths": [len(chunk) for chunk in chunks],
                 "error": repr(exc),
+                "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             }
+            if bool(self.config.get("fact_check_debug_store_full_failure_text", False)):
+                payload["text"] = text
+                payload["chunks"] = chunks
             path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info(f"[astrbot-fact-check-forward-failure-dump] {label}: {path}")
         except Exception as dump_exc:
             logger.warning(f"[astrbot-fact-check-forward-failure-dump-error] {label}: {dump_exc!r}")
+
+    def _cleanup_forward_failure_dump(self) -> None:
+        path = Path(StarTools.get_data_dir()) / "last_forward_failure.json"
+        try:
+            if path.is_file() and time.time() - path.stat().st_mtime > 24 * 60 * 60:
+                path.unlink()
+        except OSError as exc:
+            logger.warning(f"[astrbot-fact-check-forward-failure-cleanup-error] {exc!r}")
 
     def _request_cache_key(self, request_data: FactCheckRequest) -> str:
         def cache_config_value(key: str, default):
@@ -767,8 +804,31 @@ class FactCheckPlugin(Star):
                 "verdict_retry_max_output_tokens": str(
                     cache_config_value("fact_check_verdict_retry_max_output_tokens", 4096),
                 ),
-                "source_link_timeout_seconds": str(
-                    cache_config_value("fact_check_source_link_timeout_seconds", 4),
+                "verdict_policy": str(
+                    cache_config_value("fact_check_verdict_policy", "always"),
+                ),
+                "verdict_thinking_level": str(
+                    cache_config_value("fact_check_verdict_thinking_level", "medium"),
+                ),
+            },
+            "image_config": {
+                "max_image_bytes": str(
+                    cache_config_value("fact_check_max_image_bytes", 5 * 1024 * 1024),
+                ),
+                "download_hard_limit_bytes": str(
+                    cache_config_value(
+                        "fact_check_image_download_hard_limit_bytes",
+                        20 * 1024 * 1024,
+                    ),
+                ),
+                "max_pixels": str(
+                    cache_config_value("fact_check_image_max_pixels", 40_000_000),
+                ),
+                "total_inline_bytes": str(
+                    cache_config_value(
+                        "fact_check_image_total_inline_bytes",
+                        12 * 1024 * 1024,
+                    ),
                 ),
             },
             "anysearch": {
@@ -873,10 +933,107 @@ class FactCheckPlugin(Star):
             sources=list(result.sources or []),
         )
         self._cleanup_fact_check_sessions()
+        self._persist_fact_check_sessions()
         logger.info(f"[astrbot-fact-check-session-save] {self._event_label(event)}: session={session_id}")
         return session_id
 
-    def _cleanup_fact_check_sessions(self) -> None:
+    def _session_store_path(self) -> Path:
+        return Path(StarTools.get_data_dir()) / "fact_check_sessions.json"
+
+    def _persist_fact_check_sessions(self) -> None:
+        if not bool(getattr(self, "_session_store_enabled", False)):
+            return
+        path = self._session_store_path()
+        payload = {
+            "version": 1,
+            "sessions": [
+                {
+                    "session_id": session.session_id,
+                    "created_at": session.created_at,
+                    "group_id": session.group_id,
+                    "user_id": session.user_id,
+                    "reply": session.reply,
+                    "candidates": [
+                        {
+                            "claim": str(getattr(candidate, "claim", "") or ""),
+                            "source": str(getattr(candidate, "source", "") or ""),
+                            "priority": int(getattr(candidate, "priority", 3) or 3),
+                        }
+                        for candidate in session.candidates
+                        if str(getattr(candidate, "claim", "") or "").strip()
+                    ],
+                    "sources": list(session.sources),
+                }
+                for session in sorted(
+                    self._fact_check_sessions.values(),
+                    key=lambda item: item.created_at,
+                )
+            ],
+        }
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+        except OSError as exc:
+            logger.warning(f"[astrbot-fact-check-session-persist-error] {exc!r}")
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _load_fact_check_sessions(self) -> None:
+        if not bool(getattr(self, "_session_store_enabled", False)):
+            return
+        path = self._session_store_path()
+        if not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            records = payload.get("sessions") if isinstance(payload, dict) else []
+            loaded: dict[str, FactCheckSession] = {}
+            for record in records or []:
+                if not isinstance(record, dict):
+                    continue
+                session_id = str(record.get("session_id") or "").strip()
+                if not re.fullmatch(r"fc_[0-9a-fA-F]{8,16}", session_id):
+                    continue
+                candidates = [
+                    ClaimCandidate(
+                        claim=str(item.get("claim") or "").strip(),
+                        source=str(item.get("source") or "").strip(),
+                        priority=max(1, min(5, int(item.get("priority") or 3))),
+                    )
+                    for item in record.get("candidates") or []
+                    if isinstance(item, dict) and str(item.get("claim") or "").strip()
+                ]
+                loaded[session_id] = FactCheckSession(
+                    session_id=session_id,
+                    created_at=float(record.get("created_at") or 0),
+                    group_id=str(record.get("group_id") or "").strip(),
+                    user_id=str(record.get("user_id") or "").strip(),
+                    request_data=FactCheckRequest(text="", trigger_text=""),
+                    reply=str(record.get("reply") or FAILED_REPLY),
+                    candidates=candidates,
+                    sources=[
+                        str(source).strip()
+                        for source in record.get("sources") or []
+                        if str(source).strip()
+                    ],
+                )
+            self._fact_check_sessions = loaded
+            if self._cleanup_fact_check_sessions():
+                self._persist_fact_check_sessions()
+            logger.info(
+                f"[astrbot-fact-check-session-load] sessions={len(self._fact_check_sessions)}",
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning(f"[astrbot-fact-check-session-load-error] {exc!r}")
+
+    def _cleanup_fact_check_sessions(self) -> bool:
         ttl = max(60, int(self.config.get("fact_check_followup_ttl_seconds") or 3600))
         max_entries = max(8, int(self.config.get("fact_check_followup_max_sessions") or 50))
         now = time.time()
@@ -887,11 +1044,14 @@ class FactCheckPlugin(Star):
         ]
         for session_id in expired:
             self._fact_check_sessions.pop(session_id, None)
+        changed = bool(expired)
         if len(self._fact_check_sessions) <= max_entries:
-            return
+            return changed
         stale = sorted(self._fact_check_sessions.values(), key=lambda item: item.created_at)
         for session in stale[: len(self._fact_check_sessions) - max_entries]:
             self._fact_check_sessions.pop(session.session_id, None)
+            changed = True
+        return changed
 
     def _extract_followup_question(self, event: AstrMessageEvent) -> str:
         has_reply = any(isinstance(comp, Reply) for comp in event.get_messages())
@@ -913,7 +1073,8 @@ class FactCheckPlugin(Star):
         self,
         event: AstrMessageEvent,
     ) -> tuple[FactCheckSession | None, bool]:
-        self._cleanup_fact_check_sessions()
+        if self._cleanup_fact_check_sessions():
+            self._persist_fact_check_sessions()
         ids: list[str] = []
         quoted_looks_like_fact_check = False
         quoted_fact_check_texts: list[str] = []
@@ -1107,7 +1268,18 @@ class FactCheckPlugin(Star):
 
     def _maybe_start_cooldown(self, reason: str) -> None:
         lowered = str(reason or "").lower()
-        if "429" not in lowered and "too many requests" not in lowered and "rate limit" not in lowered:
+        capacity_markers = (
+            "429",
+            "503",
+            "too many requests",
+            "rate limit",
+            "cooling down",
+            "cooldown",
+            "high demand",
+            "resource_exhausted",
+            "temporarily unavailable",
+        )
+        if not any(marker in lowered for marker in capacity_markers):
             return
         seconds = max(0, int(self.config.get("fact_check_rate_limit_cooldown_seconds") or 90))
         if seconds <= 0:
@@ -1710,6 +1882,7 @@ class FactCheckPlugin(Star):
         return value if len(value) <= limit else value[:limit] + "..."
 
     async def terminate(self):
+        self._persist_fact_check_sessions()
         tasks = list(self._fact_check_tasks)
         for task in tasks:
             task.cancel()
