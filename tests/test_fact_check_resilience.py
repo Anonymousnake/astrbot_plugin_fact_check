@@ -383,7 +383,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             complete_fact_check_body(
                 "事实核查：可信\n"
                 "1. 核查点：A 事件是否发生。\n"
-                "结论：可信\n"
+                "结论：肯定\n"
                 "依据：来源支持。"
             ),
             complete_fact_check_body(
@@ -404,6 +404,88 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(body=body):
                 with self.assertRaises(fact_check.IncompleteGenerationError):
                     fact_check.validate_complete_fact_check_result(body, expected_claim_count=1)
+
+    def test_common_model_verdict_labels_are_repaired_without_retry(self) -> None:
+        body = complete_fact_check_body(
+            "事实核查：基本属实\n"
+            "1. 核查点：A 事件是否发生。\n"
+            "结论：基本属实\n"
+            "依据：官方来源确认了主体事实，但存在适用范围限制。"
+        )
+
+        fact_check.validate_complete_fact_check_result(body, expected_claim_count=1)
+        cleaned = fact_check.sanitize_fact_check_reply(fact_check.extract_text(body))
+
+        self.assertIn("事实核查：基本可信但需限定", cleaned)
+        self.assertIn("结论：表述需限定", cleaned)
+
+    def test_partial_result_keeps_completed_claims_and_marks_missing_ones(self) -> None:
+        incomplete = {
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {"parts": [{"text": (
+                    "事实核查：混合结论\n"
+                    "1. 核查点：A 事件是否发生。\n"
+                    "结论：已核实\n"
+                    "依据：官方公告直接确认。\n"
+                    "2. 核查点：B 事件是否发生。\n"
+                    "结论："
+                )}]},
+            }],
+        }
+        claims = [
+            fact_check.ClaimCandidate("A 事件是否发生。"),
+            fact_check.ClaimCandidate("B 事件是否发生。"),
+        ]
+
+        reply = fact_check.salvage_partial_fact_check_reply(incomplete, claims)
+
+        self.assertIn("以下仅保留已完成核查点", reply)
+        self.assertIn("结论：已核实", reply)
+        self.assertIn("未完成核查：B 事件是否发生。", reply)
+        self.assertNotIn("2. 核查点", reply)
+
+    def test_fact_check_returns_partial_result_after_two_incomplete_generations(self) -> None:
+        incomplete = {
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "content": {"parts": [{"text": (
+                    "事实核查：混合结论\n"
+                    "1. 核查点：A 事件是否发生。\n"
+                    "结论：已核实\n"
+                    "依据：官方公告直接确认。\n"
+                    "2. 核查点：B 事件是否发生。\n"
+                    "结论："
+                )}]},
+            }],
+        }
+        claims = [
+            fact_check.ClaimCandidate("A 事件是否发生。"),
+            fact_check.ClaimCandidate("B 事件是否发生。"),
+        ]
+
+        with (
+            patch.object(fact_check, "extract_claims_from_text", return_value=claims),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                side_effect=[
+                    (incomplete, "gemini-2.5-flash"),
+                    (incomplete, "gemini-2.5-flash"),
+                ],
+            ),
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A and B", trigger_text="/factcheck"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+            )
+
+        self.assertTrue(result.reason.startswith("ok; partial"))
+        self.assertIn("结论：已核实", result.reply)
+        self.assertIn("未完成核查：B 事件是否发生。", result.reply)
 
     def test_multi_claim_fact_check_rejects_invalid_child_label(self) -> None:
         body = complete_fact_check_body(
@@ -652,6 +734,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 pre_model="gemini-3.1-flash-lite",
                 evidence_model="gemini-2.5-flash",
                 verdict_models=["gemini-3-flash-preview"],
+                verdict_policy="always",
             )
 
         evidence_call, verdict_call = generate.call_args_list
@@ -731,6 +814,38 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generate.call_count, 1)
         self.assertIn("事实核查：可信", result.reply)
 
+    def test_default_verdict_policy_skips_review_for_one_low_risk_claim(self) -> None:
+        evidence_response = complete_single_claim_body(
+            summary="可信",
+            claim="核查 A 事件",
+            conclusion="已核实",
+            basis="完整证据。",
+        )
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("核查 A 事件")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                return_value=(evidence_response, "gemini-2.5-flash"),
+            ) as generate,
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text="A 事件", trigger_text="/事实核查"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview"],
+            )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertIn("事实核查：可信", result.reply)
+
     def test_image_log_label_strips_query_and_fragment(self) -> None:
         label = fact_check.safe_image_log_label(
             ImageInput(url="https://gchat.qpic.cn/image.png?rkey=secret#fragment"),
@@ -772,6 +887,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 pre_model="gemini-3.1-flash-lite",
                 evidence_model="gemini-2.5-flash",
                 verdict_models=["gemini-3-flash-preview"],
+                verdict_policy="always",
             )
 
         self.assertIn("1. 核查点：Check the claim.", result.reply)
@@ -821,6 +937,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 pre_model="gemini-3.1-flash-lite",
                 evidence_model="gemini-2.5-flash",
                 verdict_models=["gemini-3-flash-preview"],
+                verdict_policy="always",
             )
 
         self.assertIn("1. 核查点：请核查：A 是否属实？", result.reply)
@@ -908,6 +1025,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 pre_model="gemini-3.1-flash-lite",
                 evidence_model="gemini-2.5-flash",
                 verdict_models=["gemini-3-flash-preview"],
+                verdict_policy="always",
             )
 
         self.assertIn("1. 核查点：请核查：A 是否属实？", result.reply)

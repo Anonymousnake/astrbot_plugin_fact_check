@@ -468,7 +468,7 @@ class FactCheckPlugin(Star):
                         self.config.get("fact_check_verdict_retry_max_output_tokens") or 4096,
                     ),
                     verdict_policy=str(
-                        self.config.get("fact_check_verdict_policy") or "always",
+                        self.config.get("fact_check_verdict_policy") or "risk_based",
                     ),
                     verdict_thinking_level=str(
                         self.config.get("fact_check_verdict_thinking_level") or "medium",
@@ -836,7 +836,7 @@ class FactCheckPlugin(Star):
                     cache_config_value("fact_check_verdict_retry_max_output_tokens", 4096),
                 ),
                 "verdict_policy": str(
-                    cache_config_value("fact_check_verdict_policy", "always"),
+                    cache_config_value("fact_check_verdict_policy", "risk_based"),
                 ),
                 "verdict_thinking_level": str(
                     cache_config_value("fact_check_verdict_thinking_level", "medium"),

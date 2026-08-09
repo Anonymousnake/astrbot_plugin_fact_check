@@ -83,9 +83,9 @@
   "fact_check_verdict_policy": {
     "type": "string",
     "description": "When to run the Gemini 3 evidence-only verdict review",
-    "hint": "always preserves current quality; risk_based limits review to multi-claim or sensitive topics; never sends grounded evidence directly.",
+    "hint": "risk_based reviews multi-claim or sensitive topics; always reviews every result; never sends grounded evidence directly.",
     "options": ["always", "risk_based", "never"],
-    "default": "always"
+    "default": "risk_based"
   },
   "fact_check_verdict_thinking_level": {
     "type": "string",

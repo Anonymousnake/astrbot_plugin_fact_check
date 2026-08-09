@@ -95,6 +95,32 @@ FACT_CHECK_CLAIM_LABELS = (
     "不准确",
     "已核实",
 )
+FACT_CHECK_SUMMARY_LABEL_ALIASES = {
+    "基本属实": "基本可信但需限定",
+    "大体可信": "基本可信但需限定",
+    "基本可信": "基本可信但需限定",
+    "已核实": "可信",
+    "属实": "可信",
+    "真实": "可信",
+    "无法核实": "证据不足",
+    "无法判断": "证据不足",
+    "虚假": "基本不实",
+    "不实": "基本不实",
+    "错误": "基本不实",
+}
+FACT_CHECK_CLAIM_LABEL_ALIASES = {
+    "基本属实": "表述需限定",
+    "大体属实": "表述需限定",
+    "基本可信": "表述需限定",
+    "可信": "已核实",
+    "属实": "已核实",
+    "真实": "已核实",
+    "无法核实": "无法判断",
+    "未知": "无法判断",
+    "虚假": "不准确",
+    "不实": "不准确",
+    "错误": "不准确",
+}
 FOLLOWUP_CHANGE_LABELS = (
     "原结论需要部分修正",
     "原结论部分需要修正",
@@ -320,7 +346,7 @@ def run_fact_check(
     verdict_request_timeout: int = 25,
     verdict_max_output_tokens: int = 2048,
     verdict_retry_max_output_tokens: int = 4096,
-    verdict_policy: str = "always",
+    verdict_policy: str = "risk_based",
     verdict_thinking_level: str = "medium",
     total_timeout_seconds: int = 0,
 ) -> FactCheckResult:
@@ -551,6 +577,7 @@ def run_fact_check(
         extra_parts=main_image_parts,
         request_timeout=main_request_timeout,
     )
+    initial_evidence_body = evidence_body
     try:
         validate_complete_fact_check_result(
             evidence_body,
@@ -564,6 +591,14 @@ def run_fact_check(
             upper=8192,
         )
         if not _retry_budget_available(minimum=5.0):
+            partial_result = build_partial_fact_check_result(
+                bodies=[initial_evidence_body],
+                candidates=deduped,
+                extra_sources=anysearch_evidence.sources,
+                failure_reason=str(exc),
+            )
+            if partial_result is not None:
+                return partial_result
             return FactCheckResult(
                 FAILED_REPLY,
                 f"grounded evidence incomplete and insufficient retry budget: {exc}",
@@ -597,6 +632,14 @@ def run_fact_check(
                 f"model={evidence_used_model} reason={retry_exc}",
                 flush=True,
             )
+            partial_result = build_partial_fact_check_result(
+                bodies=[evidence_body, initial_evidence_body],
+                candidates=deduped,
+                extra_sources=anysearch_evidence.sources,
+                failure_reason=str(retry_exc),
+            )
+            if partial_result is not None:
+                return partial_result
             return FactCheckResult(
                 FAILED_REPLY,
                 f"grounded evidence incomplete after retry: {retry_exc}",
@@ -2342,7 +2385,7 @@ def should_run_verdict_review(
     candidates: list[ClaimCandidate],
     evidence_text: str,
 ) -> bool:
-    normalized = str(policy or "always").strip().lower()
+    normalized = str(policy or "risk_based").strip().lower()
     if normalized == "never":
         return False
     if normalized != "risk_based":
@@ -2350,7 +2393,7 @@ def should_run_verdict_review(
     combined = "\n".join(item.claim for item in candidates) + "\n" + str(evidence_text or "")
     return len(candidates) > 1 or bool(
         re.search(
-            r"(法规|政策|法律|违法|医学|疾病|治疗|药物|金融|投资|证券|安全|事故|伤亡)",
+            r"(法规|政策|法律|违法|医学|疾病|治疗|药物|金融|投资|证券|安全|事故|伤亡|policy|law|legal|medical|disease|treatment|drug|finance|investment|security|accident|injury)",
             combined,
             flags=re.IGNORECASE,
         )
@@ -2492,6 +2535,94 @@ def _parse_fact_check_blocks(
     return blocks
 
 
+def salvage_partial_fact_check_reply(
+    body: dict[str, Any],
+    candidates: list[ClaimCandidate],
+) -> str:
+    """Keep only structurally complete claim blocks from a truncated reply."""
+    text = sanitize_fact_check_reply(extract_text(body).strip())
+    if not text or not candidates:
+        return ""
+
+    completed: list[tuple[int, str, str, str]] = []
+    completed_indexes: set[int] = set()
+    for number, point, conclusions, bases in _parse_fact_check_blocks(text):
+        if not 1 <= number <= len(candidates):
+            continue
+        if len(conclusions) != 1 or len(bases) != 1:
+            continue
+        if not _value_starts_with_allowed_label(conclusions[0], FACT_CHECK_CLAIM_LABELS):
+            continue
+        if not point.strip() or _is_weak_basis(bases[0]):
+            continue
+        completed.append((number, point.strip(), conclusions[0].strip(), bases[0].strip()))
+        completed_indexes.add(number - 1)
+
+    if not completed:
+        return ""
+
+    lines = ["事实核查：部分存疑（模型输出未完整，以下仅保留已完成核查点）"]
+    for output_number, (_, point, conclusion, basis) in enumerate(completed, start=1):
+        lines.extend(
+            (
+                f"{output_number}. 核查点：{point}",
+                f"结论：{conclusion}",
+                f"依据：{basis}",
+            ),
+        )
+    missing = [
+        candidate.claim.strip()
+        for index, candidate in enumerate(candidates)
+        if index not in completed_indexes and candidate.claim.strip()
+    ]
+    if missing:
+        lines.append("未完成核查：" + "；".join(missing))
+    return "\n".join(lines).strip()
+
+
+def build_partial_fact_check_result(
+    *,
+    bodies: list[dict[str, Any]],
+    candidates: list[ClaimCandidate],
+    extra_sources: list[str],
+    failure_reason: str,
+) -> FactCheckResult | None:
+    replies = [
+        salvage_partial_fact_check_reply(body, candidates)
+        for body in bodies
+        if isinstance(body, dict)
+    ]
+    reply = max(
+        (item for item in replies if item),
+        key=lambda item: (item.count("\n结论："), len(item)),
+        default="",
+    )
+    if not reply:
+        return None
+
+    grounding_sources: list[str] = []
+    for body in bodies:
+        if isinstance(body, dict):
+            grounding_sources.extend(extract_sources(body))
+    sources = normalize_fact_check_sources(
+        select_fact_check_sources(
+            grounding_sources,
+            extra_sources,
+            claims=[candidate.claim for candidate in candidates],
+            limit=3,
+        ),
+    )
+    if sources:
+        reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources)
+        reply = append_source_links(reply, sources)
+    return FactCheckResult(
+        reply=reply,
+        reason=f"ok; partial; {failure_reason}",
+        sources=sources,
+        candidates=candidates,
+    )
+
+
 def _is_weak_basis(value: str) -> bool:
     normalized = re.sub(r"\s+", "", str(value or "")).strip("。.!！；;，,")
     if normalized in WEAK_BASIS_VALUES:
@@ -2522,8 +2653,48 @@ def sanitize_fact_check_reply(text: str) -> str:
     cleaned = _split_inline_fact_check_points(cleaned)
     cleaned = _break_inline_fact_check_labels(cleaned)
     cleaned = _normalize_conditional_verdict(cleaned)
+    cleaned = _repair_common_verdict_labels(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def _repair_common_verdict_labels(text: str) -> str:
+    def repair_line(
+        line: str,
+        *,
+        field: str,
+        allowed: tuple[str, ...],
+        aliases: dict[str, str],
+    ) -> str:
+        match = re.match(rf"^(\s*{re.escape(field)}[：:]\s*)(.*)$", line)
+        if not match or _value_starts_with_allowed_label(match.group(2), allowed):
+            return line
+        value = match.group(2)
+        for alias in sorted(aliases, key=len, reverse=True):
+            alias_match = re.match(
+                rf"^{re.escape(alias)}(?=$|[\s，,。；;、:：（(])",
+                value,
+            )
+            if alias_match:
+                return match.group(1) + aliases[alias] + value[alias_match.end() :]
+        return line
+
+    repaired: list[str] = []
+    for line in str(text or "").splitlines():
+        line = repair_line(
+            line,
+            field="事实核查",
+            allowed=FACT_CHECK_SUMMARY_LABELS,
+            aliases=FACT_CHECK_SUMMARY_LABEL_ALIASES,
+        )
+        line = repair_line(
+            line,
+            field="结论",
+            allowed=FACT_CHECK_CLAIM_LABELS,
+            aliases=FACT_CHECK_CLAIM_LABEL_ALIASES,
+        )
+        repaired.append(line)
+    return "\n".join(repaired)
 
 
 def ensure_claim_points_visible(text: str, candidates: list[ClaimCandidate]) -> str:
