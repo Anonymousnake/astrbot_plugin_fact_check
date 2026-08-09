@@ -17,6 +17,7 @@ from fact_check import (
     FactCheckRequest,
     ImageInput,
     append_source_links,
+    append_claim_source_hints,
     build_anysearch_queries,
     compact_source_label,
     collect_anysearch_evidence,
@@ -24,6 +25,7 @@ from fact_check import (
     ensure_claim_points_visible,
     ensure_public_url_target,
     extract_sources,
+    extract_claim_source_map,
     extract_public_urls,
     extract_claims_from_text,
     is_public_http_url,
@@ -150,6 +152,41 @@ class AnysearchEvidenceTests(unittest.TestCase):
             "https://example.org/source-b",
         ])
         self.assertIn("ok; queries=2", evidence.reason)
+
+    def test_anysearch_extracts_at_least_one_page_per_claim_before_filling_slots(self) -> None:
+        extracted_urls: list[str] = []
+
+        def fake_call_tool(*, tool_name, arguments, **kwargs):
+            if tool_name == "batch_search":
+                return (
+                    "## Query 1\n"
+                    "- **URL**: https://a.example/first\n"
+                    "- **URL**: https://a.example/second\n"
+                    "## Query 2\n"
+                    "- **URL**: https://b.example/first\n"
+                )
+            if tool_name == "extract":
+                extracted_urls.append(arguments["url"])
+                return "extracted"
+            raise AssertionError(f"unexpected tool: {tool_name}")
+
+        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+            collect_anysearch_evidence(
+                [ClaimCandidate("A claim"), ClaimCandidate("B claim")],
+                enabled=True,
+                endpoint="https://api.anysearch.com/mcp",
+                api_key="",
+                timeout=5,
+                max_claims=2,
+                max_results_per_claim=3,
+                extract_top_urls=2,
+                max_chars=4000,
+            )
+
+        self.assertEqual(
+            extracted_urls,
+            ["https://a.example/first", "https://b.example/first"],
+        )
 
     def test_anysearch_remote_extract_url_is_not_dns_resolved_locally(self) -> None:
         def fake_call_tool(*, tool_name, arguments, **kwargs):
@@ -381,6 +418,59 @@ class AnysearchEvidenceTests(unittest.TestCase):
             extract_sources(body),
             ["Official：https://gov.example/report"],
         )
+
+    def test_grounding_supports_are_mapped_to_the_claim_they_directly_support(self) -> None:
+        body = {
+            "candidates": [{
+                "groundingMetadata": {
+                    "groundingChunks": [
+                        {"web": {"title": "A report", "uri": "https://a.example/report"}},
+                        {"web": {"title": "B report", "uri": "https://b.example/report"}},
+                    ],
+                    "groundingSupports": [
+                        {
+                            "segment": {"text": "The Alpha launch happened in 2026."},
+                            "groundingChunkIndices": [0],
+                        },
+                        {
+                            "segment": {"text": "The Beta recall was announced yesterday."},
+                            "groundingChunkIndices": [1],
+                        },
+                    ],
+                },
+            }],
+        }
+        claims = [
+            ClaimCandidate("Alpha launch happened in 2026"),
+            ClaimCandidate("Beta recall was announced yesterday"),
+        ]
+
+        mapped = extract_claim_source_map(body, claims)
+
+        self.assertEqual(mapped[0], ["A report：https://a.example/report"])
+        self.assertEqual(mapped[1], ["B report：https://b.example/report"])
+
+    def test_reply_marks_claims_without_direct_grounding_support(self) -> None:
+        reply = (
+            "事实核查：混合结论\n"
+            "1. 核查点：Alpha claim\n"
+            "结论：已核实\n"
+            "依据：有直接证据。\n"
+            "2. 核查点：Beta claim\n"
+            "结论：证据不足\n"
+            "依据：只有间接信息。"
+        )
+
+        rendered = append_claim_source_hints(
+            reply,
+            [
+                ["A report：https://a.example/report"],
+                [],
+            ],
+        )
+
+        self.assertIn("直接来源：A report", rendered)
+        self.assertIn("直接来源：未找到直接支持来源", rendered)
 
     def test_source_selection_prefers_specific_pages_and_domain_diversity(self) -> None:
         selected = select_fact_check_sources(
