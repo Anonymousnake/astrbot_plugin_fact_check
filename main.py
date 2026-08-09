@@ -721,21 +721,9 @@ class FactCheckPlugin(Star):
         )
 
     def _sanitize_forward_text_for_qq(self, text: str) -> str:
-        replacements = {
-            "翻墙": "翻 墙",
-            "网信办": "网 信 办",
-            "国家网络安全法规": "相关网络安全法规",
-            "违规访问": "不合规访问",
-            "Reddit": "R eddit",
-            "r/China_irl": "r / China_irl",
-            "大纪元": "大 纪 元",
-            "VPN": "V PN",
-            "vpn": "v pn",
-        }
-        safe = str(text or "")
-        for source, target in replacements.items():
-            safe = safe.replace(source, target)
-        return safe
+        # A fact-check must not change names or claims merely to satisfy one QQ
+        # transport. The caller already falls back to segmented plain text.
+        return str(text or "")
 
     def _fact_check_forward_result(
         self,
@@ -955,13 +943,15 @@ class FactCheckPlugin(Star):
 
     def _is_fact_check_allowed(self, event: AstrMessageEvent) -> bool:
         if is_plugin_allowed is None:
-            return True
+            return bool(self.config.get("fact_check_access_control_fail_open", False))
         return bool(
             is_plugin_allowed(
                 "fact_check",
                 event,
-                default_allow=True,
-                default_allow_private=True,
+                default_allow=False,
+                default_allow_private=bool(
+                    self.config.get("fact_check_default_allow_private", True),
+                ),
             )
         )
 
@@ -1328,9 +1318,15 @@ class FactCheckPlugin(Star):
     @staticmethod
     def _session_visible_to_event(session: FactCheckSession, event: AstrMessageEvent) -> bool:
         group_id = str(event.get_group_id() or "").strip()
+        sender_id = str(event.get_sender_id() or "").strip()
         if session.group_id:
-            return bool(group_id and group_id == session.group_id)
-        return str(event.get_sender_id() or "").strip() == session.user_id
+            return bool(
+                group_id
+                and group_id == session.group_id
+                and sender_id
+                and sender_id == session.user_id
+            )
+        return bool(sender_id and sender_id == session.user_id)
 
     def _get_cached_result(self, cache_key: str) -> FactCheckResult | None:
         ttl = max(0, int(self.config.get("fact_check_cache_ttl_seconds") or 600))

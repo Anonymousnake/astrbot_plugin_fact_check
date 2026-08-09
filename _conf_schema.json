@@ -5,6 +5,17 @@
     "hint": "Supports quoted text, inline claims, and quoted/inline images on OneBot/AstrBot message chains.",
     "default": true
   },
+  "fact_check_access_control_fail_open": {
+    "type": "bool",
+    "description": "Allow fact-checking if the access-control plugin cannot be loaded",
+    "hint": "Keep disabled so an ACL failure cannot expose an API-consuming command to every group.",
+    "default": false
+  },
+  "fact_check_default_allow_private": {
+    "type": "bool",
+    "description": "Allow private fact-check requests when no explicit ACL rule matches",
+    "default": true
+  },
   "gemini_api_key": {
     "type": "string",
     "description": "Gemini API key for fact-checking",

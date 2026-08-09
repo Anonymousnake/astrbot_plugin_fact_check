@@ -120,6 +120,9 @@ def make_plugin() -> main.FactCheckPlugin:
         "fact_check_total_timeout_seconds": 30,
         "fact_check_image_download_timeout_seconds": 1,
         "fact_check_max_images": 3,
+        # Most experience tests isolate behavior unrelated to the optional ACL
+        # plugin. Production defaults remain fail-closed when ACL is missing.
+        "fact_check_access_control_fail_open": True,
     }
     plugin._reply_cache = {}
     plugin._fact_check_sessions = {}
@@ -133,6 +136,40 @@ def make_plugin() -> main.FactCheckPlugin:
 
 
 class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
+    def test_group_followup_session_is_visible_only_to_its_owner(self) -> None:
+        session = main.FactCheckSession(
+            session_id="fc_abcd1234",
+            created_at=time.time(),
+            group_id="123456",
+            user_id="owner-user",
+            request_data=FactCheckRequest(text="A 事件", trigger_text="/事实核查"),
+            reply="事实核查：可信",
+        )
+        owner_event = SimpleNamespace(
+            get_group_id=lambda: "123456",
+            get_sender_id=lambda: "owner-user",
+        )
+        other_member_event = SimpleNamespace(
+            get_group_id=lambda: "123456",
+            get_sender_id=lambda: "other-user",
+        )
+
+        self.assertTrue(main.FactCheckPlugin._session_visible_to_event(session, owner_event))
+        self.assertFalse(main.FactCheckPlugin._session_visible_to_event(session, other_member_event))
+
+    def test_missing_access_control_fails_closed_by_default(self) -> None:
+        plugin = make_plugin()
+        plugin.config["fact_check_access_control_fail_open"] = False
+
+        with patch("astrbot_plugin_fact_check.main.is_plugin_allowed", None):
+            self.assertFalse(plugin._is_fact_check_allowed(FakeEvent()))
+
+    def test_qq_fallback_does_not_rewrite_fact_check_terms(self) -> None:
+        plugin = make_plugin()
+        text = "网信办回应 VPN 与 Reddit 相关说法。"
+
+        self.assertEqual(plugin._sanitize_forward_text_for_qq(text), text)
+
     async def test_failed_fact_check_is_not_cached_or_saved_for_followup(self) -> None:
         plugin = make_plugin()
         event = FakeEvent(fail_send=False)

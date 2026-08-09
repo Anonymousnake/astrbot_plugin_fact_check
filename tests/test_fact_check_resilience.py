@@ -49,6 +49,12 @@ class LocalImage(Image):
 
 
 class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
+    def test_trigger_requires_a_real_command_boundary(self) -> None:
+        self.assertTrue(fact_check.is_trigger("/factcheck: claim"))
+        self.assertTrue(fact_check.is_trigger("/事实核查 这是真的吗"))
+        self.assertFalse(fact_check.is_trigger("factcheckers are useful"))
+        self.assertFalse(fact_check.is_trigger("事实核查插件更新了"))
+
     def test_gemini_3_uses_default_temperature_and_explicit_thinking_level(self) -> None:
         with patch.object(fact_check, "post_json_with_timeout", return_value={}) as post:
             fact_check.gemini_generate(

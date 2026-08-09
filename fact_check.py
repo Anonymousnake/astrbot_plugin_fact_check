@@ -28,7 +28,7 @@ from PIL import Image
 
 
 TRIGGER_RE = re.compile(
-    r"(?:^|[\s\u00a0\u200b\u200c\u200d/])(?:事实核查|factcheck|fact-check)(?:[\s\u00a0\u200b\u200c\u200d]*|$|[:：])",
+    r"(?:^|[\s\u00a0\u200b\u200c\u200d/])(?:事实核查|factcheck|fact-check)(?=$|[\s\u00a0\u200b\u200c\u200d:：?？!！,，。])",
     re.IGNORECASE,
 )
 NO_CHECKABLE_CLAIM = "无明确事实断言"
