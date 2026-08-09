@@ -29,14 +29,20 @@ from PIL import Image
 try:
     from .evidence_mapping import (
         append_claim_source_hints,
+        claim_text_matches,
+        enforce_evidence_coverage,
         extract_claim_source_map,
         has_grounding_supports,
+        merge_claim_sources,
     )
 except ImportError:
     from evidence_mapping import (
         append_claim_source_hints,
+        claim_text_matches,
+        enforce_evidence_coverage,
         extract_claim_source_map,
         has_grounding_supports,
+        merge_claim_sources,
     )
 
 
@@ -205,6 +211,7 @@ class AnysearchEvidence:
     text: str = ""
     sources: list[str] = field(default_factory=list)
     reason: str = ""
+    claim_sources: list[list[str]] = field(default_factory=list)
 
 
 class IncompleteGenerationError(RuntimeError):
@@ -594,7 +601,7 @@ def run_fact_check(
     try:
         validate_complete_fact_check_result(
             evidence_body,
-            expected_claim_count=len(deduped),
+            expected_claims=deduped,
         )
     except IncompleteGenerationError as exc:
         retry_tokens = _clamp_int(
@@ -637,7 +644,7 @@ def run_fact_check(
             )
             validate_complete_fact_check_result(
                 evidence_body,
-                expected_claim_count=len(deduped),
+                expected_claims=deduped,
             )
         except IncompleteGenerationError as retry_exc:
             print(
@@ -712,7 +719,7 @@ def run_fact_check(
             try:
                 validate_complete_fact_check_result(
                     verdict_body,
-                    expected_claim_count=len(deduped),
+                    expected_claims=deduped,
                 )
             except IncompleteGenerationError as exc:
                 retry_tokens = _clamp_int(
@@ -741,7 +748,7 @@ def run_fact_check(
                 )
                 validate_complete_fact_check_result(
                     verdict_body,
-                    expected_claim_count=len(deduped),
+                    expected_claims=deduped,
                 )
             body, used_model = verdict_body, verdict_model
             print(
@@ -759,18 +766,24 @@ def run_fact_check(
         extract_text(body).strip(),
         deduped,
     )
-    claim_source_map = extract_claim_source_map(evidence_body, deduped)
-    if has_grounding_supports(evidence_body):
-        reply = append_claim_source_hints(reply, claim_source_map)
+    claim_source_map = merge_claim_sources(
+        extract_claim_source_map(evidence_body, deduped),
+        anysearch_evidence.claim_sources,
+    )
+    reply = enforce_evidence_coverage(reply, claim_source_map)
     direct_sources = [source for claim_sources in claim_source_map for source in claim_sources]
+    source_limit = max(3, min(6, len(deduped) * 2))
     sources = normalize_fact_check_sources(
         select_fact_check_sources(
             direct_sources + extract_sources(evidence_body),
             anysearch_evidence.sources,
             claims=[candidate.claim for candidate in deduped],
-            limit=3,
+            limit=source_limit,
         ),
+        limit=source_limit,
     )
+    if has_grounding_supports(evidence_body) or anysearch_evidence.claim_sources:
+        reply = append_claim_source_hints(reply, claim_source_map, sources)
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources[:3])
     reply = append_source_links(reply, sources)
@@ -792,21 +805,23 @@ def run_fact_check(
     )
 
 
-def append_source_links(reply: str, sources: list[str], *, limit: int = 3) -> str:
-    urls: list[str] = []
-    for source in sources:
+def append_source_links(reply: str, sources: list[str], *, limit: int = 6) -> str:
+    indexed_urls: list[tuple[int, str]] = []
+    seen_urls: set[str] = set()
+    for source_index, source in enumerate(sources, start=1):
         for match in URL_RE.finditer(str(source or "")):
             url = normalize_url(match.group(1))
-            if url and is_public_http_url(url) and url not in urls:
-                urls.append(url)
-            if len(urls) >= limit:
+            if url and is_public_http_url(url) and url not in seen_urls:
+                indexed_urls.append((source_index, url))
+                seen_urls.add(url)
+            if len(indexed_urls) >= limit:
                 break
-        if len(urls) >= limit:
+        if len(indexed_urls) >= limit:
             break
-    missing = [url for url in urls if url not in str(reply or "")]
-    if not missing:
+    rendered_reply = str(reply or "").strip()
+    if not indexed_urls or "可核验链接：" in rendered_reply:
         return str(reply or "").strip()
-    links = "\n".join(f"{index}. {url}" for index, url in enumerate(missing, start=1))
+    links = "\n".join(f"[{index}] {url}" for index, url in indexed_urls)
     return f"{str(reply or '').rstrip()}\n可核验链接：\n{links}".strip()
 
 
@@ -1730,6 +1745,16 @@ def collect_anysearch_evidence(
                 search_text,
                 query_count=len(query_payloads),
             )
+            query_claim_indexes: list[list[int]] = []
+            for payload in query_payloads:
+                query_key = re.sub(r"\s+", "", str(payload.get("query") or "")).lower()
+                indexes = [
+                    index
+                    for index, candidate in enumerate(candidates)
+                    if re.sub(r"\s+", "", normalize_anysearch_query(candidate.claim)).lower()
+                    == query_key
+                ]
+                query_claim_indexes.append(indexes)
             extract_limit = max(
                 0,
                 _clamp_int(extract_top_urls, default=2, lower=0, upper=5),
@@ -1772,6 +1797,7 @@ def collect_anysearch_evidence(
 
     excerpts: list[str] = []
     excerpt_sources: list[str] = []
+    claim_sources: list[list[str]] = [[] for _ in candidates]
     for url, extracted, error in extract_results:
         if error:
             print(
@@ -1780,6 +1806,12 @@ def collect_anysearch_evidence(
             )
             continue
         excerpt_sources.append(url)
+        for query_index, group in enumerate(query_url_groups):
+            if url not in group or query_index >= len(query_claim_indexes):
+                continue
+            for claim_index in query_claim_indexes[query_index]:
+                if url not in claim_sources[claim_index]:
+                    claim_sources[claim_index].append(url)
         excerpts.append(f"[{len(excerpts) + 1}] {url}\n{shorten_text(extracted, 1800)}")
 
     sections = [f"搜索摘要：\n{shorten_text(sanitize_anysearch_evidence_text(search_text), 3600)}"]
@@ -1791,6 +1823,7 @@ def collect_anysearch_evidence(
         text=evidence_text,
         sources=sources,
         reason=f"ok; queries={len(query_payloads)} urls={len(urls)} extracts={len(excerpts)}",
+        claim_sources=claim_sources,
     )
 
 
@@ -1856,12 +1889,23 @@ def build_anysearch_queries(
             continue
         seen.add(key)
         payload: dict[str, Any] = {"query": query, "max_results": max_results}
-        if normalized_freshness:
-            payload["freshness"] = normalized_freshness
+        query_freshness = normalized_freshness or infer_anysearch_freshness(candidate.claim)
+        if query_freshness:
+            payload["freshness"] = query_freshness
         if normalized_content_types:
             payload["content_types"] = normalized_content_types
         queries.append(payload)
     return queries
+
+
+def infer_anysearch_freshness(claim: str) -> str:
+    """Use narrow recency filters only when the claim itself is time-sensitive."""
+    text = str(claim or "").lower()
+    if re.search(r"(今天|今日|昨天|昨日|刚刚|突发|实时|最新|目前|当前|now|today|yesterday|breaking|latest)", text):
+        return "day"
+    if re.search(r"(本周|这周|近日|近期|最近|过去几天|this week|recent|past few days)", text):
+        return "week"
+    return ""
 
 
 def normalize_anysearch_query(claim: str) -> str:
@@ -2352,9 +2396,10 @@ def _source_match_terms(text: str) -> set[str]:
     return terms
 
 
-def normalize_fact_check_sources(sources: list[str]) -> list[str]:
+def normalize_fact_check_sources(sources: list[str], *, limit: int = 3) -> list[str]:
     normalized: list[str] = []
-    for source in sources[:3]:
+    source_limit = max(1, min(10, int(limit or 1)))
+    for source in sources[:source_limit]:
         title, url = split_source_title_url(source)
         if is_google_grounding_redirect(url):
             source = title or "Google Search 来源"
@@ -2463,6 +2508,7 @@ def validate_complete_fact_check_result(
     body: dict[str, Any],
     *,
     expected_claim_count: int = 0,
+    expected_claims: list[ClaimCandidate] | None = None,
 ) -> None:
     candidates = body.get("candidates", []) or []
     candidate = candidates[0] if candidates else {}
@@ -2484,7 +2530,11 @@ def validate_complete_fact_check_result(
     blocks = _parse_fact_check_blocks(text)
     if not blocks:
         raise IncompleteGenerationError("missing numbered claim blocks")
-    expected_claim_count = max(0, int(expected_claim_count or 0))
+    expected_claims = list(expected_claims or [])
+    expected_claim_count = max(
+        len(expected_claims),
+        max(0, int(expected_claim_count or 0)),
+    )
     if not expected_claim_count:
         expected_claim_count = len(blocks)
     point_numbers = [block[0] for block in blocks]
@@ -2498,6 +2548,10 @@ def validate_complete_fact_check_result(
     for number, point, conclusions, bases in blocks:
         if not point.strip():
             raise IncompleteGenerationError(f"claim {number} is missing its question")
+        if expected_claims and not claim_text_matches(expected_claims[number - 1], point):
+            raise IncompleteGenerationError(
+                f"claim {number} does not match the expected question",
+            )
         if len(conclusions) != 1:
             raise IncompleteGenerationError(
                 f"claim {number} must have exactly one conclusion",
@@ -2612,7 +2666,11 @@ def salvage_partial_fact_check_reply(
             continue
         if not _value_starts_with_allowed_label(conclusions[0], FACT_CHECK_CLAIM_LABELS):
             continue
-        if not point.strip() or _is_weak_basis(bases[0]):
+        if (
+            not point.strip()
+            or not claim_text_matches(candidates[number - 1], point)
+            or _is_weak_basis(bases[0])
+        ):
             continue
         completed.append((number, point.strip(), conclusions[0].strip(), bases[0].strip()))
         completed_indexes.add(number - 1)

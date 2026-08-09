@@ -24,13 +24,16 @@ from fact_check import (
     dedupe_candidates,
     ensure_claim_points_visible,
     ensure_public_url_target,
+    enforce_evidence_coverage,
     extract_sources,
     extract_claim_source_map,
     extract_public_urls,
     extract_claims_from_text,
+    infer_anysearch_freshness,
     is_public_http_url,
     normalize_anysearch_query,
     normalize_fact_check_sources,
+    merge_claim_sources,
     select_fact_check_sources,
     run_fact_check,
     read_image_input_bytes,
@@ -105,6 +108,20 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertEqual(queries[0]["freshness"], "week")
         self.assertEqual(queries[0]["content_types"], ["web", "news"])
 
+    def test_current_news_claims_get_an_automatic_freshness_filter(self) -> None:
+        self.assertEqual(infer_anysearch_freshness("今天最新发布的政策是什么"), "day")
+        self.assertEqual(infer_anysearch_freshness("本周发生的事故"), "week")
+        self.assertEqual(infer_anysearch_freshness("牛顿何时发表《原理》"), "")
+
+        queries = build_anysearch_queries(
+            [ClaimCandidate("请核查：今天最新发布的政策是否属实？")],
+            max_claims=1,
+            max_results_per_claim=3,
+            freshness="",
+        )
+
+        self.assertEqual(queries[0]["freshness"], "day")
+
     def test_collect_anysearch_evidence_uses_batch_search_and_extracts_public_pages(self) -> None:
         calls: list[tuple[str, dict]] = []
 
@@ -150,6 +167,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence.sources, [
             "https://example.com/source-a",
             "https://example.org/source-b",
+        ])
+        self.assertEqual(evidence.claim_sources, [
+            ["https://example.com/source-a"],
+            ["https://example.org/source-b"],
         ])
         self.assertIn("ok; queries=2", evidence.reason)
 
@@ -329,7 +350,8 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 return_value=AnysearchEvidence(
                     text="搜索摘要：\n- **URL**: https://example.com/source\n- A 事件报道",
                     sources=["https://example.com/source"],
-                    reason="ok; queries=1 urls=1 extracts=0",
+                    reason="ok; queries=1 urls=1 extracts=1",
+                    claim_sources=[["https://example.com/source"]],
                 ),
             ) as collect_evidence,
             patch("fact_check.generate_with_fallback", side_effect=fake_generate_with_fallback),
@@ -471,6 +493,44 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         self.assertIn("直接来源：A report", rendered)
         self.assertIn("直接来源：未找到直接支持来源", rendered)
+
+    def test_claim_source_hints_use_the_same_number_as_clickable_references(self) -> None:
+        reply = (
+            "事实核查：可信\n"
+            "1. 核查点：Alpha claim\n"
+            "结论：已核实\n"
+            "依据：有直接证据。"
+        )
+        source = "A report：https://a.example/report"
+
+        rendered = append_claim_source_hints(reply, [[source]], [source])
+
+        self.assertIn("直接来源：[1] A report", rendered)
+
+    def test_merge_claim_sources_preserves_each_claim_alignment(self) -> None:
+        merged = merge_claim_sources(
+            [["Google A：https://a.example/report"], []],
+            [[], ["https://b.example/report"]],
+        )
+
+        self.assertEqual(merged, [
+            ["Google A：https://a.example/report"],
+            ["https://b.example/report"],
+        ])
+
+    def test_reply_downgrades_high_confidence_claim_without_direct_evidence(self) -> None:
+        reply = (
+            "事实核查：可信\n"
+            "1. 核查点：某项政策已经正式生效。\n"
+            "结论：已核实\n"
+            "依据：搜索结果似乎支持该说法。"
+        )
+
+        guarded = enforce_evidence_coverage(reply, [[]])
+
+        self.assertIn("事实核查：证据不足", guarded)
+        self.assertIn("结论：证据不足", guarded)
+        self.assertNotIn("结论：已核实", guarded)
 
     def test_source_selection_prefers_specific_pages_and_domain_diversity(self) -> None:
         selected = select_fact_check_sources(
@@ -718,10 +778,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
                                     {
                                         "text": (
                                             "事实核查：部分存疑\n"
-                                            "1. 核查点：法规是否存在。\n"
+                                            "1. 核查点：请核查：《人工智能拟人化互动服务管理暂行办法》是否存在及其生效时间是否属实？\n"
                                             "结论：已核实\n"
                                             "依据：法规存在。\n"
-                                            "2. 核查点：是否禁止具体产品。\n"
+                                            "2. 核查点：请核查：该办法是否明确禁止亲密陪伴 AI 与性互硬件销售？\n"
                                             "结论：证据不足\n"
                                             "依据：未找到直接证据支持该具体推论。"
                                         )

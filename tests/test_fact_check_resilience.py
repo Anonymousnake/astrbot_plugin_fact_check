@@ -29,8 +29,21 @@ def complete_single_claim_body(
     claim: str = "测试命题是否属实。",
     conclusion: str = "已核实",
     basis: str = "公开证据支持该命题。",
+    grounded: bool = False,
     **candidate_fields,
 ):
+    if grounded and "groundingMetadata" not in candidate_fields:
+        candidate_fields["groundingMetadata"] = {
+            "groundingChunks": [
+                {"web": {"uri": "https://evidence.example/report", "title": "Evidence report"}},
+            ],
+            "groundingSupports": [
+                {
+                    "segment": {"text": claim},
+                    "groundingChunkIndices": [0],
+                },
+            ],
+        }
     return complete_fact_check_body(
         f"事实核查：{summary}\n"
         f"1. 核查点：{claim}\n"
@@ -111,7 +124,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 fact_check,
                 "extract_claims_from_text",
-                return_value=[fact_check.ClaimCandidate("Check the policy implication.")],
+                return_value=[fact_check.ClaimCandidate("政策及其产品适用推论是否成立。")],
             ),
             patch.object(
                 fact_check,
@@ -119,6 +132,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 return_value=fact_check.AnysearchEvidence(
                     text="网页正文摘录：具体商品适用范围未明确。",
                     sources=["https://example.org/report"],
+                    claim_sources=[["https://example.org/report"]],
                 ),
             ),
             patch.object(
@@ -704,6 +718,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             claim="Check the policy and its product implication.",
             conclusion="已核实",
             basis="政策存在。",
+            grounded=True,
         )
         verdict_response = complete_single_claim_body(
             summary="部分存疑",
@@ -787,6 +802,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             claim="核查 A 事件",
             conclusion="已核实",
             basis="完整证据。",
+            grounded=True,
         )
 
         with (
@@ -820,6 +836,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             claim="核查 A 事件",
             conclusion="已核实",
             basis="完整证据。",
+            grounded=True,
         )
 
         with (
@@ -906,6 +923,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             claim="请核查：A 是否属实？",
             conclusion="表述需限定",
             basis="完整证据。",
+            grounded=True,
         )
         completed_verdict = complete_single_claim_body(
             summary="混合结论",
@@ -988,6 +1006,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             claim="请核查：A 是否属实？",
             conclusion="已核实",
             basis="完整证据。",
+            grounded=True,
         )
         truncated_verdict = {
             "candidates": [{
@@ -1040,6 +1059,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             claim="请核查：A 是否属实？",
             conclusion="已核实",
             basis="完整证据。",
+            grounded=True,
         )
         truncated_verdict = {
             "candidates": [{
@@ -1193,6 +1213,24 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             complete,
             expected_claim_count=2,
         )
+
+    def test_complete_result_rejects_a_numbered_block_for_the_wrong_claim(self) -> None:
+        body = complete_single_claim_body(
+            claim="某明星发布了新专辑。",
+            basis="公开页面包含一段完整说明。",
+        )
+
+        with self.assertRaises(fact_check.IncompleteGenerationError):
+            fact_check.validate_complete_fact_check_result(
+                body,
+                expected_claims=[
+                    fact_check.ClaimCandidate(
+                        claim="某地政府于今日发布了暴雨红色预警。",
+                        source="原始聊天内容",
+                        priority=1,
+                    ),
+                ],
+            )
 
     def test_followup_retries_incomplete_generation_with_larger_budget(self) -> None:
         incomplete = {
