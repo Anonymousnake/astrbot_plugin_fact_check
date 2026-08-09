@@ -41,6 +41,10 @@ from .fact_check import (
     run_fact_check_followup,
     safe_image_log_label,
 )
+from .storage import FactCheckMetricsStore, atomic_write_json, read_json_file
+
+
+FACT_CHECK_PIPELINE_VERSION = "quality-v2"
 
 try:
     from astrbot_plugin_access_control.access_control import is_plugin_allowed
@@ -126,9 +130,13 @@ class FactCheckPlugin(Star):
         self._active_followup_jobs = 0
         self._reply_cache: dict[str, tuple[float, FactCheckResult]] = {}
         self._fact_check_sessions: dict[str, FactCheckSession] = {}
-        self._fact_check_metrics: dict[str, float] = {}
+        self._metrics_store = FactCheckMetricsStore(
+            Path(StarTools.get_data_dir()) / "fact_check_metrics.json",
+        )
         self._cooldown_until = 0.0
-        self._session_store_enabled = True
+        self._session_store_enabled = bool(
+            self.config.get("fact_check_session_store_enabled", True),
+        )
         self._load_fact_check_sessions()
         self._cleanup_forward_failure_dump()
 
@@ -221,6 +229,7 @@ class FactCheckPlugin(Star):
                 success=False,
                 elapsed=time.perf_counter() - started_at,
                 followup=True,
+                failure_stage="followup_timeout",
             )
             logger.error(f"[astrbot-fact-check-followup-error] {label}: {reason}")
             await self._send_fact_check_reply(
@@ -236,6 +245,7 @@ class FactCheckPlugin(Star):
                 success=False,
                 elapsed=time.perf_counter() - started_at,
                 followup=True,
+                failure_stage="followup_exception",
             )
             logger.error(f"[astrbot-fact-check-followup-error] {label}: {exc!r}")
             self._maybe_start_cooldown(reason)
@@ -257,6 +267,7 @@ class FactCheckPlugin(Star):
             success=self._is_successful_result(result),
             elapsed=time.perf_counter() - started_at,
             followup=True,
+            partial=str(result.reason or "").startswith("ok; partial"),
         )
         sent = await self._send_fact_check_reply(
             event,
@@ -314,6 +325,7 @@ class FactCheckPlugin(Star):
                 success=True,
                 elapsed=time.perf_counter() - started_at,
                 cache_hit=True,
+                partial=str(cached_result.reason or "").startswith("ok; partial"),
             )
             await self._send_fact_check_reply(
                 event,
@@ -478,7 +490,11 @@ class FactCheckPlugin(Star):
         except asyncio.TimeoutError:
             elapsed = time.perf_counter() - started_at
             reason = f"timeout after {elapsed:.1f}s"
-            self._record_fact_check_metric(success=False, elapsed=elapsed)
+            self._record_fact_check_metric(
+                success=False,
+                elapsed=elapsed,
+                failure_stage="timeout",
+            )
             logger.error(f"[astrbot-fact-check-error] {label}: {reason}")
             logger.info(f"[astrbot-fact-check-reason] {label}: {reason}")
             await self._send_fact_check_reply(
@@ -493,6 +509,7 @@ class FactCheckPlugin(Star):
             self._record_fact_check_metric(
                 success=False,
                 elapsed=time.perf_counter() - started_at,
+                failure_stage="exception",
             )
             logger.error(f"[astrbot-fact-check-error] {label}: {exc!r}")
             logger.info(f"[astrbot-fact-check-reason] {label}: {reason}")
@@ -515,6 +532,8 @@ class FactCheckPlugin(Star):
         self._record_fact_check_metric(
             success=successful,
             elapsed=time.perf_counter() - started_at,
+            partial=str(result.reason or "").startswith("ok; partial"),
+            failure_stage="pipeline" if not successful else "",
         )
         session_id = None
         if successful:
@@ -810,6 +829,7 @@ class FactCheckPlugin(Star):
             )
         anysearch_api_key = str(self.config.get("fact_check_anysearch_api_key") or "").strip()
         payload = {
+            "pipeline_version": FACT_CHECK_PIPELINE_VERSION,
             "text": request_data.text.strip(),
             "speaker": request_data.speaker.strip(),
             "images": image_records,
@@ -974,23 +994,21 @@ class FactCheckPlugin(Star):
         elapsed: float,
         cache_hit: bool = False,
         followup: bool = False,
+        partial: bool = False,
+        failure_stage: str = "",
     ) -> None:
-        metrics = getattr(self, "_fact_check_metrics", None)
-        if not isinstance(metrics, dict):
-            metrics = {}
-            self._fact_check_metrics = metrics
-        metrics["requests"] = metrics.get("requests", 0.0) + 1
-        result_key = "pipeline_success" if success else "pipeline_failure"
-        metrics[result_key] = metrics.get(result_key, 0.0) + 1
-        metrics["elapsed_total"] = metrics.get("elapsed_total", 0.0) + max(
-            0.0,
-            float(elapsed or 0.0),
+        store = getattr(self, "_metrics_store", None)
+        if not isinstance(store, FactCheckMetricsStore):
+            store = FactCheckMetricsStore(None)
+            self._metrics_store = store
+        outcome = "partial" if partial else ("success" if success else "failure")
+        metrics = store.record(
+            outcome=outcome,
+            elapsed=elapsed,
+            cache_hit=cache_hit,
+            followup=followup,
+            failure_stage=failure_stage,
         )
-        if cache_hit:
-            metrics["cache_hits"] = metrics.get("cache_hits", 0.0) + 1
-        if followup:
-            metrics["followups"] = metrics.get("followups", 0.0) + 1
-
         requests = int(metrics["requests"])
         log_every = max(
             1,
@@ -998,15 +1016,15 @@ class FactCheckPlugin(Star):
         )
         if requests % log_every:
             return
-        average = metrics["elapsed_total"] / max(1, requests)
         logger.info(
             "[astrbot-fact-check-metrics] "
             f"requests={requests} "
-            f"pipeline_success={int(metrics.get('pipeline_success', 0))} "
-            f"pipeline_failure={int(metrics.get('pipeline_failure', 0))} "
+            f"pipeline_success={int(metrics.get('success', 0))} "
+            f"pipeline_partial={int(metrics.get('partial', 0))} "
+            f"pipeline_failure={int(metrics.get('failure', 0))} "
             f"cache_hits={int(metrics.get('cache_hits', 0))} "
             f"followups={int(metrics.get('followups', 0))} "
-            f"avg_seconds={average:.2f}",
+            f"avg_seconds={float(metrics.get('average_seconds', 0.0)):.2f}",
         )
 
     def _remember_fact_check_session(
@@ -1068,20 +1086,10 @@ class FactCheckPlugin(Star):
                 )
             ],
         }
-        temp_path = path.with_suffix(path.suffix + ".tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            temp_path.replace(path)
+            atomic_write_json(path, payload)
         except OSError as exc:
             logger.warning(f"[astrbot-fact-check-session-persist-error] {exc!r}")
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     def _load_fact_check_sessions(self) -> None:
         if not bool(getattr(self, "_session_store_enabled", False)):
@@ -1090,7 +1098,7 @@ class FactCheckPlugin(Star):
         if not path.is_file():
             return
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = read_json_file(path, {})
             records = payload.get("sessions") if isinstance(payload, dict) else []
             loaded: dict[str, FactCheckSession] = {}
             for record in records or []:
@@ -1445,6 +1453,20 @@ class FactCheckPlugin(Star):
         event.set_extra("qq_agent_command_handled", True)
         event.stop_event()
         yield event.plain_result(self._fact_check_usage_text())
+
+    @filter.command("事实核查状态")
+    async def factcheck_status(self, event: AstrMessageEvent):
+        """Show persisted aggregate quality and performance counters."""
+        event.set_extra("qq_agent_command_handled", True)
+        event.stop_event()
+        if not self._is_fact_check_allowed(event):
+            yield event.plain_result("这个群没开事实核查。")
+            return
+        store = getattr(self, "_metrics_store", None)
+        if not isinstance(store, FactCheckMetricsStore):
+            store = FactCheckMetricsStore(None)
+            self._metrics_store = store
+        yield event.plain_result(store.render_status())
 
     @staticmethod
     def _fact_check_usage_text() -> str:

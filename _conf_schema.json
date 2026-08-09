@@ -193,6 +193,12 @@
     "description": "Max persisted fact-check follow-up sessions",
     "default": 50
   },
+  "fact_check_session_store_enabled": {
+    "type": "bool",
+    "description": "Persist follow-up sessions across plugin restarts",
+    "hint": "Stores reply text, checked claims, source links, and group/user ids in the plugin data directory with owner-only file permissions.",
+    "default": true
+  },
   "fact_check_followup_max_output_tokens": {
     "type": "int",
     "description": "Output-token limit for the first grounded follow-up response",

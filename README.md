@@ -7,6 +7,7 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Reply to a message and send `/事实核查`.
 - Send `/事实核查 要核查的内容` directly.
 - English aliases in normal message text: `/factcheck`, `fact-check`.
+- Send `/事实核查状态` to view persisted aggregate success, partial-result, failure, cache, and latency counters.
 
 ## Behavior
 
@@ -14,14 +15,16 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Extracts up to `fact_check_max_images` image URLs from the current or quoted message.
 - Uses a lightweight Gemini model to turn text/images into checkable questions.
 - Uses Gemini 2.5 Flash with Google Search grounding to collect evidence and produce a complete fallback result.
-- Uses Gemini 3 Flash without native grounding to turn that evidence package into a stricter atomic-claim verdict.
+- Uses Gemini 3 Flash without native grounding for multi-claim and high-risk topics by default; ordinary single claims use the grounded result directly.
 - Optionally searches Anysearch for extra pre-retrieval evidence before the grounded check.
 - Formats replies as plain QQ-friendly text with explicit per-point `结论：` lines.
+- Maps Gemini grounding support back to individual claim blocks and marks claims without direct support.
+- Preserves structurally complete claim blocks when a model response is truncated instead of discarding the whole result.
 - Saves cache hits as full fact-check sessions, so replying to cached results still supports follow-up.
 - Falls back to segmented OneBot text when merged-forward sending fails.
 - Accepts images only from trusted local adapter paths or public HTTP(S) URLs; `file://`, `base64://`,
   localhost, and private-network URLs are ignored as user-supplied URLs.
-- Falls back to `这条我现在没查成。` with an optional short reason when extraction or model calls fail.
+- Falls back to `这条我现在没查成。` only when no usable claim block can be recovered.
 
 ## Configuration
 
@@ -31,6 +34,7 @@ Managed by AstrBot WebUI through `_conf_schema.json`.
 - `fact_check_pre_model`: pre-processing model.
 - `fact_check_evidence_model`: grounded evidence-retrieval model, normally `gemini-2.5-flash`.
 - `fact_check_verdict_models`: evidence-only verdict editors, normally `gemini-3-flash-preview`.
+- `fact_check_verdict_policy`: defaults to `risk_based`; use `always` only when every request needs a second verdict pass.
 - `fact_check_verdict_timeout_seconds`: short timeout for the Gemini 3 review; the grounded 2.5 result is sent immediately when it expires or returns no readable text.
 - `fact_check_max_images`: max images per request.
 - `fact_check_max_image_bytes`: max bytes per image download.
@@ -38,6 +42,8 @@ Managed by AstrBot WebUI through `_conf_schema.json`.
 - `fact_check_anysearch_api_key`: optional Anysearch API key. Empty means anonymous access or `ANYSEARCH_API_KEY`.
 - `fact_check_anysearch_extract_top_urls`: number of public result pages to extract into plain-text snippets.
 - `fact_check_show_failure_reason`: append a short friendly reason to failures.
+- `fact_check_session_store_enabled`: persist owner-scoped follow-up sessions across restarts.
+- `fact_check_access_control_fail_open`: keep disabled so an ACL import failure does not expose the command globally.
 
 ## Anysearch evidence mode
 

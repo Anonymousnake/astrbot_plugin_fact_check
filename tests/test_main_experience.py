@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from astrbot.api.message_components import Image, Plain, Reply
 from astrbot_plugin_fact_check.fact_check import ClaimCandidate, FactCheckRequest, FactCheckResult, ImageInput
 from astrbot_plugin_fact_check import main
+from astrbot_plugin_fact_check.storage import FactCheckMetricsStore
 
 
 class FakeBot:
@@ -131,11 +132,35 @@ def make_plugin() -> main.FactCheckPlugin:
     plugin._cooldown_until = 0.0
     plugin._fact_check_semaphore = main.asyncio.Semaphore(1)
     plugin._session_store_enabled = False
+    plugin._metrics_store = FactCheckMetricsStore(None)
     plugin._dump_forward_failure = lambda *args, **kwargs: None
     return plugin
 
 
 class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
+    def test_cache_key_changes_when_pipeline_version_changes(self) -> None:
+        plugin = make_plugin()
+        request = FactCheckRequest(text="A 事件", trigger_text="/事实核查")
+
+        with patch("astrbot_plugin_fact_check.main.FACT_CHECK_PIPELINE_VERSION", "v1"):
+            first = plugin._request_cache_key(request)
+        with patch("astrbot_plugin_fact_check.main.FACT_CHECK_PIPELINE_VERSION", "v2"):
+            second = plugin._request_cache_key(request)
+
+        self.assertNotEqual(first, second)
+
+    async def test_status_command_reports_persisted_aggregate_metrics(self) -> None:
+        plugin = make_plugin()
+        plugin._metrics_store.record(outcome="partial", elapsed=2.0)
+        event = FakeEvent(fail_send=False)
+
+        with patch("astrbot_plugin_fact_check.main.is_plugin_allowed", return_value=True):
+            results = [item async for item in plugin.factcheck_status(event)]
+
+        self.assertTrue(event.stopped)
+        self.assertEqual(len(results), 1)
+        self.assertIn("部分完成：1", results[0]["plain"])
+
     def test_group_followup_session_is_visible_only_to_its_owner(self) -> None:
         session = main.FactCheckSession(
             session_id="fc_abcd1234",
