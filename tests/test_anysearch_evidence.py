@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import unittest
 import sys
+import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,43 +11,43 @@ for astrbot_root in (Path("D:/Codex/AstrBot"), Path("/home/ubuntu/AstrBot")):
     if astrbot_root.exists():
         sys.path.insert(0, str(astrbot_root))
 
+from evidence_mapping import has_strong_claim_evidence
 from fact_check import (
     AnysearchEvidence,
     ClaimCandidate,
     FactCheckRequest,
     ImageInput,
-    append_source_links,
     append_claim_source_hints,
+    append_source_links,
     build_anysearch_queries,
-    compact_source_label,
     collect_anysearch_evidence,
+    compact_source_label,
     dedupe_candidates,
+    enforce_evidence_coverage,
     ensure_claim_points_visible,
     ensure_public_url_target,
-    enforce_evidence_coverage,
-    extract_sources,
+    evidence_text_relevant,
     extract_claim_source_map,
-    extract_public_urls,
     extract_claims_from_text,
+    extract_public_urls,
+    extract_sources,
     infer_anysearch_freshness,
     is_public_http_url,
+    merge_claim_sources,
     normalize_anysearch_query,
     normalize_fact_check_sources,
-    merge_claim_sources,
-    select_fact_check_sources,
-    run_fact_check,
     read_image_input_bytes,
+    run_fact_check,
     sanitize_anysearch_evidence_text,
     sanitize_fact_check_reply,
+    select_fact_check_sources,
 )
 
 
 class AnysearchEvidenceTests(unittest.TestCase):
     def test_ensure_claim_points_visible_restores_omitted_questions(self) -> None:
         reply = (
-            "事实核查：可信\n"
-            "结论：已核实。第一条依据。\n"
-            "结论：部分存疑。第二条依据。"
+            "事实核查：可信\n结论：已核实。第一条依据。\n结论：部分存疑。第二条依据。"
         )
         candidates = [
             ClaimCandidate("第一条待核查问题"),
@@ -58,8 +58,12 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         self.assertIn("1. 核查点：第一条待核查问题", rendered)
         self.assertIn("2. 核查点：第二条待核查问题", rendered)
-        self.assertLess(rendered.index("第一条待核查问题"), rendered.index("结论：已核实"))
-        self.assertLess(rendered.index("第二条待核查问题"), rendered.index("结论：部分存疑"))
+        self.assertLess(
+            rendered.index("第一条待核查问题"), rendered.index("结论：已核实")
+        )
+        self.assertLess(
+            rendered.index("第二条待核查问题"), rendered.index("结论：部分存疑")
+        )
 
     def test_ensure_claim_points_visible_does_not_change_structured_reply(self) -> None:
         reply = "事实核查：可信\n1. 核查点：已有问题\n结论：已核实\n依据：证据。"
@@ -75,7 +79,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
             "美国硅谷今天发生 6.0 级地震",
         )
 
-    def test_extract_public_urls_dedupes_and_safety_filter_blocks_private_urls(self) -> None:
+    def test_extract_public_urls_dedupes_and_safety_filter_blocks_private_urls(
+        self,
+    ) -> None:
         text = """
         ### 1. Example
         - **URL**: https://example.com/a
@@ -122,10 +128,14 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         self.assertEqual(queries[0]["freshness"], "day")
 
-    def test_collect_anysearch_evidence_uses_batch_search_and_extracts_public_pages(self) -> None:
+    def test_collect_anysearch_evidence_uses_batch_search_and_extracts_public_pages(
+        self,
+    ) -> None:
         calls: list[tuple[str, dict]] = []
 
-        def fake_call_tool(*, tool_name, arguments, endpoint, api_key, timeout, max_retries=1, **kwargs):
+        def fake_call_tool(
+            *, tool_name, arguments, endpoint, api_key, timeout, max_retries=1, **kwargs
+        ):
             calls.append((tool_name, arguments))
             if tool_name == "batch_search":
                 return (
@@ -138,7 +148,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
                     "- **URL**: https://unused.example/source-c\n"
                 )
             if tool_name == "extract":
-                return f"## Extracted\n正文来自 {arguments['url']}"
+                return f"## Extracted\nA 事件 B 事件正文来自 {arguments['url']}"
             raise AssertionError(f"unexpected tool: {tool_name}")
 
         with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
@@ -164,17 +174,25 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertNotIn("正文来自 http://127.0.0.1/private", evidence.text)
         self.assertEqual(calls[0][0], "batch_search")
         self.assertEqual([call[0] for call in calls].count("extract"), 2)
-        self.assertEqual(evidence.sources, [
-            "https://example.com/source-a",
-            "https://example.org/source-b",
-        ])
-        self.assertEqual(evidence.claim_sources, [
-            ["https://example.com/source-a"],
-            ["https://example.org/source-b"],
-        ])
+        self.assertEqual(
+            evidence.sources,
+            [
+                "https://example.com/source-a",
+                "https://example.org/source-b",
+            ],
+        )
+        self.assertEqual(
+            evidence.claim_sources,
+            [
+                ["https://example.com/source-a"],
+                ["https://example.org/source-b"],
+            ],
+        )
         self.assertIn("ok; queries=2", evidence.reason)
 
-    def test_anysearch_extracts_at_least_one_page_per_claim_before_filling_slots(self) -> None:
+    def test_anysearch_extracts_at_least_one_page_per_claim_before_filling_slots(
+        self,
+    ) -> None:
         extracted_urls: list[str] = []
 
         def fake_call_tool(*, tool_name, arguments, **kwargs):
@@ -333,7 +351,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
                                         )
                                     }
                                 ]
-                            }
+                            },
                         }
                     ]
                 },
@@ -343,7 +361,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
         with (
             patch(
                 "fact_check.extract_claims_from_text",
-                return_value=[ClaimCandidate("请核查：A 事件是否属实？", "用户文字", 5)],
+                return_value=[
+                    ClaimCandidate("请核查：A 事件是否属实？", "用户文字", 5)
+                ],
             ) as extract_claims,
             patch(
                 "fact_check.collect_anysearch_evidence",
@@ -354,10 +374,15 @@ class AnysearchEvidenceTests(unittest.TestCase):
                     claim_sources=[["https://example.com/source"]],
                 ),
             ) as collect_evidence,
-            patch("fact_check.generate_with_fallback", side_effect=fake_generate_with_fallback),
+            patch(
+                "fact_check.generate_with_fallback",
+                side_effect=fake_generate_with_fallback,
+            ),
         ):
             result = run_fact_check(
-                request_data=FactCheckRequest(text="A 事件是真的", trigger_text="/事实核查"),
+                request_data=FactCheckRequest(
+                    text="A 事件是真的", trigger_text="/事实核查"
+                ),
                 api_key="test-key",
                 base_url="https://example.invalid/models",
                 pre_model="gemini-pre",
@@ -385,7 +410,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertIn("可核验链接：", reply)
         self.assertIn("https://example.com/report", reply)
 
-    def test_google_grounding_redirect_is_omitted_without_network_resolution(self) -> None:
+    def test_google_grounding_redirect_is_omitted_without_network_resolution(
+        self,
+    ) -> None:
         source = (
             "Official report：https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
             "AUZIYExample"
@@ -399,7 +426,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertNotIn("可核验链接：", reply)
         self.assertNotIn("vertexaisearch.cloud.google.com", reply)
 
-    def test_unresolved_google_grounding_redirect_keeps_title_without_long_url(self) -> None:
+    def test_unresolved_google_grounding_redirect_keeps_title_without_long_url(
+        self,
+    ) -> None:
         source = (
             "Official report：https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
             "AUZIYExample"
@@ -412,8 +441,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
     def test_source_normalization_only_keeps_visible_sources(self) -> None:
         sources = [
-            f"Source {index}：https://example{index}.com/report"
-            for index in range(5)
+            f"Source {index}：https://example{index}.com/report" for index in range(5)
         ]
         normalized = normalize_fact_check_sources(sources)
 
@@ -422,18 +450,32 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
     def test_extract_sources_only_uses_chunks_with_grounding_support(self) -> None:
         body = {
-            "candidates": [{
-                "groundingMetadata": {
-                    "groundingChunks": [
-                        {"web": {"title": "Official", "uri": "https://gov.example/report"}},
-                        {"web": {"title": "Unrelated", "uri": "https://other.example/home"}},
-                    ],
-                    "groundingSupports": [{
-                        "segment": {"text": "The claim is supported."},
-                        "groundingChunkIndices": [0],
-                    }],
-                },
-            }],
+            "candidates": [
+                {
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {
+                                "web": {
+                                    "title": "Official",
+                                    "uri": "https://gov.example/report",
+                                }
+                            },
+                            {
+                                "web": {
+                                    "title": "Unrelated",
+                                    "uri": "https://other.example/home",
+                                }
+                            },
+                        ],
+                        "groundingSupports": [
+                            {
+                                "segment": {"text": "The claim is supported."},
+                                "groundingChunkIndices": [0],
+                            }
+                        ],
+                    },
+                }
+            ],
         }
 
         self.assertEqual(
@@ -441,26 +483,44 @@ class AnysearchEvidenceTests(unittest.TestCase):
             ["Official：https://gov.example/report"],
         )
 
-    def test_grounding_supports_are_mapped_to_the_claim_they_directly_support(self) -> None:
+    def test_grounding_supports_are_mapped_to_the_claim_they_directly_support(
+        self,
+    ) -> None:
         body = {
-            "candidates": [{
-                "groundingMetadata": {
-                    "groundingChunks": [
-                        {"web": {"title": "A report", "uri": "https://a.example/report"}},
-                        {"web": {"title": "B report", "uri": "https://b.example/report"}},
-                    ],
-                    "groundingSupports": [
-                        {
-                            "segment": {"text": "The Alpha launch happened in 2026."},
-                            "groundingChunkIndices": [0],
-                        },
-                        {
-                            "segment": {"text": "The Beta recall was announced yesterday."},
-                            "groundingChunkIndices": [1],
-                        },
-                    ],
-                },
-            }],
+            "candidates": [
+                {
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {
+                                "web": {
+                                    "title": "A report",
+                                    "uri": "https://a.example/report",
+                                }
+                            },
+                            {
+                                "web": {
+                                    "title": "B report",
+                                    "uri": "https://b.example/report",
+                                }
+                            },
+                        ],
+                        "groundingSupports": [
+                            {
+                                "segment": {
+                                    "text": "The Alpha launch happened in 2026."
+                                },
+                                "groundingChunkIndices": [0],
+                            },
+                            {
+                                "segment": {
+                                    "text": "The Beta recall was announced yesterday."
+                                },
+                                "groundingChunkIndices": [1],
+                            },
+                        ],
+                    },
+                }
+            ],
         }
         claims = [
             ClaimCandidate("Alpha launch happened in 2026"),
@@ -471,6 +531,48 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         self.assertEqual(mapped[0], ["A report：https://a.example/report"])
         self.assertEqual(mapped[1], ["B report：https://b.example/report"])
+
+    def test_grounding_support_offsets_beat_ambiguous_word_overlap(self) -> None:
+        text = (
+            "事实核查：混合结论\n"
+            "1. 核查点：Alpha policy claim\n结论：已核实\n依据：shared evidence\n"
+            "2. 核查点：Beta policy claim\n结论：已核实\n依据：shared evidence"
+        )
+        second_offset = text.rindex("shared evidence")
+        body = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": text}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {
+                                "web": {
+                                    "title": "Beta source",
+                                    "uri": "https://b.example/report",
+                                }
+                            },
+                        ],
+                        "groundingSupports": [
+                            {
+                                "segment": {
+                                    "text": "shared evidence",
+                                    "startIndex": second_offset,
+                                    "endIndex": second_offset + len("shared evidence"),
+                                },
+                                "groundingChunkIndices": [0],
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+        mapped = extract_claim_source_map(
+            body,
+            [ClaimCandidate("Alpha policy claim"), ClaimCandidate("Beta policy claim")],
+        )
+
+        self.assertEqual(mapped, [[], ["Beta source：https://b.example/report"]])
 
     def test_reply_marks_claims_without_direct_grounding_support(self) -> None:
         reply = (
@@ -494,12 +596,11 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertIn("直接来源：A report", rendered)
         self.assertIn("直接来源：未找到直接支持来源", rendered)
 
-    def test_claim_source_hints_use_the_same_number_as_clickable_references(self) -> None:
+    def test_claim_source_hints_use_the_same_number_as_clickable_references(
+        self,
+    ) -> None:
         reply = (
-            "事实核查：可信\n"
-            "1. 核查点：Alpha claim\n"
-            "结论：已核实\n"
-            "依据：有直接证据。"
+            "事实核查：可信\n1. 核查点：Alpha claim\n结论：已核实\n依据：有直接证据。"
         )
         source = "A report：https://a.example/report"
 
@@ -513,12 +614,17 @@ class AnysearchEvidenceTests(unittest.TestCase):
             [[], ["https://b.example/report"]],
         )
 
-        self.assertEqual(merged, [
-            ["Google A：https://a.example/report"],
-            ["https://b.example/report"],
-        ])
+        self.assertEqual(
+            merged,
+            [
+                ["Google A：https://a.example/report"],
+                ["https://b.example/report"],
+            ],
+        )
 
-    def test_reply_downgrades_high_confidence_claim_without_direct_evidence(self) -> None:
+    def test_reply_downgrades_high_confidence_claim_without_direct_evidence(
+        self,
+    ) -> None:
         reply = (
             "事实核查：可信\n"
             "1. 核查点：某项政策已经正式生效。\n"
@@ -531,6 +637,68 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertIn("事实核查：证据不足", guarded)
         self.assertIn("结论：证据不足", guarded)
         self.assertNotIn("结论：已核实", guarded)
+
+    def test_high_risk_claim_requires_official_or_independent_sources(self) -> None:
+        reply = (
+            "事实核查：可信\n"
+            "1. 核查点：某药物已经获准治疗该疾病。\n"
+            "结论：已核实\n"
+            "依据：有报道支持。"
+        )
+
+        weak = enforce_evidence_coverage(
+            reply,
+            [["普通报道：https://blog.example/report"]],
+            [ClaimCandidate("某药物已经获准治疗该疾病。")],
+        )
+        strong = enforce_evidence_coverage(
+            reply,
+            [["官方公告：https://agency.gov/drug/approval"]],
+            [ClaimCandidate("某药物已经获准治疗该疾病。")],
+        )
+
+        self.assertIn("高风险命题缺少官方来源或多源交叉验证", weak)
+        self.assertIn("结论：已核实", strong)
+        self.assertTrue(
+            has_strong_claim_evidence(
+                [
+                    "报道 A：https://news-a.example/report",
+                    "报道 B：https://news-b.example/report",
+                ]
+            )
+        )
+
+    def test_explicit_source_conflict_blocks_high_confidence_conclusion(self) -> None:
+        reply = (
+            "事实核查：可信\n"
+            "1. 核查点：A 事件已经发生。\n"
+            "结论：已核实\n"
+            "依据：来源说法不一致。\n"
+            "证据关系：来源冲突"
+        )
+
+        guarded = enforce_evidence_coverage(
+            reply,
+            [["A：https://a.example/report", "B：https://b.example/report"]],
+            [ClaimCandidate("A 事件已经发生。")],
+        )
+
+        self.assertIn("结论：部分存疑（直接来源之间存在冲突）", guarded)
+        self.assertIn("事实核查：部分存疑", guarded)
+
+    def test_anysearch_extract_must_overlap_the_claim_to_be_direct_evidence(
+        self,
+    ) -> None:
+        self.assertTrue(
+            evidence_text_relevant(
+                "Alpha launch happened", "Official Alpha launch report"
+            )
+        )
+        self.assertFalse(
+            evidence_text_relevant(
+                "Alpha launch happened", "Unrelated weather forecast"
+            )
+        )
 
     def test_source_selection_prefers_specific_pages_and_domain_diversity(self) -> None:
         selected = select_fact_check_sources(
@@ -545,13 +713,18 @@ class AnysearchEvidenceTests(unittest.TestCase):
             limit=3,
         )
 
-        self.assertEqual(selected, [
-            "Primary report：https://agency.example/report/123",
-            "News report：https://news.example/articles/456",
-        ])
+        self.assertEqual(
+            selected,
+            [
+                "Primary report：https://agency.example/report/123",
+                "News report：https://news.example/articles/456",
+            ],
+        )
 
     def test_source_selection_keeps_distinct_grounding_titles(self) -> None:
-        redirect_root = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        redirect_root = (
+            "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        )
 
         selected = select_fact_check_sources(
             [
@@ -562,13 +735,18 @@ class AnysearchEvidenceTests(unittest.TestCase):
             limit=3,
         )
 
-        self.assertEqual(selected, [
-            f"Official A：{redirect_root}a",
-            f"Official B：{redirect_root}b",
-        ])
+        self.assertEqual(
+            selected,
+            [
+                f"Official A：{redirect_root}a",
+                f"Official B：{redirect_root}b",
+            ],
+        )
 
     def test_source_selection_reserves_a_clickable_extracted_source(self) -> None:
-        redirect_root = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        redirect_root = (
+            "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        )
 
         selected = select_fact_check_sources(
             [
@@ -583,7 +761,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         self.assertEqual(len(selected), 3)
         self.assertIn("Direct report：https://news.example/report/123", selected)
-        self.assertTrue(any("https://news.example/report/123" in source for source in normalized))
+        self.assertTrue(
+            any("https://news.example/report/123" in source for source in normalized)
+        )
 
     def test_source_selection_prefers_official_suffix_without_spoofing(self) -> None:
         selected = select_fact_check_sources(
@@ -598,9 +778,13 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         self.assertEqual(selected[0], "官方判决：https://wenshu.court.gov.cn/case/123")
         self.assertIn("普通博客：https://blog.example/policy", selected)
-        self.assertNotIn("伪官方说明：https://court.gov.cn.evil.example/policy", selected)
+        self.assertNotIn(
+            "伪官方说明：https://court.gov.cn.evil.example/policy", selected
+        )
 
-    def test_source_selection_covers_distinct_claims_before_redundant_sources(self) -> None:
+    def test_source_selection_covers_distinct_claims_before_redundant_sources(
+        self,
+    ) -> None:
         selected = select_fact_check_sources(
             [],
             [
@@ -616,9 +800,13 @@ class AnysearchEvidenceTests(unittest.TestCase):
         )
 
         self.assertIn("签证政策官方说明：https://www.gov.cn/visa/policy", selected)
-        self.assertIn("法院赔偿判决全文：https://court.gov.cn/case/compensation", selected)
+        self.assertIn(
+            "法院赔偿判决全文：https://court.gov.cn/case/compensation", selected
+        )
 
-    def test_source_selection_keeps_unique_claim_evidence_from_the_same_domain(self) -> None:
+    def test_source_selection_keeps_unique_claim_evidence_from_the_same_domain(
+        self,
+    ) -> None:
         alpha_source = (
             "Alpha vaccine efficacy report:"
             "https://research.example/reports/alpha-vaccine-efficacy"
@@ -658,8 +846,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
     def test_dated_official_lookalike_ranks_below_normal_source(self) -> None:
         dated_spoof = (
-            "Dated court lookalike:"
-            "https://court.gov.cn.evil.example/2026/report"
+            "Dated court lookalike:https://court.gov.cn.evil.example/2026/report"
         )
         normal_source = "Independent report:https://news.example/report"
 
@@ -684,7 +871,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertEqual(selected, [normal_source])
 
     def test_shared_entity_alone_does_not_cover_distinct_claims(self) -> None:
-        redirect_root = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        redirect_root = (
+            "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        )
         generic = f"Apple:{redirect_root}apple"
         release = "Apple iPhone release date:https://news.example/apple-iphone-release"
         lawsuit = "Apple antitrust lawsuit:https://law.example/apple-antitrust-lawsuit"
@@ -703,7 +892,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertNotIn(generic, selected)
 
     def test_clickable_fallback_does_not_replace_unique_claim_evidence(self) -> None:
-        redirect_root = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        redirect_root = (
+            "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        )
         alpha_source = f"Alpha vaccine evidence:{redirect_root}alpha"
         beta_source = f"Beta earthquake evidence:{redirect_root}beta"
         unrelated_clickable = "General newsroom:https://news.example/home"
@@ -742,14 +933,16 @@ class AnysearchEvidenceTests(unittest.TestCase):
                                         """
                                     }
                                 ]
-                            }
+                            },
                         }
                     ]
                 },
                 "gemini-test",
             )
 
-        with patch("fact_check.generate_with_fallback", side_effect=fake_generate_with_fallback):
+        with patch(
+            "fact_check.generate_with_fallback", side_effect=fake_generate_with_fallback
+        ):
             claims = extract_claims_from_text(
                 "网传《人工智能拟人化互动服务管理暂行办法》将实施，亲密陪伴 AI 和性互硬件以后不能卖。",
                 model="gemini-pre",
@@ -787,7 +980,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
                                         )
                                     }
                                 ]
-                            }
+                            },
                         }
                     ]
                 },
@@ -798,11 +991,22 @@ class AnysearchEvidenceTests(unittest.TestCase):
             patch(
                 "fact_check.extract_claims_from_text",
                 return_value=[
-                    ClaimCandidate("请核查：《人工智能拟人化互动服务管理暂行办法》是否存在及其生效时间是否属实？", "用户文字", 5),
-                    ClaimCandidate("请核查：该办法是否明确禁止亲密陪伴 AI 与性互硬件销售？", "用户文字", 5),
+                    ClaimCandidate(
+                        "请核查：《人工智能拟人化互动服务管理暂行办法》是否存在及其生效时间是否属实？",
+                        "用户文字",
+                        5,
+                    ),
+                    ClaimCandidate(
+                        "请核查：该办法是否明确禁止亲密陪伴 AI 与性互硬件销售？",
+                        "用户文字",
+                        5,
+                    ),
                 ],
             ),
-            patch("fact_check.generate_with_fallback", side_effect=fake_generate_with_fallback),
+            patch(
+                "fact_check.generate_with_fallback",
+                side_effect=fake_generate_with_fallback,
+            ),
         ):
             result = run_fact_check(
                 request_data=FactCheckRequest(
@@ -816,7 +1020,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
             )
 
         self.assertIn("整体结论最高为“部分存疑”", captured["prompt"])
-        self.assertIn("不要因为任一子事实成立就把整体判成“可信”或“基本可信但需限定”", captured["prompt"])
+        self.assertIn(
+            "不要因为任一子事实成立就把整体判成“可信”或“基本可信但需限定”",
+            captured["prompt"],
+        )
         self.assertIn("已核实 / 条件性成立 / 表述需限定", captured["prompt"])
         self.assertNotIn("已证实 / 未直接证实 / 存疑", captured["prompt"])
         self.assertIn("事实核查：部分存疑", result.reply)
@@ -832,15 +1039,17 @@ class AnysearchEvidenceTests(unittest.TestCase):
                         {
                             "finishReason": "STOP",
                             "content": {
-                                "parts": [{
-                                    "text": (
-                                        "事实核查：证据不足\n"
-                                        "1. 核查点：请核查：A 事件是否属实？\n"
-                                        "结论：证据不足\n"
-                                        "依据：搜索失败但主核查继续。"
-                                    )
-                                }]
-                            }
+                                "parts": [
+                                    {
+                                        "text": (
+                                            "事实核查：证据不足\n"
+                                            "1. 核查点：请核查：A 事件是否属实？\n"
+                                            "结论：证据不足\n"
+                                            "依据：搜索失败但主核查继续。"
+                                        )
+                                    }
+                                ]
+                            },
                         }
                     ]
                 },
@@ -850,13 +1059,23 @@ class AnysearchEvidenceTests(unittest.TestCase):
         with (
             patch(
                 "fact_check.extract_claims_from_text",
-                return_value=[ClaimCandidate("请核查：A 事件是否属实？", "用户文字", 5)],
+                return_value=[
+                    ClaimCandidate("请核查：A 事件是否属实？", "用户文字", 5)
+                ],
             ),
-            patch("fact_check.anysearch_call_tool", side_effect=TimeoutError("simulated timeout")),
-            patch("fact_check.generate_with_fallback", side_effect=fake_generate_with_fallback),
+            patch(
+                "fact_check.anysearch_call_tool",
+                side_effect=TimeoutError("simulated timeout"),
+            ),
+            patch(
+                "fact_check.generate_with_fallback",
+                side_effect=fake_generate_with_fallback,
+            ),
         ):
             result = run_fact_check(
-                request_data=FactCheckRequest(text="A 事件是真的", trigger_text="/事实核查"),
+                request_data=FactCheckRequest(
+                    text="A 事件是真的", trigger_text="/事实核查"
+                ),
                 api_key="test-key",
                 base_url="https://example.invalid/models",
                 pre_model="gemini-pre",
@@ -869,7 +1088,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertNotIn("搜索摘要：", captured["prompt"])
         self.assertNotIn("simulated timeout", captured["prompt"])
 
-    def test_request_cache_key_changes_when_anysearch_retrieval_config_changes(self) -> None:
+    def test_request_cache_key_changes_when_anysearch_retrieval_config_changes(
+        self,
+    ) -> None:
         from astrbot_plugin_fact_check.main import FactCheckPlugin
 
         request = FactCheckRequest(text="A 事件是真的", trigger_text="/事实核查")
@@ -907,7 +1128,9 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertIn("URL：https://example.com/a", cleaned)
 
     def test_sanitize_fact_check_reply_splits_single_line_points(self) -> None:
-        reply = "事实核查：**大致可信**\n要点：1. A 有依据。2. B 证据不足。\n来源：Example"
+        reply = (
+            "事实核查：**大致可信**\n要点：1. A 有依据。2. B 证据不足。\n来源：Example"
+        )
 
         cleaned = sanitize_fact_check_reply(reply)
 
@@ -945,7 +1168,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
         cleaned = sanitize_fact_check_reply(reply)
 
         self.assertIn("1. 核查点：相关法规已经发布。\n结论：已核实。", cleaned)
-        self.assertIn("2. 核查点：私人飞机可以被视为符合绿色投资条件。\n结论：条件性成立。", cleaned)
+        self.assertIn(
+            "2. 核查点：私人飞机可以被视为符合绿色投资条件。\n结论：条件性成立。",
+            cleaned,
+        )
 
     def test_sanitize_fact_check_reply_splits_inline_conclusion_label(self) -> None:
         reply = (
@@ -955,30 +1181,46 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         cleaned = sanitize_fact_check_reply(reply)
 
-        self.assertIn("1. 核查点：私人飞机可以被视为符合绿色投资条件。\n结论：条件性成立。", cleaned)
+        self.assertIn(
+            "1. 核查点：私人飞机可以被视为符合绿色投资条件。\n结论：条件性成立。",
+            cleaned,
+        )
         self.assertIn("\n依据：满足技术筛选条件才适用。", cleaned)
 
-    def test_read_image_input_bytes_rejects_untrusted_url_schemes_without_network(self) -> None:
+    def test_read_image_input_bytes_rejects_untrusted_url_schemes_without_network(
+        self,
+    ) -> None:
         with self.assertRaises(ValueError):
-            read_image_input_bytes(ImageInput(url="base64://QUJD"), max_bytes=10, timeout=1)
+            read_image_input_bytes(
+                ImageInput(url="base64://QUJD"), max_bytes=10, timeout=1
+            )
 
         with patch("fact_check.httpx.Client") as client:
             with self.assertRaises(ValueError):
-                read_image_input_bytes(ImageInput(url="http://127.0.0.1/private.png"), max_bytes=10, timeout=1)
-        client.assert_not_called()
-
-    def test_read_image_input_bytes_rejects_hostname_resolving_to_private_ip(self) -> None:
-        with (
-            patch("fact_check._PUBLIC_HOST_CACHE", {}),
-            patch("fact_check.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.8", 0))]),
-            patch("fact_check.httpx.Client") as client,
-        ):
-            with self.assertRaises(ValueError):
                 read_image_input_bytes(
-                    ImageInput(url="https://private.example/image.png"),
+                    ImageInput(url="http://127.0.0.1/private.png"),
                     max_bytes=10,
                     timeout=1,
                 )
+        client.assert_not_called()
+
+    def test_read_image_input_bytes_rejects_hostname_resolving_to_private_ip(
+        self,
+    ) -> None:
+        with (
+            patch("fact_check._PUBLIC_HOST_CACHE", {}),
+            patch(
+                "fact_check.socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", ("10.0.0.8", 0))],
+            ),
+            patch("fact_check.httpx.Client") as client,
+            self.assertRaises(ValueError),
+        ):
+            read_image_input_bytes(
+                ImageInput(url="https://private.example/image.png"),
+                max_bytes=10,
+                timeout=1,
+            )
 
         client.assert_not_called()
 

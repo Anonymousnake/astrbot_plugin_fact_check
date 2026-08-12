@@ -1,0 +1,22 @@
+[
+  {"name":"no-source-confident","claim":"A 事件已经发生。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":[],"expect_summary":"证据不足","expect_conclusion":"证据不足"},
+  {"name":"low-risk-one-source","claim":"A 公司发布了新产品。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["公司公告：https://company.example/news/1"],"expect_summary":"可信","expect_conclusion":"已核实"},
+  {"name":"medical-official","claim":"该药物已经获准治疗该疾病。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["监管公告：https://agency.gov/drug/1"],"expect_summary":"可信","expect_conclusion":"已核实"},
+  {"name":"medical-single-blog","claim":"该药物已经获准治疗该疾病。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["博客：https://blog.example/drug"],"expect_summary":"证据不足","expect_conclusion":"证据不足"},
+  {"name":"medical-two-domains","claim":"该治疗已经通过临床审批。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["报道甲：https://a.example/medical","报道乙：https://b.example/medical"],"expect_summary":"可信","expect_conclusion":"已核实"},
+  {"name":"policy-official-cn","claim":"该政策已经正式生效。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["政府公报：https://example.gov.cn/policy/1"],"expect_summary":"可信","expect_conclusion":"已核实"},
+  {"name":"policy-single-media","claim":"该政策已经正式生效。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["新闻：https://news.example/policy"],"expect_summary":"证据不足","expect_conclusion":"证据不足"},
+  {"name":"policy-two-independent","claim":"该法规禁止相关销售行为。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["分析甲：https://legal-a.example/report","分析乙：https://legal-b.example/report"],"expect_summary":"可信","expect_conclusion":"已核实"},
+  {"name":"finance-one-source","claim":"该证券投资保证获得固定收益。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["营销页：https://seller.example/return"],"expect_summary":"证据不足","expect_conclusion":"证据不足"},
+  {"name":"finance-independent-refutation","claim":"该证券投资保证获得固定收益。","summary":"基本不实","conclusion":"不准确","relation":"反驳一致","sources":["报道甲：https://finance-a.example/report","报道乙：https://finance-b.example/report"],"expect_summary":"基本不实","expect_conclusion":"不准确"},
+  {"name":"source-conflict","claim":"A 事件已经发生。","summary":"可信","conclusion":"已核实","relation":"来源冲突","sources":["来源甲：https://a.example/report","来源乙：https://b.example/report"],"expect_summary":"部分存疑","expect_conclusion":"部分存疑"},
+  {"name":"policy-source-conflict","claim":"该法律已经废止。","summary":"可信","conclusion":"已核实","relation":"来源冲突","sources":["来源甲：https://a.example/law","来源乙：https://b.example/law"],"expect_summary":"部分存疑","expect_conclusion":"部分存疑"},
+  {"name":"already-insufficient","claim":"未知事件发生。","summary":"证据不足","conclusion":"证据不足","relation":"无直接证据","sources":[],"expect_summary":"证据不足","expect_conclusion":"证据不足"},
+  {"name":"unable-to-judge","claim":"图片中的人物是谁。","summary":"证据不足","conclusion":"无法判断","relation":"无直接证据","sources":[],"expect_summary":"证据不足","expect_conclusion":"无法判断"},
+  {"name":"spoofed-government-domain","claim":"该法规已经实施。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["伪政府站：https://gov.cn.evil.example/law"],"expect_summary":"证据不足","expect_conclusion":"证据不足"},
+  {"name":"who-primary-source","claim":"该疾病已被列为国际卫生紧急事件。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["WHO：https://who.int/emergencies/1"],"expect_summary":"可信","expect_conclusion":"已核实"},
+  {"name":"eu-primary-source","claim":"该法律在欧盟范围生效。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["EU：https://europa.eu/legal/1"],"expect_summary":"可信","expect_conclusion":"已核实"},
+  {"name":"same-domain-duplicates","claim":"该药物已经获批。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["报道一：https://news.example/a","报道二：https://news.example/b"],"expect_summary":"证据不足","expect_conclusion":"证据不足"},
+  {"name":"distinct-grounding-titles","claim":"该政策已经发布。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["公报甲：https://vertexaisearch.cloud.google.com/grounding-api-redirect/a","公报乙：https://vertexaisearch.cloud.google.com/grounding-api-redirect/b"],"expect_summary":"可信","expect_conclusion":"已核实"},
+  {"name":"normal-refutation-one-source","claim":"A 产品于周一发布。","summary":"基本不实","conclusion":"不准确","relation":"反驳一致","sources":["产品记录：https://company.example/releases/a"],"expect_summary":"基本不实","expect_conclusion":"不准确"}
+]

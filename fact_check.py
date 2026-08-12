@@ -14,13 +14,13 @@ import socket
 import threading
 import time
 from collections import Counter
-from datetime import datetime
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -31,6 +31,7 @@ try:
         append_claim_source_hints,
         claim_text_matches,
         enforce_evidence_coverage,
+        evidence_text_relevant,
         extract_claim_source_map,
         has_grounding_supports,
         merge_claim_sources,
@@ -40,6 +41,7 @@ except ImportError:
         append_claim_source_hints,
         claim_text_matches,
         enforce_evidence_coverage,
+        evidence_text_relevant,
         extract_claim_source_map,
         has_grounding_supports,
         merge_claim_sources,
@@ -58,7 +60,9 @@ ANYSEARCH_DEFAULT_ENDPOINT = "https://api.anysearch.com/mcp"
 ANYSEARCH_CONTENT_TYPES = {"web", "news", "doc", "academic", "data"}
 ANYSEARCH_FRESHNESS_VALUES = {"day", "week", "month", "year"}
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-URL_RE = re.compile(r"(?:-\s*\*\*URL\*\*:\s*)?(https?://[^\s<>\]\)\"']+)", re.IGNORECASE)
+URL_RE = re.compile(
+    r"(?:-\s*\*\*URL\*\*:\s*)?(https?://[^\s<>\]\)\"']+)", re.IGNORECASE
+)
 _MODEL_FAILURE_UNTIL: dict[str, float] = {}
 _MODEL_FAILURE_LOCK = threading.Lock()
 _PUBLIC_HOST_CACHE: dict[str, tuple[float, bool]] = {}
@@ -71,9 +75,11 @@ _REQUEST_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar
     "fact_check_request_deadline",
     default=None,
 )
-_GEMINI_HTTP_CLIENT: contextvars.ContextVar[httpx.Client | None] = contextvars.ContextVar(
-    "fact_check_gemini_http_client",
-    default=None,
+_GEMINI_HTTP_CLIENT: contextvars.ContextVar[httpx.Client | None] = (
+    contextvars.ContextVar(
+        "fact_check_gemini_http_client",
+        default=None,
+    )
 )
 META_CLAIM_RE = re.compile(
     r"(系统自动生成|无需核查|不需要核查|不用核查|无法核查|没有必要核查|"
@@ -377,9 +383,15 @@ def run_fact_check(
     # `main_models` keeps the callable backwards-compatible for older tests and
     # third-party callers. New configuration uses one grounded evidence model
     # followed by optional evidence-only verdict editors.
-    legacy_models = [str(model).strip() for model in (main_models or []) if str(model).strip()]
-    evidence_model = str(evidence_model or "").strip() or (legacy_models[0] if legacy_models else "gemini-2.5-flash")
-    verdict_models = [str(model).strip() for model in (verdict_models or []) if str(model).strip()]
+    legacy_models = [
+        str(model).strip() for model in (main_models or []) if str(model).strip()
+    ]
+    evidence_model = str(evidence_model or "").strip() or (
+        legacy_models[0] if legacy_models else "gemini-2.5-flash"
+    )
+    verdict_models = [
+        str(model).strip() for model in (verdict_models or []) if str(model).strip()
+    ]
 
     candidates: list[ClaimCandidate] = []
     text_context = request_data.text.strip()
@@ -398,7 +410,10 @@ def run_fact_check(
     )
     if text_context and not request_data.images:
         text_preprocess_attempted = True
-        print(f"[astrbot-fact-check-stage] text-preprocess start len={len(text_context)} model={pre_model}", flush=True)
+        print(
+            f"[astrbot-fact-check-stage] text-preprocess start len={len(text_context)} model={pre_model}",
+            flush=True,
+        )
         try:
             candidates.extend(
                 extract_claims_from_text(
@@ -414,7 +429,10 @@ def run_fact_check(
                 f"[astrbot-fact-check-text-preprocess-error] {error_label(exc)}",
                 flush=True,
             )
-        print(f"[astrbot-fact-check-stage] text-preprocess done candidates={len(candidates)}", flush=True)
+        print(
+            f"[astrbot-fact-check-stage] text-preprocess done candidates={len(candidates)}",
+            flush=True,
+        )
 
     if request_data.images:
         print(
@@ -461,7 +479,10 @@ def run_fact_check(
                         f"[astrbot-fact-check-text-preprocess-error] {error_label(text_exc)}",
                         flush=True,
                     )
-        print(f"[astrbot-fact-check-stage] image-preprocess done candidates={len(candidates)}", flush=True)
+        print(
+            f"[astrbot-fact-check-stage] image-preprocess done candidates={len(candidates)}",
+            flush=True,
+        )
 
     if text_context and not candidates and not text_preprocess_attempted:
         text_preprocess_attempted = True
@@ -531,7 +552,9 @@ def run_fact_check(
     if main_image_parts:
         image_line = f"参考图片：已附上 {len(main_image_parts)} 张原图。请同时参考图中文字、截图上下文和画面含义。\n"
     elif request_data.images:
-        image_line = "参考图片：原图未成功附上，只能依据前置整理出的核查问题和原始文字判断。\n"
+        image_line = (
+            "参考图片：原图未成功附上，只能依据前置整理出的核查问题和原始文字判断。\n"
+        )
     else:
         image_line = ""
     prompt = f"""你是一个中文事实核查助手。请使用 Google Search grounding 核查下面的聊天内容和核查问题列表。
@@ -562,6 +585,7 @@ def run_fact_check(
 - 如果原文是“可以被视为符合某条件”“在满足条件下适用”“eligible”“aligned”“taxonomy-compatible”这类条件性表述，不要写“已证实”；优先写“条件性成立”或“表述需限定”，并说明条件。
 - 证据不足就明确说不确定，不要硬判。
 - 对复合命题逐项写清“已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断”，不要只回答其中一个子事实。
+- 每个核查点额外写“证据关系：支持一致 / 反驳一致 / 来源冲突 / 仅背景 / 无直接证据”之一；来源存在实质冲突时不得下高置信结论。
 - 不要编造来源。
 
 格式：
@@ -569,6 +593,7 @@ def run_fact_check(
 1. 核查点：...
 结论：...
 依据：...
+证据关系：...
 2. 核查点：...
 结论：...
 依据：...
@@ -682,7 +707,9 @@ def run_fact_check(
         evidence_text=extract_text(evidence_body),
     ):
         evidence_text = shorten_text(extract_text(evidence_body).strip(), 9000)
-        evidence_sources = dedupe_sources(extract_sources(evidence_body) + anysearch_evidence.sources, limit=5)
+        evidence_sources = dedupe_sources(
+            extract_sources(evidence_body) + anysearch_evidence.sources, limit=5
+        )
         grounding_evidence = extract_grounding_evidence(evidence_body)
         verdict_prompt = build_evidence_verdict_prompt(
             request_data=request_data,
@@ -770,8 +797,10 @@ def run_fact_check(
         extract_claim_source_map(evidence_body, deduped),
         anysearch_evidence.claim_sources,
     )
-    reply = enforce_evidence_coverage(reply, claim_source_map)
-    direct_sources = [source for claim_sources in claim_source_map for source in claim_sources]
+    reply = enforce_evidence_coverage(reply, claim_source_map, deduped)
+    direct_sources = [
+        source for claim_sources in claim_source_map for source in claim_sources
+    ]
     source_limit = max(3, min(6, len(deduped) * 2))
     sources = normalize_fact_check_sources(
         select_fact_check_sources(
@@ -785,7 +814,9 @@ def run_fact_check(
     if has_grounding_supports(evidence_body) or anysearch_evidence.claim_sources:
         reply = append_claim_source_hints(reply, claim_source_map, sources)
     if sources and "来源" not in reply:
-        reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources[:3])
+        reply += "\n来源：" + "；".join(
+            compact_source_label(source) for source in sources[:3]
+        )
     reply = append_source_links(reply, sources)
     if used_model in LIGHTWEIGHT_MODELS and reply:
         reply += "\n（主模型繁忙，已用轻量模型核查）"
@@ -835,7 +866,10 @@ def build_evidence_verdict_prompt(
     anysearch_evidence: str = "",
 ) -> str:
     """Build the non-grounded Gemini 3 verdict pass from a grounded evidence package."""
-    sources = "\n".join(f"- {source}" for source in evidence_sources[:5]) or "- No source URL was returned."
+    sources = (
+        "\n".join(f"- {source}" for source in evidence_sources[:5])
+        or "- No source URL was returned."
+    )
     return f"""You are the final Chinese fact-check verdict editor.
 
 Use only the grounded evidence package below. Do not browse, invent sources, or fill gaps with prior knowledge.
@@ -846,32 +880,33 @@ Current time:
 {current_time_context()}
 
 Original chat content:
-{request_data.text or '(image-led request)'}
+{request_data.text or "(image-led request)"}
 
 Checkable claims:
 {format_candidates(candidates)}
 
 <untrusted_evidence>
 Grounded evidence package:
-{evidence_text or '(The grounded model returned no readable text.)'}
+{evidence_text or "(The grounded model returned no readable text.)"}
 
 Grounding support mapping from Google Search:
-{grounding_evidence or '(No grounding support mapping was returned.)'}
+{grounding_evidence or "(No grounding support mapping was returned.)"}
 
 Raw Anysearch excerpts and search snippets:
-{sanitize_anysearch_evidence_text(anysearch_evidence) or '(No Anysearch evidence was returned.)'}
+{sanitize_anysearch_evidence_text(anysearch_evidence) or "(No Anysearch evidence was returned.)"}
 
 Grounded source URLs:
 {sources}
 </untrusted_evidence>
 
 Write a concise Chinese QQ-ready result. Start with "事实核查：" and choose one overall verdict from: 可信 / 基本可信但需限定 / 条件性成立 / 混合结论 / 部分存疑 / 证据不足 / 基本不实 / 表述不准确.
-For every atomic claim, preserve the order of Checkable claims and write this exact three-line block:
+For every atomic claim, preserve the order of Checkable claims and write this exact four-line block:
 1. 核查点：<do not omit or merge the claim>
 结论：<one allowed verdict>
 依据：<short evidence-based reason>
+证据关系：<支持一致 / 反驳一致 / 来源冲突 / 仅背景 / 无直接证据>
 Do not output bare repeated "结论：" lines without their matching "核查点：" lines.
-State clearly when the evidence does not directly support a key inference. End with at most three actual source domains or titles. Do not use Markdown headings, bold, code blocks, or fabricated citations."""
+If direct sources materially disagree, use "来源冲突" and do not give a high-confidence conclusion. State clearly when the evidence does not directly support a key inference. End with at most three actual source domains or titles. Do not use Markdown headings, bold, code blocks, or fabricated citations."""
 
 
 def extract_grounding_evidence(body: dict[str, Any], *, max_chars: int = 6000) -> str:
@@ -929,8 +964,13 @@ def run_fact_check_followup(
     if not api_key:
         return FactCheckResult(FAILED_REPLY, "missing Gemini API key")
 
-    candidate_text = format_candidates(candidates) if candidates else "（上次未保存待核查问题）"
-    source_text = "\n".join(f"- {source}" for source in previous_sources[:5]) or "（上次未提取到来源）"
+    candidate_text = (
+        format_candidates(candidates) if candidates else "（上次未保存待核查问题）"
+    )
+    source_text = (
+        "\n".join(f"- {source}" for source in previous_sources[:5])
+        or "（上次未提取到来源）"
+    )
     prompt = f"""你是中文事实核查追问助手。用户正在追问上一轮事实核查结果。
 
 时间上下文：
@@ -1031,7 +1071,9 @@ def run_fact_check_followup(
         ),
     )
     if sources and "来源" not in reply:
-        reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources)
+        reply += "\n来源：" + "；".join(
+            compact_source_label(source) for source in sources
+        )
     reply = append_source_links(reply, sources)
     if used_model in LIGHTWEIGHT_MODELS and reply:
         reply += "\n（主模型繁忙，已用轻量模型回答追问）"
@@ -1042,7 +1084,9 @@ def run_fact_check_followup(
             sources,
             candidates,
         )
-    return FactCheckResult(reply=reply, reason="ok; follow-up", sources=sources, candidates=candidates)
+    return FactCheckResult(
+        reply=reply, reason="ok; follow-up", sources=sources, candidates=candidates
+    )
 
 
 def extract_claims_from_text(
@@ -1146,7 +1190,10 @@ def extract_claims_from_images(
                     label=item.file_name or item.url or item.path,
                 )
             except Exception as exc:
-                print(f"[astrbot-fact-check-image-download-error] {item.file_name or item.url}: {exc!r}", flush=True)
+                print(
+                    f"[astrbot-fact-check-image-download-error] {item.file_name or item.url}: {exc!r}",
+                    flush=True,
+                )
     if len(parts) == 1:
         return []
     raw = call_gemini_parts(
@@ -1191,7 +1238,9 @@ def generate_with_fallback(
     attempts = max_attempts or max(1, min(3, len(active_models)))
     last_error: Exception | None = None
     last_model = active_models[0]
-    ungrounded = {str(model).strip() for model in (ungrounded_models or []) if str(model).strip()}
+    ungrounded = {
+        str(model).strip() for model in (ungrounded_models or []) if str(model).strip()
+    }
     for attempt in range(attempts):
         model = active_models[min(attempt, len(active_models) - 1)]
         last_model = model
@@ -1217,7 +1266,11 @@ def generate_with_fallback(
                 exc,
                 cooldown_seconds=model_failure_cooldown_seconds,
             )
-            if not is_retryable(exc) or attempt >= attempts - 1 or not _retry_budget_available():
+            if (
+                not is_retryable(exc)
+                or attempt >= attempts - 1
+                or not _retry_budget_available()
+            ):
                 break
             next_model = active_models[min(attempt + 1, len(active_models) - 1)]
             wait = backoff_seconds(attempt, exc)
@@ -1225,8 +1278,7 @@ def generate_with_fallback(
                 "[astrbot-fact-check-retry] "
                 f"attempt={attempt + 1}/{attempts} model={model} next={next_model} "
                 f"grounding={'on' if model_grounding else 'off'} "
-                f"wait={wait:.1f}s error={error_label(exc)}"
-                ,
+                f"wait={wait:.1f}s error={error_label(exc)}",
                 flush=True,
             )
             _sleep_with_deadline(wait)
@@ -1242,11 +1294,15 @@ def _available_models(models: list[str]) -> list[str]:
         for model, until in list(_MODEL_FAILURE_UNTIL.items()):
             if until <= now:
                 _MODEL_FAILURE_UNTIL.pop(model, None)
-        active = [model for model in models if _MODEL_FAILURE_UNTIL.get(model, 0.0) <= now]
+        active = [
+            model for model in models if _MODEL_FAILURE_UNTIL.get(model, 0.0) <= now
+        ]
     return active
 
 
-def _mark_model_unavailable(model: str, exc: Exception, *, cooldown_seconds: int) -> None:
+def _mark_model_unavailable(
+    model: str, exc: Exception, *, cooldown_seconds: int
+) -> None:
     if cooldown_seconds <= 0 or not _is_model_capacity_error(exc):
         return
     seconds = max(1, int(cooldown_seconds))
@@ -1417,7 +1473,10 @@ def append_unique_inline_parts(
     for part in new_parts:
         payload = ((part.get("inline_data") or {}).get("data") or "").strip()
         if payload and payload in seen_payloads:
-            print(f"[astrbot-fact-check-image-{stage}-dedupe] skipped duplicate {label}", flush=True)
+            print(
+                f"[astrbot-fact-check-image-{stage}-dedupe] skipped duplicate {label}",
+                flush=True,
+            )
             continue
         payload_bytes = inline_image_payload_size(part)
         if max_total_bytes > 0 and total_bytes + payload_bytes > max_total_bytes:
@@ -1487,7 +1546,9 @@ def safe_image_log_label(item: ImageInput) -> str:
     else:
         name = Path(raw_name).name
     if not name and item.path:
-        name = Path(str(item.path).removeprefix("file:///").removeprefix("file://")).name
+        name = Path(
+            str(item.path).removeprefix("file:///").removeprefix("file://")
+        ).name
     if not name and item.url:
         parsed = urlparse(item.url)
         name = Path(parsed.path).name or str(parsed.hostname or "image")
@@ -1580,7 +1641,9 @@ def encode_image_chunk_under_limit(image: Image.Image, *, max_bytes: int) -> byt
     resized.save(output, format="JPEG", quality=50, optimize=True)
     body = output.getvalue()
     if len(body) > max_bytes:
-        raise ValueError(f"image chunk too large after compression: {len(body)} bytes > limit {max_bytes}")
+        raise ValueError(
+            f"image chunk too large after compression: {len(body)} bytes > limit {max_bytes}"
+        )
     return body
 
 
@@ -1598,7 +1661,12 @@ def parse_candidates(text: str, *, limit: int) -> list[ClaimCandidate]:
         cleaned = text.strip().strip('"“”')
         return [ClaimCandidate(cleaned[:1000], "text", 3)] if cleaned else []
     if isinstance(payload, dict):
-        payload = payload.get("claims") or payload.get("candidates") or payload.get("questions") or []
+        payload = (
+            payload.get("claims")
+            or payload.get("candidates")
+            or payload.get("questions")
+            or []
+        )
     if not isinstance(payload, list):
         return []
     candidates: list[ClaimCandidate] = []
@@ -1609,7 +1677,9 @@ def parse_candidates(text: str, *, limit: int) -> list[ClaimCandidate]:
             source = "text"
             priority = 3
         elif isinstance(item, dict):
-            claim = str(item.get("question") or item.get("claim") or item.get("text") or "").strip()
+            claim = str(
+                item.get("question") or item.get("claim") or item.get("text") or ""
+            ).strip()
             source = str(item.get("source") or "").strip() or "unknown"
             try:
                 priority = int(item.get("priority") or 3)
@@ -1624,7 +1694,9 @@ def parse_candidates(text: str, *, limit: int) -> list[ClaimCandidate]:
         if key in seen:
             continue
         seen.add(key)
-        candidates.append(ClaimCandidate(claim[:1000], source[:120], max(1, min(priority, 5))))
+        candidates.append(
+            ClaimCandidate(claim[:1000], source[:120], max(1, min(priority, 5)))
+        )
         if len(candidates) >= limit:
             break
     return sorted(candidates, key=lambda x: x.priority, reverse=True)
@@ -1642,7 +1714,9 @@ def _is_meta_claim(claim: str) -> bool:
     return False
 
 
-def dedupe_candidates(candidates: list[ClaimCandidate], *, limit: int) -> list[ClaimCandidate]:
+def dedupe_candidates(
+    candidates: list[ClaimCandidate], *, limit: int
+) -> list[ClaimCandidate]:
     deduped: list[ClaimCandidate] = []
     seen: set[str] = set()
     for item in sorted(candidates, key=lambda x: x.priority, reverse=True):
@@ -1668,13 +1742,19 @@ def _candidate_dedupe_keys(claim: str) -> set[str]:
 
 def _compact_claim_key(text: str) -> str:
     text = str(text or "").lower()
-    text = re.sub(r"(请核查|是否属实|是否准确|是否真实|是否正确|事实是否准确)", "", text)
+    text = re.sub(
+        r"(请核查|是否属实|是否准确|是否真实|是否正确|事实是否准确)", "", text
+    )
     text = re.sub(r"(可以被视为|可被视为|符合|条件|属实|准确|真实|正确)", "", text)
-    return re.sub(r"[\s\u00a0\u200b\u200c\u200d:：，,。.!！?？；;、/（）()《》“”\"'\-]+", "", text)
+    return re.sub(
+        r"[\s\u00a0\u200b\u200c\u200d:：，,。.!！?？；;、/（）()《》“”\"'\-]+", "", text
+    )
 
 
 def _claim_tokens(compact: str) -> set[str]:
-    tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", compact, flags=re.IGNORECASE))
+    tokens = set(
+        re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", compact, flags=re.IGNORECASE)
+    )
     stopwords = {"请核查", "是否属实", "是否准确", "可以", "被视为", "符合", "条件"}
     return {token for token in tokens if token not in stopwords}
 
@@ -1740,7 +1820,11 @@ def collect_anysearch_evidence(
                     endpoint_validated=True,
                 )
 
-            urls = [url for url in extract_public_urls(search_text) if is_public_http_url(url)]
+            urls = [
+                url
+                for url in extract_public_urls(search_text)
+                if is_public_http_url(url)
+            ]
             query_url_groups = extract_anysearch_urls_by_query(
                 search_text,
                 query_count=len(query_payloads),
@@ -1751,7 +1835,9 @@ def collect_anysearch_evidence(
                 indexes = [
                     index
                     for index, candidate in enumerate(candidates)
-                    if re.sub(r"\s+", "", normalize_anysearch_query(candidate.claim)).lower()
+                    if re.sub(
+                        r"\s+", "", normalize_anysearch_query(candidate.claim)
+                    ).lower()
                     == query_key
                 ]
                 query_claim_indexes.append(indexes)
@@ -1759,7 +1845,9 @@ def collect_anysearch_evidence(
                 0,
                 _clamp_int(extract_top_urls, default=2, lower=0, upper=5),
             )
-            extract_urls = select_round_robin_urls(query_url_groups, limit=extract_limit)
+            extract_urls = select_round_robin_urls(
+                query_url_groups, limit=extract_limit
+            )
             if not extract_urls:
                 extract_urls = urls[:extract_limit]
             request_deadline = _REQUEST_DEADLINE.get()
@@ -1810,14 +1898,24 @@ def collect_anysearch_evidence(
             if url not in group or query_index >= len(query_claim_indexes):
                 continue
             for claim_index in query_claim_indexes[query_index]:
-                if url not in claim_sources[claim_index]:
+                if (
+                    evidence_text_relevant(candidates[claim_index], extracted)
+                    and url not in claim_sources[claim_index]
+                ):
                     claim_sources[claim_index].append(url)
         excerpts.append(f"[{len(excerpts) + 1}] {url}\n{shorten_text(extracted, 1800)}")
 
-    sections = [f"搜索摘要：\n{shorten_text(sanitize_anysearch_evidence_text(search_text), 3600)}"]
+    sections = [
+        f"搜索摘要：\n{shorten_text(sanitize_anysearch_evidence_text(search_text), 3600)}"
+    ]
     if excerpts:
-        sections.append("网页正文摘录：\n" + sanitize_anysearch_evidence_text("\n\n".join(excerpts)))
-    evidence_text = shorten_text("\n\n".join(sections), _clamp_int(max_chars, default=6000, lower=1000, upper=12000))
+        sections.append(
+            "网页正文摘录：\n" + sanitize_anysearch_evidence_text("\n\n".join(excerpts))
+        )
+    evidence_text = shorten_text(
+        "\n\n".join(sections),
+        _clamp_int(max_chars, default=6000, lower=1000, upper=12000),
+    )
     sources = dedupe_sources(excerpt_sources or urls, limit=8)
     return AnysearchEvidence(
         text=evidence_text,
@@ -1889,7 +1987,9 @@ def build_anysearch_queries(
             continue
         seen.add(key)
         payload: dict[str, Any] = {"query": query, "max_results": max_results}
-        query_freshness = normalized_freshness or infer_anysearch_freshness(candidate.claim)
+        query_freshness = normalized_freshness or infer_anysearch_freshness(
+            candidate.claim
+        )
         if query_freshness:
             payload["freshness"] = query_freshness
         if normalized_content_types:
@@ -1901,9 +2001,14 @@ def build_anysearch_queries(
 def infer_anysearch_freshness(claim: str) -> str:
     """Use narrow recency filters only when the claim itself is time-sensitive."""
     text = str(claim or "").lower()
-    if re.search(r"(今天|今日|昨天|昨日|刚刚|突发|实时|最新|目前|当前|now|today|yesterday|breaking|latest)", text):
+    if re.search(
+        r"(今天|今日|昨天|昨日|刚刚|突发|实时|最新|目前|当前|now|today|yesterday|breaking|latest)",
+        text,
+    ):
         return "day"
-    if re.search(r"(本周|这周|近日|近期|最近|过去几天|this week|recent|past few days)", text):
+    if re.search(
+        r"(本周|这周|近日|近期|最近|过去几天|this week|recent|past few days)", text
+    ):
         return "week"
     return ""
 
@@ -1966,20 +2071,28 @@ def anysearch_call_tool(
                 if "error" in data:
                     error = data["error"]
                     if isinstance(error, dict):
-                        message = error.get("message") or json.dumps(error, ensure_ascii=False)
+                        message = error.get("message") or json.dumps(
+                            error, ensure_ascii=False
+                        )
                     else:
                         message = str(error)
                     raise RuntimeError(f"Anysearch API error: {message}")
                 return extract_anysearch_text(data)
             except httpx.HTTPStatusError as exc:
                 last_error = exc
-                if not is_retryable(exc) or attempt >= max_retries or not _retry_budget_available():
+                if (
+                    not is_retryable(exc)
+                    or attempt >= max_retries
+                    or not _retry_budget_available()
+                ):
                     raise
             except (httpx.RequestError, json.JSONDecodeError, RuntimeError) as exc:
                 last_error = exc
                 if attempt >= max_retries or not _retry_budget_available():
                     raise
-            wait = backoff_seconds(attempt, last_error or RuntimeError("Anysearch request failed"))
+            wait = backoff_seconds(
+                attempt, last_error or RuntimeError("Anysearch request failed")
+            )
             print(
                 "[astrbot-fact-check-anysearch-retry] "
                 f"attempt={attempt + 1}/{max_retries + 1} tool={tool_name} "
@@ -2066,17 +2179,15 @@ def ensure_public_url_target(url: str) -> None:
     )
     try:
         records = future.result(timeout=_bounded_timeout(3.0))
-        addresses = {
-            item[4][0]
-            for item in records
-            if item and item[4]
-        }
+        addresses = {item[4][0] for item in records if item and item[4]}
     except concurrent.futures.TimeoutError as exc:
         future.cancel()
         raise ValueError(f"URL hostname resolution timed out: {host}") from exc
     except OSError as exc:
         raise ValueError(f"URL hostname could not be resolved: {host}") from exc
-    public = bool(addresses) and all(ipaddress.ip_address(address).is_global for address in addresses)
+    public = bool(addresses) and all(
+        ipaddress.ip_address(address).is_global for address in addresses
+    )
     with _PUBLIC_HOST_CACHE_LOCK:
         _PUBLIC_HOST_CACHE[host] = (now, public)
     if not public:
@@ -2120,11 +2231,11 @@ def select_fact_check_sources(
         if len(candidates) >= 20:
             break
 
-    claim_terms = [_source_match_terms(claim) for claim in (claims or []) if str(claim).strip()]
+    claim_terms = [
+        _source_match_terms(claim) for claim in (claims or []) if str(claim).strip()
+    ]
     term_claim_counts = Counter(
-        term
-        for terms_for_claim in claim_terms
-        for term in terms_for_claim
+        term for terms_for_claim in claim_terms for term in terms_for_claim
     )
     distinguishing_claim_terms = [
         {term for term in terms_for_claim if term_claim_counts[term] == 1}
@@ -2136,8 +2247,7 @@ def select_fact_check_sources(
         title, url = split_source_title_url(source)
         parsed = urlparse(url) if url else None
         domain = str(parsed.hostname or "").strip(".").lower() if parsed else ""
-        if domain.startswith("www."):
-            domain = domain[4:]
+        domain = domain.removeprefix("www.")
         if is_google_grounding_redirect(url):
             domain = ""
         domain_group = _source_domain_group(domain)
@@ -2215,8 +2325,7 @@ def select_fact_check_sources(
         covering = [
             details
             for details in ranked
-            if details not in selected
-            and details[4].intersection(uncovered_claims)
+            if details not in selected and details[4].intersection(uncovered_claims)
         ]
         if not covering:
             break
@@ -2295,7 +2404,9 @@ def _host_matches_suffix(host: str, suffix: str) -> bool:
 
 
 def _is_official_source_domain(host: str) -> bool:
-    return any(_host_matches_suffix(host, suffix) for suffix in _OFFICIAL_DOMAIN_SUFFIXES)
+    return any(
+        _host_matches_suffix(host, suffix) for suffix in _OFFICIAL_DOMAIN_SUFFIXES
+    )
 
 
 def _looks_like_official_domain_spoof(host: str) -> bool:
@@ -2310,8 +2421,7 @@ def _looks_like_official_domain_spoof(host: str) -> bool:
 
 def _source_domain_group(host: str) -> str:
     normalized = str(host or "").strip(".").lower()
-    if normalized.startswith("www."):
-        normalized = normalized[4:]
+    normalized = normalized.removeprefix("www.")
     if not normalized:
         return ""
     for suffix in sorted(_OFFICIAL_DOMAIN_SUFFIXES, key=len, reverse=True):
@@ -2424,8 +2534,9 @@ def split_source_title_url(source: str) -> tuple[str, str]:
 def is_google_grounding_redirect(url: str) -> bool:
     parsed = urlparse(str(url or ""))
     return (
-        (parsed.hostname or "").lower() == "vertexaisearch.cloud.google.com"
-        and parsed.path.startswith("/grounding-api-redirect/")
+        parsed.hostname or ""
+    ).lower() == "vertexaisearch.cloud.google.com" and parsed.path.startswith(
+        "/grounding-api-redirect/"
     )
 
 
@@ -2441,8 +2552,7 @@ def compact_source_label(source: str) -> str:
     parsed = urlparse(url_text)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         host = parsed.hostname or parsed.netloc
-        if host.startswith("www."):
-            host = host[4:]
+        host = host.removeprefix("www.")
         path_parts = [part for part in parsed.path.strip("/").split("/") if part][:2]
         label = host + ("/" + "/".join(path_parts) if path_parts else "")
         return shorten_text(label, 60).replace("\n", " ")
@@ -2469,7 +2579,9 @@ def extract_text(body: dict[str, Any]) -> str:
     candidates = body.get("candidates", []) or []
     candidate = candidates[0] if candidates else {}
     parts = (candidate.get("content") or {}).get("parts") or []
-    text = "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict))
+    text = "".join(
+        str(part.get("text") or "") for part in parts if isinstance(part, dict)
+    )
     return strip_thinking(text)
 
 
@@ -2480,7 +2592,9 @@ def generation_diagnostics(body: dict[str, Any]) -> str:
     finish = str(candidate.get("finishReason") or "unspecified")
     output_tokens = usage.get("candidatesTokenCount", "?")
     thought_tokens = usage.get("thoughtsTokenCount", "?")
-    return f"finish={finish} output_tokens={output_tokens} thought_tokens={thought_tokens}"
+    return (
+        f"finish={finish} output_tokens={output_tokens} thought_tokens={thought_tokens}"
+    )
 
 
 def should_run_verdict_review(
@@ -2494,7 +2608,9 @@ def should_run_verdict_review(
         return False
     if normalized != "risk_based":
         return True
-    combined = "\n".join(item.claim for item in candidates) + "\n" + str(evidence_text or "")
+    combined = (
+        "\n".join(item.claim for item in candidates) + "\n" + str(evidence_text or "")
+    )
     return len(candidates) > 1 or bool(
         re.search(
             r"(法规|政策|法律|违法|医学|疾病|治疗|药物|金融|投资|证券|安全|事故|伤亡|policy|law|legal|medical|disease|treatment|drug|finance|investment|security|accident|injury)",
@@ -2548,7 +2664,9 @@ def validate_complete_fact_check_result(
     for number, point, conclusions, bases in blocks:
         if not point.strip():
             raise IncompleteGenerationError(f"claim {number} is missing its question")
-        if expected_claims and not claim_text_matches(expected_claims[number - 1], point):
+        if expected_claims and not claim_text_matches(
+            expected_claims[number - 1], point
+        ):
             raise IncompleteGenerationError(
                 f"claim {number} does not match the expected question",
             )
@@ -2587,7 +2705,9 @@ def validate_complete_followup_result(body: dict[str, Any]) -> None:
         if not re.search(rf"(?:^|\n){re.escape(field)}[：:]\s*\S+", text)
     ]
     if missing:
-        raise IncompleteGenerationError("missing follow-up fields: " + ",".join(missing))
+        raise IncompleteGenerationError(
+            "missing follow-up fields: " + ",".join(missing)
+        )
     change_match = re.search(
         r"(?:^|\n)是否改变原结论[：:]\s*([^\n]+)",
         text,
@@ -2606,7 +2726,9 @@ def _value_starts_with_allowed_label(
     allowed_labels: tuple[str, ...],
 ) -> bool:
     normalized = str(value or "").strip().replace("**", "")
-    labels = "|".join(re.escape(label) for label in sorted(allowed_labels, key=len, reverse=True))
+    labels = "|".join(
+        re.escape(label) for label in sorted(allowed_labels, key=len, reverse=True)
+    )
     return bool(
         re.match(
             rf"^(?:{labels})(?=$|[\s，,。；;、:：（(])",
@@ -2664,7 +2786,9 @@ def salvage_partial_fact_check_reply(
             continue
         if len(conclusions) != 1 or len(bases) != 1:
             continue
-        if not _value_starts_with_allowed_label(conclusions[0], FACT_CHECK_CLAIM_LABELS):
+        if not _value_starts_with_allowed_label(
+            conclusions[0], FACT_CHECK_CLAIM_LABELS
+        ):
             continue
         if (
             not point.strip()
@@ -2672,7 +2796,9 @@ def salvage_partial_fact_check_reply(
             or _is_weak_basis(bases[0])
         ):
             continue
-        completed.append((number, point.strip(), conclusions[0].strip(), bases[0].strip()))
+        completed.append(
+            (number, point.strip(), conclusions[0].strip(), bases[0].strip())
+        )
         completed_indexes.add(number - 1)
 
     if not completed:
@@ -2730,7 +2856,9 @@ def build_partial_fact_check_result(
         ),
     )
     if sources:
-        reply += "\n来源：" + "；".join(compact_source_label(source) for source in sources)
+        reply += "\n来源：" + "；".join(
+            compact_source_label(source) for source in sources
+        )
         reply = append_source_links(reply, sources)
     return FactCheckResult(
         reply=reply,
@@ -2744,7 +2872,9 @@ def _is_weak_basis(value: str) -> bool:
     normalized = re.sub(r"\s+", "", str(value or "")).strip("。.!！；;，,")
     if normalized in WEAK_BASIS_VALUES:
         return True
-    return bool(re.fullmatch(r"(?:见|参见)(?:上述|上方|前述)?(?:来源|链接|证据)", normalized))
+    return bool(
+        re.fullmatch(r"(?:见|参见)(?:上述|上方|前述)?(?:来源|链接|证据)", normalized)
+    )
 
 
 def validate_complete_verdict(body: dict[str, Any]) -> None:
@@ -2758,7 +2888,9 @@ def sanitize_anysearch_evidence_text(text: str) -> str:
     for raw_line in safe_text.splitlines():
         line = raw_line.strip()
         line = re.sub(r"^#{1,6}\s*", "", line)
-        line = re.sub(r"^\s*[-*]\s*\*\*URL\*\*\s*[:：]\s*", "URL：", line, flags=re.IGNORECASE)
+        line = re.sub(
+            r"^\s*[-*]\s*\*\*URL\*\*\s*[:：]\s*", "URL：", line, flags=re.IGNORECASE
+        )
         line = re.sub(r"^\s*[-*]\s*\*\*([^*]+)\*\*\s*[:：]\s*", r"\1：", line)
         line = line.replace("**", "")
         cleaned_lines.append(line)
@@ -2820,15 +2952,15 @@ def ensure_claim_points_visible(text: str, candidates: list[ClaimCandidate]) -> 
     if not cleaned or not candidates:
         return cleaned
 
-    point_count = len(re.findall(r"^\s*\d+\.\s*核查点[:：]", cleaned, flags=re.MULTILINE))
+    point_count = len(
+        re.findall(r"^\s*\d+\.\s*核查点[:：]", cleaned, flags=re.MULTILINE)
+    )
     if point_count:
         return cleaned
 
     lines = cleaned.splitlines()
     conclusion_indexes = [
-        index
-        for index, line in enumerate(lines)
-        if re.match(r"^\s*结论[:：]", line)
+        index for index, line in enumerate(lines) if re.match(r"^\s*结论[:：]", line)
     ]
     if len(conclusion_indexes) != len(candidates):
         return cleaned
@@ -2852,10 +2984,16 @@ def _split_inline_fact_check_points(text: str) -> str:
             if matches:
                 for index, match in enumerate(matches):
                     start = match.end()
-                    end = matches[index + 1].start() if index + 1 < len(matches) else len(points_text)
+                    end = (
+                        matches[index + 1].start()
+                        if index + 1 < len(matches)
+                        else len(points_text)
+                    )
                     point = points_text[start:end].strip(" \t\r\n；;")
                     if point:
-                        lines.extend(_format_inline_fact_check_point(match.group(1), point))
+                        lines.extend(
+                            _format_inline_fact_check_point(match.group(1), point)
+                        )
                 continue
         stripped = re.sub(r"^[-*]\s+", "", stripped)
         lines.append(stripped)
@@ -2910,14 +3048,19 @@ def _normalize_conditional_verdict(text: str) -> str:
         if not conditional:
             return line
         stripped = line.strip()
-        if re.match(r"^事实核查[:：]\s*(已证实|已核实|大致可信|基本可信)(?=[\s，,。；;]|$)", stripped):
+        if re.match(
+            r"^事实核查[:：]\s*(已证实|已核实|大致可信|基本可信)(?=[\s，,。；;]|$)",
+            stripped,
+        ):
             return re.sub(
                 r"(事实核查[:：]\s*)(已证实|已核实|大致可信|基本可信)",
                 r"\1条件性成立",
                 line,
                 count=1,
             )
-        if re.match(r"^结论[:：]\s*(已证实|已核实|可信|大致可信)(?=[\s，,。；;]|$)", stripped):
+        if re.match(
+            r"^结论[:：]\s*(已证实|已核实|可信|大致可信)(?=[\s，,。；;]|$)", stripped
+        ):
             return re.sub(
                 r"(结论[:：]\s*)(已证实|已核实|可信|大致可信)",
                 r"\1条件性成立",
@@ -2965,9 +3108,7 @@ def extract_sources(body: dict[str, Any], limit: int = 3) -> list[str]:
             ):
                 supported_indices.append(index)
     source_chunks = (
-        [chunks[index] for index in supported_indices]
-        if supported_indices
-        else chunks
+        [chunks[index] for index in supported_indices] if supported_indices else chunks
     )
     sources: list[str] = []
     for chunk in source_chunks:
@@ -3028,7 +3169,14 @@ def strip_thinking(text: str) -> str:
 
 
 def _normalize(text: str) -> str:
-    return str(text or "").replace("\u00a0", " ").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").strip()
+    return (
+        str(text or "")
+        .replace("\u00a0", " ")
+        .replace("\u200b", "")
+        .replace("\u200c", "")
+        .replace("\u200d", "")
+        .strip()
+    )
 
 
 def is_retryable(exc: Exception | None) -> bool:
@@ -3098,20 +3246,29 @@ def post_json_with_timeout(
                 response = client.post(
                     url,
                     json=payload,
-                    headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": api_key,
+                    },
                     timeout=http_timeout,
                 )
                 response.raise_for_status()
                 return response.json()
             except httpx.HTTPStatusError as exc:
                 last_error = exc
-                if not is_retryable(exc) or attempt >= max_retries or not _retry_budget_available():
+                if (
+                    not is_retryable(exc)
+                    or attempt >= max_retries
+                    or not _retry_budget_available()
+                ):
                     raise
             except httpx.RequestError as exc:
                 last_error = exc
                 if attempt >= max_retries or not _retry_budget_available():
                     raise
-            wait = backoff_seconds(attempt, last_error or RuntimeError("request failed"))
+            wait = backoff_seconds(
+                attempt, last_error or RuntimeError("request failed")
+            )
             print(
                 "[astrbot-fact-check-http-retry] "
                 f"attempt={attempt + 1}/{max_retries + 1} wait={wait:.1f}s "
@@ -3128,13 +3285,14 @@ def post_json_with_timeout(
                 client.close()
             except Exception as exc:
                 print(
-                    "[astrbot-fact-check-http-client-close] "
-                    f"error={error_label(exc)}",
+                    f"[astrbot-fact-check-http-client-close] error={error_label(exc)}",
                     flush=True,
                 )
 
 
-def read_image_input_bytes(item: ImageInput, *, max_bytes: int | None, timeout: int) -> tuple[bytes, str]:
+def read_image_input_bytes(
+    item: ImageInput, *, max_bytes: int | None, timeout: int
+) -> tuple[bytes, str]:
     path_value = (item.path or "").strip()
     url_value = (item.url or "").strip()
     if path_value:
@@ -3153,7 +3311,9 @@ def read_image_input_bytes(item: ImageInput, *, max_bytes: int | None, timeout: 
     raise ValueError("empty image input")
 
 
-def get_bytes_with_timeout(url: str, *, max_bytes: int | None, timeout: int) -> tuple[bytes, str]:
+def get_bytes_with_timeout(
+    url: str, *, max_bytes: int | None, timeout: int
+) -> tuple[bytes, str]:
     if not is_public_http_url(url):
         raise ValueError("image url must be public http(s)")
     bounded = _bounded_timeout(timeout)
@@ -3165,20 +3325,34 @@ def get_bytes_with_timeout(url: str, *, max_bytes: int | None, timeout: int) -> 
     )
     current_url = url
     ensure_public_url_target(current_url)
-    with httpx.Client(timeout=http_timeout, follow_redirects=False, trust_env=True) as client:
+    with httpx.Client(
+        timeout=http_timeout, follow_redirects=False, trust_env=True
+    ) as client:
         for _ in range(5):
             if not is_public_http_url(current_url):
                 raise ValueError("image redirect target must be public http(s)")
             ensure_public_url_target(current_url)
-            response_cm = client.stream("GET", current_url, headers={"User-Agent": "AstrBot-QQ-Agent/0.1"})
+            response_cm = client.stream(
+                "GET", current_url, headers={"User-Agent": "AstrBot-QQ-Agent/0.1"}
+            )
             with response_cm as response:
-                if 300 <= response.status_code < 400 and response.headers.get("Location"):
-                    current_url = urljoin(str(response.url), response.headers["Location"])
+                if 300 <= response.status_code < 400 and response.headers.get(
+                    "Location"
+                ):
+                    current_url = urljoin(
+                        str(response.url), response.headers["Location"]
+                    )
                     continue
                 response.raise_for_status()
                 content_length = response.headers.get("Content-Length", "")
-                if max_bytes is not None and content_length and int(content_length) > max_bytes:
-                    raise ValueError(f"image too large: {content_length} bytes > limit {max_bytes}")
+                if (
+                    max_bytes is not None
+                    and content_length
+                    and int(content_length) > max_bytes
+                ):
+                    raise ValueError(
+                        f"image too large: {content_length} bytes > limit {max_bytes}"
+                    )
                 chunks: list[bytes] = []
                 size = 0
                 for chunk in response.iter_bytes():
@@ -3186,7 +3360,9 @@ def get_bytes_with_timeout(url: str, *, max_bytes: int | None, timeout: int) -> 
                         continue
                     size += len(chunk)
                     if max_bytes is not None and size > max_bytes:
-                        raise ValueError(f"image too large while downloading: {size} bytes > limit {max_bytes}")
+                        raise ValueError(
+                            f"image too large while downloading: {size} bytes > limit {max_bytes}"
+                        )
                     chunks.append(chunk)
                 return b"".join(chunks), response.headers.get("Content-Type", "")
         raise ValueError("too many image redirects")

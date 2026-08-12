@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 
 def _match_terms(text: str) -> set[str]:
@@ -69,8 +70,71 @@ _EVIDENCE_REQUIRED_LABELS = (
     "不准确",
 )
 
+_HIGH_RISK_CLAIM_RE = re.compile(
+    r"(法规|政策|法律|违法|法院|医学|疾病|治疗|药物|疫苗|金融|投资|证券|安全|事故|伤亡|"
+    r"policy|law|legal|court|medical|disease|treatment|drug|vaccine|finance|investment|security|accident|injury)",
+    flags=re.IGNORECASE,
+)
 
-def enforce_evidence_coverage(reply: str, claim_sources: list[list[str]]) -> str:
+
+def evidence_text_relevant(claim: Any, evidence_text: str) -> bool:
+    """Reject extracted pages that do not materially overlap the checked claim."""
+    claim_text = re.sub(r"^\s*请核查[：:]?\s*", "", _claim_text(claim))
+    claim_text = re.sub(r"是否属实[？?]?\s*$", "", claim_text)
+    claim_terms = _match_terms(claim_text) - _CLAIM_MATCH_STOPWORDS
+    evidence_terms = _match_terms(evidence_text) - _CLAIM_MATCH_STOPWORDS
+    if not claim_terms or not evidence_terms:
+        return False
+    shared = claim_terms.intersection(evidence_terms)
+    minimum = 1 if len(claim_terms) <= 2 else 2
+    return len(shared) >= minimum and len(shared) / max(1, len(claim_terms)) >= 0.2
+
+
+def _source_identity(source: str) -> str:
+    text = str(source or "").strip()
+    url = _source_url(text)
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if host == "vertexaisearch.cloud.google.com":
+        return "grounding:" + _source_title(text).lower()
+    return host or _source_title(text).lower()
+
+
+def _is_primary_source(source: str) -> bool:
+    url = _source_url(source)
+    host = (urlparse(url).hostname or "").lower()
+    return bool(
+        host
+        and (
+            host.endswith((".gov", ".gov.cn", ".edu", ".edu.cn"))
+            or host in {"gov.cn", "who.int", "un.org", "europa.eu"}
+        )
+    )
+
+
+def has_strong_claim_evidence(sources: list[str]) -> bool:
+    clean_sources = [
+        str(source or "").strip() for source in sources if str(source or "").strip()
+    ]
+    if any(_is_primary_source(source) for source in clean_sources):
+        return True
+    return (
+        len(
+            {
+                _source_identity(source)
+                for source in clean_sources
+                if _source_identity(source)
+            }
+        )
+        >= 2
+    )
+
+
+def enforce_evidence_coverage(
+    reply: str,
+    claim_sources: list[list[str]],
+    claims: list[Any] | None = None,
+) -> str:
     """Downgrade decisive claim labels that have no directly mapped source."""
     if not reply:
         return reply
@@ -78,28 +142,67 @@ def enforce_evidence_coverage(reply: str, claim_sources: list[list[str]]) -> str
     current_claim: int | None = None
     claim_count = 0
     downgraded = 0
+    conflict_downgrades = 0
+    conflicts: set[int] = set()
+    for index, block in enumerate(
+        re.split(r"(?=^\s*\d+\.\s*核查点[：:])", str(reply), flags=re.MULTILINE)
+    ):
+        if re.search(r"^\s*证据关系[：:]\s*来源冲突", block, flags=re.MULTILINE):
+            point = re.search(r"^\s*(\d+)\.\s*核查点[：:]", block, flags=re.MULTILINE)
+            if point:
+                conflicts.add(int(point.group(1)) - 1)
     label_pattern = "|".join(
-        re.escape(label) for label in sorted(_EVIDENCE_REQUIRED_LABELS, key=len, reverse=True)
+        re.escape(label)
+        for label in sorted(_EVIDENCE_REQUIRED_LABELS, key=len, reverse=True)
     )
     for line in str(reply).splitlines():
         point_match = re.match(r"^\s*(\d+)\.\s*核查点[：:]", line)
         if point_match:
             current_claim = int(point_match.group(1)) - 1
             claim_count = max(claim_count, current_claim + 1)
-        conclusion = re.match(rf"^(\s*结论[：:]\s*)(?:{label_pattern})(?:[^\n]*)$", line)
+        conclusion = re.match(
+            rf"^(\s*结论[：:]\s*)(?:{label_pattern})(?:[^\n]*)$", line
+        )
         has_sources = bool(
             current_claim is not None
             and current_claim < len(claim_sources)
             and claim_sources[current_claim]
         )
-        if conclusion and not has_sources:
-            line = conclusion.group(1) + "证据不足（未找到可核验的直接来源）"
-            downgraded += 1
+        if conclusion:
+            claim = (
+                claims[current_claim]
+                if claims and current_claim is not None and current_claim < len(claims)
+                else ""
+            )
+            sources = (
+                claim_sources[current_claim]
+                if current_claim is not None and current_claim < len(claim_sources)
+                else []
+            )
+            if current_claim in conflicts:
+                line = conclusion.group(1) + "部分存疑（直接来源之间存在冲突）"
+                downgraded += 1
+                conflict_downgrades += 1
+            elif not has_sources:
+                line = conclusion.group(1) + "证据不足（未找到可核验的直接来源）"
+                downgraded += 1
+            elif _HIGH_RISK_CLAIM_RE.search(
+                _claim_text(claim)
+            ) and not has_strong_claim_evidence(sources):
+                line = (
+                    conclusion.group(1)
+                    + "证据不足（高风险命题缺少官方来源或多源交叉验证）"
+                )
+                downgraded += 1
         output.append(line)
     rendered = "\n".join(output).strip()
     if not downgraded:
         return rendered
-    summary = "证据不足" if downgraded >= max(1, claim_count) else "部分存疑"
+    summary = (
+        "部分存疑"
+        if conflict_downgrades
+        else ("证据不足" if downgraded >= max(1, claim_count) else "部分存疑")
+    )
     return re.sub(
         r"(^|\n)(\s*事实核查[：:]\s*)[^\n]+",
         lambda match: match.group(1) + match.group(2) + summary,
@@ -138,21 +241,54 @@ def extract_claim_source_map(
     if not claims:
         return mapped
     response_candidates = body.get("candidates", []) or []
-    metadata = (response_candidates[0] if response_candidates else {}).get("groundingMetadata") or {}
+    metadata = (response_candidates[0] if response_candidates else {}).get(
+        "groundingMetadata"
+    ) or {}
     chunks = metadata.get("groundingChunks") or []
     supports = metadata.get("groundingSupports") or []
     claim_terms = [_match_terms(_claim_text(claim)) for claim in claims]
     per_claim_limit = max(1, min(3, int(limit_per_claim or 1)))
+    content = (response_candidates[0] if response_candidates else {}).get(
+        "content"
+    ) or {}
+    response_text = "".join(
+        str(part.get("text") or "")
+        for part in content.get("parts") or []
+        if isinstance(part, dict)
+    )
+    point_matches = list(
+        re.finditer(r"^\s*(\d+)\.\s*核查点[：:]", response_text, flags=re.MULTILINE),
+    )
 
     for support in supports:
         if not isinstance(support, dict):
             continue
-        segment_text = str((support.get("segment") or {}).get("text") or "").strip()
-        segment_terms = _match_terms(segment_text)
-        scores = [len(terms.intersection(segment_terms)) for terms in claim_terms]
-        best_index = 0 if len(claims) == 1 else max(range(len(scores)), key=scores.__getitem__)
-        if len(claims) > 1 and not scores[best_index]:
-            continue
+        segment = support.get("segment") or {}
+        segment_text = str(segment.get("text") or "").strip()
+        segment_start = segment.get("startIndex")
+        best_index: int | None = None
+        if isinstance(segment_start, int) and point_matches:
+            for point_index, point_match in enumerate(point_matches):
+                next_start = (
+                    point_matches[point_index + 1].start()
+                    if point_index + 1 < len(point_matches)
+                    else len(response_text)
+                )
+                if point_match.start() <= segment_start < next_start:
+                    candidate_index = int(point_match.group(1)) - 1
+                    if 0 <= candidate_index < len(claims):
+                        best_index = candidate_index
+                    break
+        if best_index is None:
+            segment_terms = _match_terms(segment_text)
+            scores = [len(terms.intersection(segment_terms)) for terms in claim_terms]
+            best_index = (
+                0
+                if len(claims) == 1
+                else max(range(len(scores)), key=scores.__getitem__)
+            )
+            if len(claims) > 1 and not scores[best_index]:
+                continue
         for index in support.get("groundingChunkIndices") or []:
             if not isinstance(index, int) or not 0 <= index < len(chunks):
                 continue
@@ -216,7 +352,9 @@ def append_claim_source_hints(
         output.append(line)
         if current_claim is None or not re.match(r"^\s*依据[：:]", line):
             continue
-        sources = claim_sources[current_claim] if current_claim < len(claim_sources) else []
+        sources = (
+            claim_sources[current_claim] if current_claim < len(claim_sources) else []
+        )
         if sources:
             labels: list[str] = []
             for source in sources[:2]:
