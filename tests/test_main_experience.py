@@ -136,6 +136,7 @@ def make_plugin() -> main.FactCheckPlugin:
     plugin._reply_cache = {}
     plugin._fact_check_sessions = {}
     plugin._fact_check_tasks = set()
+    plugin._followup_tasks = set()
     plugin._singleflight = AsyncSingleFlight()
     plugin._active_followup_jobs = 0
     plugin._cooldown_until = 0.0
@@ -195,6 +196,22 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(task.cancelled())
         self.assertEqual(plugin._singleflight.active_count, 0)
+
+    async def test_terminate_cancels_tracked_followup_tasks(self) -> None:
+        plugin = make_plugin()
+        started = asyncio.Event()
+
+        async def followup_worker() -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(followup_worker())
+        plugin._followup_tasks.add(task)
+        await started.wait()
+
+        await plugin.terminate()
+
+        self.assertTrue(task.cancelled())
 
     async def test_send_outcome_is_recorded_separately_from_pipeline_success(
         self,

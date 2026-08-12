@@ -48,7 +48,7 @@ from .pipeline_config import build_fact_check_kwargs
 from .runtime import AsyncSingleFlight, run_blocking_with_timeout
 from .storage import FactCheckMetricsStore, atomic_write_json, read_json_file
 
-FACT_CHECK_PIPELINE_VERSION = "quality-v5"
+FACT_CHECK_PIPELINE_VERSION = "quality-v6"
 
 try:
     from astrbot_plugin_access_control.access_control import is_plugin_allowed
@@ -137,6 +137,7 @@ class FactCheckPlugin(Star):
             max(1, int(self.config.get("fact_check_max_concurrent") or 1)),
         )
         self._fact_check_tasks: set[asyncio.Task] = set()
+        self._followup_tasks: set[asyncio.Task] = set()
         self._active_followup_jobs = 0
         self._reply_cache: dict[str, tuple[float, float, FactCheckResult]] = {}
         self._singleflight: AsyncSingleFlight[FactCheckResult] = AsyncSingleFlight()
@@ -203,6 +204,10 @@ class FactCheckPlugin(Star):
             )
             return
 
+        followup_task = asyncio.current_task()
+        if followup_task is not None:
+            self._followup_tasks.add(followup_task)
+            followup_task.add_done_callback(self._followup_tasks.discard)
         await event.send(event.plain_result("我接着查一下。"))
         self._active_followup_jobs = (
             max(0, int(getattr(self, "_active_followup_jobs", 0))) + 1
@@ -289,6 +294,8 @@ class FactCheckPlugin(Star):
             self._active_followup_jobs = max(
                 0, int(getattr(self, "_active_followup_jobs", 0)) - 1
             )
+            if followup_task is not None:
+                self._followup_tasks.discard(followup_task)
 
         logger.info(
             f"[astrbot-fact-check-followup-done] {label}: "
@@ -2339,7 +2346,12 @@ class FactCheckPlugin(Star):
 
     async def terminate(self):
         self._persist_fact_check_sessions()
-        tasks = list(self._fact_check_tasks)
+        current_task = asyncio.current_task()
+        tasks = [
+            task
+            for task in (*self._fact_check_tasks, *self._followup_tasks)
+            if task is not current_task
+        ]
         for task in tasks:
             task.cancel()
         if tasks:

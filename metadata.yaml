@@ -1,7 +1,7 @@
 name: astrbot_plugin_fact_check
 display_name: QQ Fact Check
 desc: QQ-friendly /事实核查 command with Gemini multimodal claim extraction and fallback models.
-version: 0.2.2
+version: 0.2.3
 author: local
 repo: "https://github.com/Anonymousnake/astrbot_plugin_fact_check"
 support_platforms:

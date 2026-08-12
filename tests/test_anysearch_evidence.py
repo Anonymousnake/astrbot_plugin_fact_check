@@ -28,6 +28,7 @@ from fact_check import (
     ensure_public_url_target,
     evidence_text_relevant,
     extract_claim_source_map,
+    extract_anysearch_urls_by_query,
     extract_claims_from_text,
     extract_public_urls,
     extract_sources,
@@ -45,6 +46,27 @@ from fact_check import (
 
 
 class AnysearchEvidenceTests(unittest.TestCase):
+    def test_markerless_batch_urls_are_split_across_queries(self) -> None:
+        groups = extract_anysearch_urls_by_query(
+            "\n".join(
+                [
+                    "https://a.example/one",
+                    "https://a.example/two",
+                    "https://b.example/one",
+                    "https://b.example/two",
+                ]
+            ),
+            query_count=2,
+        )
+
+        self.assertEqual(
+            groups,
+            [
+                ["https://a.example/one", "https://a.example/two"],
+                ["https://b.example/one", "https://b.example/two"],
+            ],
+        )
+
     def test_claim_match_rejects_opposite_polarity(self) -> None:
         self.assertFalse(
             claim_text_matches(
@@ -372,6 +394,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         client_factory.assert_not_called()
         self.assertEqual(client.post.call_count, 2)
+        self.assertFalse(client.post.call_args.kwargs["follow_redirects"])
         self.assertEqual((first, second), ("ok", "ok"))
 
     def test_public_url_dns_resolution_timeout_fails_closed(self) -> None:

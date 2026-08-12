@@ -1077,11 +1077,18 @@ def run_fact_check_followup(
                 candidates=candidates,
             )
     reply = sanitize_fact_check_reply(extract_text(body).strip())
+    followup_claims = [ClaimCandidate(question), *candidates]
+    grounded_claim_sources = extract_claim_source_map(body, followup_claims)
+    relevant_grounded_sources = [
+        source
+        for claim_sources in grounded_claim_sources
+        for source in claim_sources
+    ]
     sources = normalize_fact_check_sources(
         select_fact_check_sources(
-            extract_sources(body),
+            relevant_grounded_sources,
             [],
-            claims=[candidate.claim for candidate in candidates],
+            claims=[question, *(candidate.claim for candidate in candidates)],
             limit=3,
         ),
     )
@@ -1094,7 +1101,7 @@ def run_fact_check_followup(
         change_state
         and not change_state.startswith(("原结论暂不改变", "不改变"))
     )
-    has_new_grounding = bool(sources and has_grounding_supports(body))
+    has_new_grounding = bool(sources)
     if requests_change and not has_new_grounding:
         reply = (
             "追问结论：本次未获得新的可核验证据，无法据此修改原结论。\n"
@@ -1838,7 +1845,7 @@ def collect_anysearch_evidence(
 
     try:
         ensure_public_url_target(endpoint)
-        with httpx.Client(follow_redirects=True, trust_env=True) as shared_client:
+        with httpx.Client(follow_redirects=False, trust_env=True) as shared_client:
             if len(query_payloads) == 1:
                 search_text = anysearch_call_tool(
                     tool_name="search",
@@ -1988,7 +1995,14 @@ def extract_anysearch_urls_by_query(text: str, *, query_count: int) -> list[list
                 groups[current_index].append(url)
     if saw_marker:
         return groups
-    return [[url for url in extract_public_urls(text) if is_public_http_url(url)]]
+    urls = [url for url in extract_public_urls(text) if is_public_http_url(url)]
+    if len(groups) == 1 or not urls:
+        return [urls]
+    chunk_size = max(1, (len(urls) + len(groups) - 1) // len(groups))
+    return [
+        urls[index * chunk_size : (index + 1) * chunk_size]
+        for index in range(len(groups))
+    ]
 
 
 def select_round_robin_urls(groups: list[list[str]], *, limit: int) -> list[str]:
@@ -2100,7 +2114,7 @@ def anysearch_call_tool(
     }
     last_error: Exception | None = None
     owned_client = client is None
-    request_client = client or httpx.Client(follow_redirects=True, trust_env=True)
+    request_client = client or httpx.Client(follow_redirects=False, trust_env=True)
     try:
         for attempt in range(max_retries + 1):
             try:
@@ -2116,6 +2130,7 @@ def anysearch_call_tool(
                     json=payload,
                     headers=headers,
                     timeout=http_timeout,
+                    follow_redirects=False,
                 )
                 response.raise_for_status()
                 data = response.json()
