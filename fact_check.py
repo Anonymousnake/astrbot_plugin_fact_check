@@ -47,6 +47,11 @@ except ImportError:
         merge_claim_sources,
     )
 
+try:
+    from .verdict_policy import EVIDENCE_RELATIONS, summary_matches_claim_labels
+except ImportError:  # pragma: no cover - supports direct module imports in tests
+    from verdict_policy import EVIDENCE_RELATIONS, summary_matches_claim_labels
+
 
 TRIGGER_RE = re.compile(
     r"(?:^|[\s\u00a0\u200b\u200c\u200d/])(?:事实核查|factcheck|fact-check)(?=$|[\s\u00a0\u200b\u200c\u200d:：?？!！,，。])",
@@ -2661,7 +2666,8 @@ def validate_complete_fact_check_result(
             f"expected={expected_claim_count} points={point_numbers}",
         )
 
-    for number, point, conclusions, bases in blocks:
+    child_labels: list[str] = []
+    for number, point, conclusions, bases, relations in blocks:
         if not point.strip():
             raise IncompleteGenerationError(f"claim {number} is missing its question")
         if expected_claims and not claim_text_matches(
@@ -2681,10 +2687,27 @@ def validate_complete_fact_check_result(
             raise IncompleteGenerationError(
                 f"claim {number} has an invalid conclusion label",
             )
+        child_labels.append(
+            next(
+                label
+                for label in FACT_CHECK_CLAIM_LABELS
+                if _value_starts_with_allowed_label(conclusions[0], (label,))
+            )
+        )
         if len(bases) != 1 or _is_weak_basis(bases[0]):
             raise IncompleteGenerationError(
                 f"claim {number} must have one meaningful basis",
             )
+        if len(relations) != 1 or not _value_starts_with_allowed_label(
+            relations[0], EVIDENCE_RELATIONS
+        ):
+            raise IncompleteGenerationError(
+                f"claim {number} must have one valid evidence relation",
+            )
+    if not summary_matches_claim_labels(summary_match.group(1), child_labels):
+        raise IncompleteGenerationError(
+            "fact-check summary contradicts child conclusions",
+        )
     if text.rstrip().endswith((",", "，", "、", ":", "：", ";", "；", "/", "（")):
         raise IncompleteGenerationError("reply ended mid-sentence")
 
@@ -2739,13 +2762,13 @@ def _value_starts_with_allowed_label(
 
 def _parse_fact_check_blocks(
     text: str,
-) -> list[tuple[int, str, list[str], list[str]]]:
+) -> list[tuple[int, str, list[str], list[str], list[str]]]:
     point_pattern = re.compile(
         r"^\s*(\d+)\.\s*核查点[：:]\s*([^\n]*)",
         flags=re.MULTILINE,
     )
     matches = list(point_pattern.finditer(text))
-    blocks: list[tuple[int, str, list[str], list[str]]] = []
+    blocks: list[tuple[int, str, list[str], list[str], list[str]]] = []
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         section = text[match.end() : end]
@@ -2759,12 +2782,18 @@ def _parse_fact_check_blocks(
             section,
             flags=re.MULTILINE,
         )
+        relations = re.findall(
+            r"^\s*证据关系[：:]\s*([^\n]+)",
+            section,
+            flags=re.MULTILINE,
+        )
         blocks.append(
             (
                 int(match.group(1)),
                 match.group(2).strip(),
                 [item.strip() for item in conclusions],
                 [item.strip() for item in bases],
+                [item.strip() for item in relations],
             ),
         )
     return blocks
@@ -2779,9 +2808,9 @@ def salvage_partial_fact_check_reply(
     if not text or not candidates:
         return ""
 
-    completed: list[tuple[int, str, str, str]] = []
+    completed: list[tuple[int, str, str, str, str]] = []
     completed_indexes: set[int] = set()
-    for number, point, conclusions, bases in _parse_fact_check_blocks(text):
+    for number, point, conclusions, bases, relations in _parse_fact_check_blocks(text):
         if not 1 <= number <= len(candidates):
             continue
         if len(conclusions) != 1 or len(bases) != 1:
@@ -2796,8 +2825,15 @@ def salvage_partial_fact_check_reply(
             or _is_weak_basis(bases[0])
         ):
             continue
+        relation = relations[0].strip() if len(relations) == 1 else "无直接证据"
+        conclusion = conclusions[0].strip()
+        if len(relations) != 1 and any(
+            _value_starts_with_allowed_label(conclusion, (label,))
+            for label in ("已核实", "条件性成立", "表述需限定", "部分存疑", "不准确")
+        ):
+            conclusion = "证据不足（模型输出缺少证据关系）"
         completed.append(
-            (number, point.strip(), conclusions[0].strip(), bases[0].strip())
+            (number, point.strip(), conclusion, bases[0].strip(), relation)
         )
         completed_indexes.add(number - 1)
 
@@ -2805,12 +2841,13 @@ def salvage_partial_fact_check_reply(
         return ""
 
     lines = ["事实核查：部分存疑（模型输出未完整，以下仅保留已完成核查点）"]
-    for output_number, (_, point, conclusion, basis) in enumerate(completed, start=1):
+    for output_number, (_, point, conclusion, basis, relation) in enumerate(completed, start=1):
         lines.extend(
             (
                 f"{output_number}. 核查点：{point}",
                 f"结论：{conclusion}",
                 f"依据：{basis}",
+                f"证据关系：{relation}",
             ),
         )
     missing = [

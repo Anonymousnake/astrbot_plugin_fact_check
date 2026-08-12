@@ -29,6 +29,7 @@ def complete_single_claim_body(
     claim: str = "测试命题是否属实。",
     conclusion: str = "已核实",
     basis: str = "公开证据支持该命题。",
+    relation: str = "支持一致",
     grounded: bool = False,
     **candidate_fields,
 ):
@@ -50,7 +51,7 @@ def complete_single_claim_body(
             ],
         }
     return complete_fact_check_body(
-        f"事实核查：{summary}\n1. 核查点：{claim}\n结论：{conclusion}\n依据：{basis}",
+        f"事实核查：{summary}\n1. 核查点：{claim}\n结论：{conclusion}\n依据：{basis}\n证据关系：{relation}",
         **candidate_fields,
     )
 
@@ -475,12 +476,35 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                         body, expected_claim_count=1
                     )
 
+    def test_complete_result_requires_evidence_relation_and_consistent_summary(
+        self,
+    ) -> None:
+        missing_relation = complete_fact_check_body(
+            "事实核查：可信\n"
+            "1. 核查点：A 事件是否发生。\n"
+            "结论：已核实\n"
+            "依据：官方来源直接确认。"
+        )
+        contradictory_summary = complete_single_claim_body(
+            summary="可信",
+            conclusion="证据不足",
+            relation="无直接证据",
+        )
+
+        for body in (missing_relation, contradictory_summary):
+            with self.subTest(body=body):
+                with self.assertRaises(fact_check.IncompleteGenerationError):
+                    fact_check.validate_complete_fact_check_result(
+                        body, expected_claim_count=1
+                    )
+
     def test_common_model_verdict_labels_are_repaired_without_retry(self) -> None:
         body = complete_fact_check_body(
             "事实核查：基本属实\n"
             "1. 核查点：A 事件是否发生。\n"
             "结论：基本属实\n"
-            "依据：官方来源确认了主体事实，但存在适用范围限制。"
+            "依据：官方来源确认了主体事实，但存在适用范围限制。\n"
+            "证据关系：支持一致"
         )
 
         fact_check.validate_complete_fact_check_result(body, expected_claim_count=1)
@@ -519,7 +543,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         reply = fact_check.salvage_partial_fact_check_reply(incomplete, claims)
 
         self.assertIn("以下仅保留已完成核查点", reply)
-        self.assertIn("结论：已核实", reply)
+        self.assertIn("结论：证据不足（模型输出缺少证据关系）", reply)
+        self.assertIn("证据关系：无直接证据", reply)
         self.assertIn("未完成核查：B 事件是否发生。", reply)
         self.assertNotIn("2. 核查点", reply)
 
@@ -574,7 +599,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(result.reason.startswith("ok; partial"))
-        self.assertIn("结论：已核实", result.reply)
+        self.assertIn("结论：证据不足（模型输出缺少证据关系）", result.reply)
+        self.assertIn("证据关系：无直接证据", result.reply)
         self.assertIn("未完成核查：B 事件是否发生。", result.reply)
 
     def test_multi_claim_fact_check_rejects_invalid_child_label(self) -> None:
@@ -1361,9 +1387,11 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             "1. 核查点：第一项\n"
             "结论：已核实\n"
             "依据：第一项证据。\n"
+            "证据关系：支持一致\n"
             "2. 核查点：第二项\n"
             "结论：证据不足\n"
-            "依据：没有直接证据。"
+            "依据：没有直接证据。\n"
+            "证据关系：无直接证据"
         )
 
         with self.assertRaises(fact_check.IncompleteGenerationError):

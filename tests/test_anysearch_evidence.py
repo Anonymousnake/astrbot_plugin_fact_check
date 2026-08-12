@@ -347,7 +347,8 @@ class AnysearchEvidenceTests(unittest.TestCase):
                                             "事实核查：基本可信但需限定\n"
                                             "1. 核查点：请核查：A 事件是否属实？\n"
                                             "结论：已核实\n"
-                                            "依据：有公开来源支持。"
+                                            "依据：有公开来源支持。\n"
+                                            "证据关系：支持一致"
                                         )
                                     }
                                 ]
@@ -685,6 +686,96 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         self.assertIn("结论：部分存疑（直接来源之间存在冲突）", guarded)
         self.assertIn("事实核查：部分存疑", guarded)
+
+    def test_background_only_relation_blocks_a_decisive_conclusion(self) -> None:
+        reply = (
+            "事实核查：可信\n"
+            "1. 核查点：A 事件已经发生。\n"
+            "结论：已核实\n"
+            "依据：页面提供了相关背景。\n"
+            "证据关系：仅背景（只有事件时间线）"
+        )
+
+        guarded = enforce_evidence_coverage(
+            reply,
+            [["背景页面：https://news.example/background"]],
+            [ClaimCandidate("A 事件已经发生。")],
+        )
+
+        self.assertIn("结论：证据不足（现有来源仅提供背景信息）", guarded)
+        self.assertIn("事实核查：证据不足", guarded)
+
+    def test_no_direct_evidence_relation_blocks_a_decisive_conclusion(self) -> None:
+        reply = (
+            "事实核查：可信\n"
+            "1. 核查点：A 事件已经发生。\n"
+            "结论：已核实\n"
+            "依据：页面没有直接确认该命题。\n"
+            "证据关系：无直接证据"
+        )
+
+        guarded = enforce_evidence_coverage(
+            reply,
+            [["相关页面：https://news.example/context"]],
+            [ClaimCandidate("A 事件已经发生。")],
+        )
+
+        self.assertIn("结论：证据不足（现有来源没有直接支持该命题）", guarded)
+        self.assertIn("事实核查：证据不足", guarded)
+
+    def test_summary_is_reconciled_with_existing_cautious_child_conclusion(self) -> None:
+        reply = (
+            "事实核查：可信\n"
+            "1. 核查点：A 事件已经发生。\n"
+            "结论：证据不足\n"
+            "依据：没有可核验的直接证据。\n"
+            "证据关系：无直接证据"
+        )
+
+        guarded = enforce_evidence_coverage(reply, [[]])
+
+        self.assertIn("事实核查：证据不足", guarded)
+        self.assertNotIn("事实核查：可信", guarded)
+
+    def test_source_strength_uses_authority_and_registered_domain_identity(self) -> None:
+        redirect_root = (
+            "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+        )
+
+        self.assertTrue(
+            has_strong_claim_evidence(
+                ["英国政府：https://www.gov.uk/government/publications/report"]
+            )
+        )
+        self.assertFalse(
+            has_strong_claim_evidence(
+                ["校园博客：https://student.example.edu/blog/post"]
+            )
+        )
+        self.assertFalse(
+            has_strong_claim_evidence(
+                [
+                    "同机构甲：https://desk-a.news.example.org/report",
+                    "同机构乙：https://desk-b.news.example.org/report",
+                ]
+            )
+        )
+        self.assertFalse(
+            has_strong_claim_evidence(
+                [
+                    f"公报甲：{redirect_root}a",
+                    f"公报乙：{redirect_root}b",
+                ]
+            )
+        )
+        self.assertFalse(
+            has_strong_claim_evidence(
+                [
+                    "博客甲：https://blog-a.example/report",
+                    "博客乙：https://blog-b.example/report",
+                ]
+            )
+        )
 
     def test_anysearch_extract_must_overlap_the_claim_to_be_direct_evidence(
         self,
@@ -1045,7 +1136,8 @@ class AnysearchEvidenceTests(unittest.TestCase):
                                             "事实核查：证据不足\n"
                                             "1. 核查点：请核查：A 事件是否属实？\n"
                                             "结论：证据不足\n"
-                                            "依据：搜索失败但主核查继续。"
+                                            "依据：搜索失败但主核查继续。\n"
+                                            "证据关系：无直接证据"
                                         )
                                     }
                                 ]

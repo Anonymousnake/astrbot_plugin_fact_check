@@ -2,7 +2,21 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlparse
+
+try:
+    from .source_quality import has_strong_claim_evidence
+    from .verdict_policy import (
+        WEAK_EVIDENCE_RELATIONS,
+        claim_evidence_relations,
+        reconcile_fact_check_summary,
+    )
+except ImportError:  # pragma: no cover - supports direct module imports in tests
+    from source_quality import has_strong_claim_evidence
+    from verdict_policy import (
+        WEAK_EVIDENCE_RELATIONS,
+        claim_evidence_relations,
+        reconcile_fact_check_summary,
+    )
 
 
 def _match_terms(text: str) -> set[str]:
@@ -90,46 +104,6 @@ def evidence_text_relevant(claim: Any, evidence_text: str) -> bool:
     return len(shared) >= minimum and len(shared) / max(1, len(claim_terms)) >= 0.2
 
 
-def _source_identity(source: str) -> str:
-    text = str(source or "").strip()
-    url = _source_url(text)
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower().removeprefix("www.")
-    if host == "vertexaisearch.cloud.google.com":
-        return "grounding:" + _source_title(text).lower()
-    return host or _source_title(text).lower()
-
-
-def _is_primary_source(source: str) -> bool:
-    url = _source_url(source)
-    host = (urlparse(url).hostname or "").lower()
-    return bool(
-        host
-        and (
-            host.endswith((".gov", ".gov.cn", ".edu", ".edu.cn"))
-            or host in {"gov.cn", "who.int", "un.org", "europa.eu"}
-        )
-    )
-
-
-def has_strong_claim_evidence(sources: list[str]) -> bool:
-    clean_sources = [
-        str(source or "").strip() for source in sources if str(source or "").strip()
-    ]
-    if any(_is_primary_source(source) for source in clean_sources):
-        return True
-    return (
-        len(
-            {
-                _source_identity(source)
-                for source in clean_sources
-                if _source_identity(source)
-            }
-        )
-        >= 2
-    )
-
-
 def enforce_evidence_coverage(
     reply: str,
     claim_sources: list[list[str]],
@@ -142,15 +116,7 @@ def enforce_evidence_coverage(
     current_claim: int | None = None
     claim_count = 0
     downgraded = 0
-    conflict_downgrades = 0
-    conflicts: set[int] = set()
-    for index, block in enumerate(
-        re.split(r"(?=^\s*\d+\.\s*核查点[：:])", str(reply), flags=re.MULTILINE)
-    ):
-        if re.search(r"^\s*证据关系[：:]\s*来源冲突", block, flags=re.MULTILINE):
-            point = re.search(r"^\s*(\d+)\.\s*核查点[：:]", block, flags=re.MULTILINE)
-            if point:
-                conflicts.add(int(point.group(1)) - 1)
+    relations = claim_evidence_relations(reply)
     label_pattern = "|".join(
         re.escape(label)
         for label in sorted(_EVIDENCE_REQUIRED_LABELS, key=len, reverse=True)
@@ -179,10 +145,20 @@ def enforce_evidence_coverage(
                 if current_claim is not None and current_claim < len(claim_sources)
                 else []
             )
-            if current_claim in conflicts:
+            relation = relations.get(current_claim, "")
+            if relation.startswith("来源冲突"):
                 line = conclusion.group(1) + "部分存疑（直接来源之间存在冲突）"
                 downgraded += 1
-                conflict_downgrades += 1
+            elif weak_reason := next(
+                (
+                    reason
+                    for label, reason in WEAK_EVIDENCE_RELATIONS.items()
+                    if relation.startswith(label)
+                ),
+                "",
+            ):
+                line = conclusion.group(1) + weak_reason
+                downgraded += 1
             elif not has_sources:
                 line = conclusion.group(1) + "证据不足（未找到可核验的直接来源）"
                 downgraded += 1
@@ -196,19 +172,7 @@ def enforce_evidence_coverage(
                 downgraded += 1
         output.append(line)
     rendered = "\n".join(output).strip()
-    if not downgraded:
-        return rendered
-    summary = (
-        "部分存疑"
-        if conflict_downgrades
-        else ("证据不足" if downgraded >= max(1, claim_count) else "部分存疑")
-    )
-    return re.sub(
-        r"(^|\n)(\s*事实核查[：:]\s*)[^\n]+",
-        lambda match: match.group(1) + match.group(2) + summary,
-        rendered,
-        count=1,
-    )
+    return reconcile_fact_check_summary(rendered)
 
 
 def merge_claim_sources(

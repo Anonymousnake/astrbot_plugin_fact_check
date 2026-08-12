@@ -17,6 +17,6 @@
   {"name":"who-primary-source","claim":"该疾病已被列为国际卫生紧急事件。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["WHO：https://who.int/emergencies/1"],"expect_summary":"可信","expect_conclusion":"已核实"},
   {"name":"eu-primary-source","claim":"该法律在欧盟范围生效。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["EU：https://europa.eu/legal/1"],"expect_summary":"可信","expect_conclusion":"已核实"},
   {"name":"same-domain-duplicates","claim":"该药物已经获批。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["报道一：https://news.example/a","报道二：https://news.example/b"],"expect_summary":"证据不足","expect_conclusion":"证据不足"},
-  {"name":"distinct-grounding-titles","claim":"该政策已经发布。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["公报甲：https://vertexaisearch.cloud.google.com/grounding-api-redirect/a","公报乙：https://vertexaisearch.cloud.google.com/grounding-api-redirect/b"],"expect_summary":"可信","expect_conclusion":"已核实"},
+  {"name":"distinct-grounding-titles","claim":"该政策已经发布。","summary":"可信","conclusion":"已核实","relation":"支持一致","sources":["公报甲：https://vertexaisearch.cloud.google.com/grounding-api-redirect/a","公报乙：https://vertexaisearch.cloud.google.com/grounding-api-redirect/b"],"expect_summary":"证据不足","expect_conclusion":"证据不足"},
   {"name":"normal-refutation-one-source","claim":"A 产品于周一发布。","summary":"基本不实","conclusion":"不准确","relation":"反驳一致","sources":["产品记录：https://company.example/releases/a"],"expect_summary":"基本不实","expect_conclusion":"不准确"}
 ]
