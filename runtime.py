@@ -11,12 +11,32 @@ async def run_blocking_with_timeout(
     func: Callable[[], T],
     *,
     timeout: float,
+    capacity: asyncio.Semaphore | None = None,
 ) -> T:
-    """Bound the caller's wait even though the worker thread cannot be killed."""
-    return await asyncio.wait_for(
-        asyncio.to_thread(func),
-        timeout=max(0.01, float(timeout)),
-    )
+    """Bound caller wait while retaining capacity until its thread really exits."""
+    budget = max(0.01, float(timeout))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    acquired = False
+    if capacity is not None:
+        await asyncio.wait_for(capacity.acquire(), timeout=budget)
+        acquired = True
+
+    remaining = max(0.001, deadline - loop.time())
+    worker = asyncio.create_task(asyncio.to_thread(func))
+
+    def finalize(done: asyncio.Task[T]) -> None:
+        if capacity is not None and acquired:
+            capacity.release()
+        if done.cancelled():
+            return
+        try:
+            done.exception()
+        except asyncio.CancelledError:
+            pass
+
+    worker.add_done_callback(finalize)
+    return await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
 
 
 class AsyncSingleFlight(Generic[T]):
@@ -29,15 +49,24 @@ class AsyncSingleFlight(Generic[T]):
         task = self._tasks.get(str(key))
         return bool(task and not task.done())
 
-    async def run(
+    @property
+    def active_count(self) -> int:
+        return sum(1 for task in self._tasks.values() if not task.done())
+
+    def start_if(
         self,
         key: str,
         factory: Callable[[], Awaitable[T]],
-    ) -> tuple[T, bool]:
+        *,
+        can_start: Callable[[], bool],
+    ) -> tuple[asyncio.Task[T] | None, bool]:
+        """Atomically join an existing task or admit one new task."""
         normalized_key = str(key)
         existing = self._tasks.get(normalized_key)
         if existing is not None and not existing.done():
-            return await asyncio.shield(existing), True
+            return existing, True
+        if not can_start():
+            return None, False
 
         task = asyncio.create_task(factory())
         self._tasks[normalized_key] = task
@@ -47,4 +76,13 @@ class AsyncSingleFlight(Generic[T]):
                 self._tasks.pop(normalized_key, None)
 
         task.add_done_callback(cleanup)
-        return await asyncio.shield(task), False
+        return task, False
+
+    async def run(
+        self,
+        key: str,
+        factory: Callable[[], Awaitable[T]],
+    ) -> tuple[T, bool]:
+        task, joined = self.start_if(key, factory, can_start=lambda: True)
+        assert task is not None
+        return await asyncio.shield(task), joined

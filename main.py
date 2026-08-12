@@ -48,7 +48,7 @@ from .pipeline_config import build_fact_check_kwargs
 from .runtime import AsyncSingleFlight, run_blocking_with_timeout
 from .storage import FactCheckMetricsStore, atomic_write_json, read_json_file
 
-FACT_CHECK_PIPELINE_VERSION = "quality-v3"
+FACT_CHECK_PIPELINE_VERSION = "quality-v4"
 
 try:
     from astrbot_plugin_access_control.access_control import is_plugin_allowed
@@ -208,13 +208,12 @@ class FactCheckPlugin(Star):
             max(0, int(getattr(self, "_active_followup_jobs", 0))) + 1
         )
         try:
-            async with self._fact_check_semaphore:
-                total_timeout = max(
-                    10,
-                    int(self.config.get("fact_check_total_timeout_seconds") or 90),
-                )
-                result = await run_blocking_with_timeout(
-                    partial(
+            total_timeout = max(
+                10,
+                int(self.config.get("fact_check_total_timeout_seconds") or 90),
+            )
+            result = await run_blocking_with_timeout(
+                partial(
                         run_fact_check_followup,
                         original_text=session.request_data.text,
                         candidates=session.candidates,
@@ -249,9 +248,10 @@ class FactCheckPlugin(Star):
                             or 2048,
                         ),
                         total_timeout_seconds=total_timeout,
-                    ),
-                    timeout=total_timeout,
-                )
+                ),
+                timeout=total_timeout,
+                capacity=self._fact_check_semaphore,
+            )
         except asyncio.TimeoutError:
             reason = f"follow-up timeout after {time.perf_counter() - started_at:.1f}s"
             self._record_fact_check_metric(
@@ -386,8 +386,24 @@ class FactCheckPlugin(Star):
             )
             return
 
-        joining_existing = self._singleflight.has(cache_key)
-        if self._fact_check_queue_full() and not joining_existing:
+        timeout_seconds = max(
+            10.0,
+            float(self.config.get("fact_check_total_timeout_seconds") or 90),
+        )
+
+        async def compute() -> FactCheckResult:
+            return await run_blocking_with_timeout(
+                partial(self._run_fact_check_sync, request_data, timeout_seconds),
+                timeout=timeout_seconds,
+                capacity=self._fact_check_semaphore,
+            )
+
+        pipeline_task, joining_existing = self._singleflight.start_if(
+            cache_key,
+            compute,
+            can_start=lambda: not self._fact_check_queue_full(),
+        )
+        if pipeline_task is None:
             logger.warning(
                 f"[astrbot-fact-check-queue-full] {self._event_label(event)}: "
                 f"jobs={self._active_fact_check_jobs()} max={self._max_fact_check_queue()}",
@@ -406,7 +422,14 @@ class FactCheckPlugin(Star):
             )
         )
         task = asyncio.create_task(
-            self._run_fact_check_job(event, request_data, started_at, cache_key)
+            self._run_fact_check_job(
+                event,
+                request_data,
+                started_at,
+                cache_key,
+                pipeline_task=pipeline_task,
+                joined_existing=joining_existing,
+            )
         )
         self._fact_check_tasks.add(task)
         task.add_done_callback(self._fact_check_tasks.discard)
@@ -418,6 +441,9 @@ class FactCheckPlugin(Star):
         request_data: FactCheckRequest,
         started_at: float,
         cache_key: str,
+        *,
+        pipeline_task: asyncio.Task[FactCheckResult] | None = None,
+        joined_existing: bool = False,
     ) -> None:
         label = self._event_label(event)
         timeout_seconds = max(
@@ -425,15 +451,24 @@ class FactCheckPlugin(Star):
             float(self.config.get("fact_check_total_timeout_seconds") or 90),
         )
 
-        async def compute() -> FactCheckResult:
-            async with self._fact_check_semaphore:
-                return await run_blocking_with_timeout(
-                    partial(self._run_fact_check_sync, request_data, timeout_seconds),
-                    timeout=timeout_seconds,
-                )
-
         try:
-            result, joined_existing = await self._singleflight.run(cache_key, compute)
+            if pipeline_task is None:
+                async def compute() -> FactCheckResult:
+                    return await run_blocking_with_timeout(
+                        partial(
+                            self._run_fact_check_sync,
+                            request_data,
+                            timeout_seconds,
+                        ),
+                        timeout=timeout_seconds,
+                        capacity=self._fact_check_semaphore,
+                    )
+
+                result, joined_existing = await self._singleflight.run(
+                    cache_key, compute
+                )
+            else:
+                result = await asyncio.shield(pipeline_task)
             if joined_existing:
                 logger.info(
                     f"[astrbot-fact-check-singleflight-hit] {label}: key={cache_key[:12]}"
@@ -1019,7 +1054,11 @@ class FactCheckPlugin(Star):
         return max(1, int(self.config.get("fact_check_max_queue") or 4))
 
     def _active_fact_check_jobs(self) -> int:
-        return len(getattr(self, "_fact_check_tasks", set()) or set()) + max(
+        waiting_events = len(getattr(self, "_fact_check_tasks", set()) or set())
+        pipeline_jobs = int(
+            getattr(getattr(self, "_singleflight", None), "active_count", 0) or 0
+        )
+        return max(waiting_events, pipeline_jobs) + max(
             0,
             int(getattr(self, "_active_followup_jobs", 0)),
         )

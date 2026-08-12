@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -45,3 +46,68 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await run_blocking_with_timeout(lambda: time.sleep(0.2), timeout=0.02)
 
         self.assertLess(time.perf_counter() - started, 0.15)
+
+    async def test_timed_out_worker_keeps_capacity_until_thread_finishes(self) -> None:
+        capacity = asyncio.Semaphore(1)
+        release = threading.Event()
+        second_started = threading.Event()
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await run_blocking_with_timeout(
+                lambda: release.wait(timeout=1),
+                timeout=0.02,
+                capacity=capacity,
+            )
+
+        self.assertTrue(capacity.locked())
+        with self.assertRaises(asyncio.TimeoutError):
+            await run_blocking_with_timeout(
+                lambda: second_started.set(),
+                timeout=0.02,
+                capacity=capacity,
+            )
+        self.assertFalse(second_started.is_set())
+
+        release.set()
+        for _ in range(50):
+            if not capacity.locked():
+                break
+            await asyncio.sleep(0.01)
+        self.assertFalse(capacity.locked())
+
+    async def test_singleflight_start_if_admits_or_joins_atomically(self) -> None:
+        flight: AsyncSingleFlight[str] = AsyncSingleFlight()
+        gate = asyncio.Event()
+        calls = 0
+
+        async def factory() -> str:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return "done"
+
+        first, first_joined = flight.start_if(
+            "same",
+            factory,
+            can_start=lambda: True,
+        )
+        duplicate, duplicate_joined = flight.start_if(
+            "same",
+            factory,
+            can_start=lambda: False,
+        )
+        rejected, rejected_joined = flight.start_if(
+            "different",
+            factory,
+            can_start=lambda: False,
+        )
+
+        self.assertIs(first, duplicate)
+        self.assertFalse(first_joined)
+        self.assertTrue(duplicate_joined)
+        self.assertIsNone(rejected)
+        self.assertFalse(rejected_joined)
+        self.assertEqual(flight.active_count, 1)
+        gate.set()
+        self.assertEqual(await first, "done")
+        self.assertEqual(calls, 1)
