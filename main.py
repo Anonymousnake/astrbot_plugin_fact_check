@@ -12,9 +12,11 @@ import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -48,7 +50,15 @@ from .pipeline_config import build_fact_check_kwargs
 from .runtime import AsyncSingleFlight, run_blocking_with_timeout
 from .storage import FactCheckMetricsStore, atomic_write_json, read_json_file
 
-FACT_CHECK_PIPELINE_VERSION = "quality-v6"
+FACT_CHECK_PIPELINE_VERSION = "quality-v7"
+
+
+def _current_cache_date() -> str:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+
+
+def _request_uses_current_time(request_data: FactCheckRequest) -> bool:
+    return bool(request_data.images or infer_anysearch_freshness(request_data.text))
 
 try:
     from astrbot_plugin_access_control.access_control import is_plugin_allowed
@@ -125,6 +135,8 @@ class FactCheckSession:
     updated_at: float = 0.0
     candidates: list = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
+    baseline_reply: str = ""
+    followup_history: list[str] = field(default_factory=list)
 
 
 class FactCheckPlugin(Star):
@@ -222,7 +234,7 @@ class FactCheckPlugin(Star):
                         run_fact_check_followup,
                         original_text=session.request_data.text,
                         candidates=session.candidates,
-                        previous_reply=session.reply,
+                        previous_reply=self._followup_context(session),
                         previous_sources=session.sources,
                         question=question,
                         api_key=str(self.config.get("gemini_api_key") or ""),
@@ -315,7 +327,15 @@ class FactCheckPlugin(Star):
             session_id=session.session_id,
         )
         if sent and self._is_successful_result(result):
+            if not session.baseline_reply:
+                session.baseline_reply = session.reply
             session.reply = result.reply or session.reply
+            if result.reply and (
+                not session.followup_history
+                or session.followup_history[-1] != result.reply
+            ):
+                session.followup_history.append(result.reply)
+                session.followup_history = session.followup_history[-3:]
             session.sources = self._merge_sources(
                 result.sources,
                 session.sources,
@@ -983,7 +1003,7 @@ class FactCheckPlugin(Star):
                     cache_config_value("fact_check_anysearch_max_results_per_claim", 3),
                 ),
                 "extract_top_urls": str(
-                    cache_config_value("fact_check_anysearch_extract_top_urls", 2)
+                    cache_config_value("fact_check_anysearch_extract_top_urls", 3)
                 ),
                 "max_chars": str(
                     cache_config_value("fact_check_anysearch_max_chars", 6000)
@@ -997,6 +1017,8 @@ class FactCheckPlugin(Star):
                 ),
             },
         }
+        if _request_uses_current_time(request_data):
+            payload["local_date"] = _current_cache_date()
         raw = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
@@ -1149,6 +1171,7 @@ class FactCheckPlugin(Star):
             updated_at=now,
             candidates=list(result.candidates or []),
             sources=list(result.sources or []),
+            baseline_reply=result.reply or FAILED_REPLY,
         )
         self._cleanup_fact_check_sessions()
         self._persist_fact_check_sessions()
@@ -1156,6 +1179,19 @@ class FactCheckPlugin(Star):
             f"[astrbot-fact-check-session-save] {self._event_label(event)}: session={session_id}"
         )
         return session_id
+
+    @staticmethod
+    def _followup_context(session: FactCheckSession) -> str:
+        baseline = str(session.baseline_reply or session.reply or FAILED_REPLY).strip()
+        history = [
+            str(item).strip() for item in session.followup_history[-3:] if str(item).strip()
+        ]
+        if not history:
+            return baseline
+        return (
+            f"初始核查结果：\n{baseline}\n\n"
+            "最近追问记录：\n" + "\n\n---\n\n".join(history)
+        )
 
     def _session_store_path(self) -> Path:
         return Path(StarTools.get_data_dir()) / "fact_check_sessions.json"
@@ -1165,7 +1201,7 @@ class FactCheckPlugin(Star):
             return
         path = self._session_store_path()
         payload = {
-            "version": 2,
+            "version": 3,
             "sessions": [
                 {
                     "session_id": session.session_id,
@@ -1174,6 +1210,8 @@ class FactCheckPlugin(Star):
                     "group_id": session.group_id,
                     "user_id": session.user_id,
                     "reply": session.reply,
+                    "baseline_reply": session.baseline_reply or session.reply,
+                    "followup_history": list(session.followup_history[-3:]),
                     "candidates": [
                         {
                             "claim": str(getattr(candidate, "claim", "") or ""),
@@ -1236,6 +1274,16 @@ class FactCheckPlugin(Star):
                         str(source).strip()
                         for source in record.get("sources") or []
                         if str(source).strip()
+                    ],
+                    baseline_reply=str(
+                        record.get("baseline_reply")
+                        or record.get("reply")
+                        or FAILED_REPLY
+                    ),
+                    followup_history=[
+                        str(item).strip()
+                        for item in (record.get("followup_history") or [])[-3:]
+                        if str(item).strip()
                     ],
                 )
             self._fact_check_sessions = loaded
@@ -1483,6 +1531,8 @@ class FactCheckPlugin(Star):
         if freshness == "day":
             return min(ttl, 120)
         if freshness == "week":
+            return min(ttl, 300)
+        if request_data.images:
             return min(ttl, 300)
         return ttl
 

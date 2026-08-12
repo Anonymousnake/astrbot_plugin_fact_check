@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -377,7 +377,7 @@ def run_fact_check(
     anysearch_timeout: int = 20,
     anysearch_max_claims: int = 3,
     anysearch_max_results_per_claim: int = 3,
-    anysearch_extract_top_urls: int = 2,
+    anysearch_extract_top_urls: int = 3,
     anysearch_max_chars: int = 6000,
     anysearch_freshness: str = "",
     anysearch_content_types: list[str] | None = None,
@@ -819,8 +819,8 @@ def run_fact_check(
     source_limit = max(3, min(6, len(deduped) * 2))
     sources = normalize_fact_check_sources(
         select_fact_check_sources(
-            direct_sources + extract_sources(evidence_body),
-            anysearch_evidence.sources,
+            direct_sources,
+            [],
             claims=[candidate.claim for candidate in deduped],
             limit=source_limit,
         ),
@@ -828,7 +828,8 @@ def run_fact_check(
     )
     if has_grounding_supports(evidence_body) or anysearch_evidence.claim_sources:
         reply = append_claim_source_hints(reply, claim_source_map, sources)
-    if sources and "来源" not in reply:
+    reply = re.sub(r"(?m)^\s*来源[：:].*$", "", reply).strip()
+    if sources:
         reply += "\n来源：" + "；".join(
             compact_source_label(source) for source in sources[:3]
         )
@@ -1092,6 +1093,14 @@ def run_fact_check_followup(
             limit=3,
         ),
     )
+    previous_source_keys = {
+        source_comparison_key(source) for source in previous_sources if source.strip()
+    }
+    sources = [
+        source
+        for source in sources
+        if source_comparison_key(source) not in previous_source_keys
+    ]
     change_match = re.search(
         r"(?:^|\n)是否改变原结论[：:]\s*([^\n]+)",
         reply,
@@ -1117,7 +1126,8 @@ def run_fact_check_followup(
             reply,
             count=1,
         ).strip()
-    if sources and "来源" not in reply:
+    if sources:
+        reply = re.sub(r"(?m)^\s*来源[：:].*$", "", reply).strip()
         reply += "\n来源：" + "；".join(
             compact_source_label(source) for source in sources
         )
@@ -1897,9 +1907,14 @@ def collect_anysearch_evidence(
                     == query_key
                 ]
                 query_claim_indexes.append(indexes)
-            extract_limit = max(
+            configured_extract_limit = max(
                 0,
-                _clamp_int(extract_top_urls, default=2, lower=0, upper=5),
+                _clamp_int(extract_top_urls, default=3, lower=0, upper=5),
+            )
+            extract_limit = (
+                min(5, max(configured_extract_limit, len(query_payloads)))
+                if configured_extract_limit
+                else 0
             )
             extract_urls = select_round_robin_urls(
                 query_url_groups, limit=extract_limit
@@ -1998,11 +2013,9 @@ def extract_anysearch_urls_by_query(text: str, *, query_count: int) -> list[list
     urls = [url for url in extract_public_urls(text) if is_public_http_url(url)]
     if len(groups) == 1 or not urls:
         return [urls]
-    chunk_size = max(1, (len(urls) + len(groups) - 1) // len(groups))
-    return [
-        urls[index * chunk_size : (index + 1) * chunk_size]
-        for index in range(len(groups))
-    ]
+    # Markerless batch output carries no trustworthy query-to-URL boundary.
+    # Share the pool and let extracted page relevance map each URL to claims.
+    return [list(urls) for _ in groups]
 
 
 def select_round_robin_urls(groups: list[list[str]], *, limit: int) -> list[str]:
@@ -2067,7 +2080,9 @@ def infer_anysearch_freshness(claim: str) -> str:
     """Use narrow recency filters only when the claim itself is time-sensitive."""
     text = str(claim or "").lower()
     if re.search(
-        r"(今天|今日|昨天|昨日|刚刚|突发|实时|最新|目前|当前|now|today|yesterday|breaking|latest)",
+        r"(今天|今日|昨天|昨日|前天|明天|后天|今晚|今早|今晨|明早|"
+        r"刚刚|突发|实时|最新|目前|当前|即将|马上|尚未发生|将于|"
+        r"now|today|yesterday|tomorrow|breaking|latest|upcoming|soon)",
         text,
     ):
         return "day"
@@ -2075,6 +2090,10 @@ def infer_anysearch_freshness(claim: str) -> str:
         r"(本周|这周|近日|近期|最近|过去几天|this week|recent|past few days)", text
     ):
         return "week"
+    if re.search(r"(本月|这个月|上月|下月|this month|next month|last month)", text):
+        return "month"
+    if re.search(r"(今年|本年度|去年|明年|this year|next year|last year)", text):
+        return "year"
     return ""
 
 
@@ -2595,6 +2614,32 @@ def split_source_title_url(source: str) -> tuple[str, str]:
         return text, ""
     url = normalize_url(match.group(1))
     return text[: match.start()].rstrip(" ：:"), url
+
+
+def source_comparison_key(source: str) -> str:
+    """Return a stable identity for detecting repeated follow-up sources."""
+    title, url = split_source_title_url(source)
+    if url:
+        parsed = urlparse(url)
+        host = str(parsed.hostname or "").lower().removeprefix("www.")
+        path = re.sub(r"/{2,}", "/", parsed.path or "/").rstrip("/") or "/"
+        tracking_keys = {
+            "fbclid",
+            "gclid",
+            "mc_cid",
+            "mc_eid",
+            "ref",
+            "source",
+        }
+        query_items = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_") and key.lower() not in tracking_keys
+        ]
+        query_text = urlencode(sorted(query_items))
+        query = f"?{query_text}" if query_text else ""
+        return f"{parsed.scheme.lower()}://{host}{path}{query}"
+    return re.sub(r"\s+", "", title).lower()
 
 
 def is_google_grounding_redirect(url: str) -> bool:

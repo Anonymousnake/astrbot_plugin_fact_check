@@ -77,7 +77,9 @@ def build_fact_check_kwargs(
             config.get("fact_check_anysearch_max_results_per_claim") or 3
         ),
         "anysearch_extract_top_urls": int(
-            config.get("fact_check_anysearch_extract_top_urls") or 2
+            3
+            if config.get("fact_check_anysearch_extract_top_urls", None) in (None, "")
+            else config.get("fact_check_anysearch_extract_top_urls")
         ),
         "anysearch_max_chars": int(
             config.get("fact_check_anysearch_max_chars") or 6000

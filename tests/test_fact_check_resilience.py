@@ -178,6 +178,52 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("原结论暂不改变", result.reply)
         self.assertEqual(result.sources, [])
 
+    def test_followup_cannot_treat_a_previous_source_as_new_grounding(self) -> None:
+        body = complete_fact_check_body(
+            "追问结论：旧结论应当推翻。\n"
+            "补充依据：官方报告确认了原命题。\n"
+            "是否改变原结论：原结论需要修正。\n"
+            "来源：官方报告",
+            groundingMetadata={
+                "groundingChunks": [
+                    {
+                        "web": {
+                            "uri": "https://agency.gov/report",
+                            "title": "官方报告",
+                        }
+                    }
+                ],
+                "groundingSupports": [
+                    {
+                        "segment": {"text": "官方报告确认了原命题。"},
+                        "groundingChunkIndices": [0],
+                    }
+                ],
+            },
+        )
+
+        with patch.object(
+            fact_check,
+            "generate_with_fallback",
+            return_value=(body, "gemini-2.5-flash"),
+        ):
+            result = fact_check.run_fact_check_followup(
+                original_text="原命题",
+                candidates=[fact_check.ClaimCandidate("官方报告确认了原命题")],
+                previous_reply="事实核查：部分存疑",
+                previous_sources=[
+                    "官方报告：https://www.agency.gov/report?utm_source=qq"
+                ],
+                question="现在能改结论了吗？",
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                main_models=["gemini-2.5-flash"],
+            )
+
+        self.assertIn("原结论暂不改变", result.reply)
+        self.assertIn("未获得新的可核验证据", result.reply)
+        self.assertEqual(result.sources, [])
+
     def test_trigger_requires_a_real_command_boundary(self) -> None:
         self.assertTrue(fact_check.is_trigger("/factcheck: claim"))
         self.assertTrue(fact_check.is_trigger("/事实核查 这是真的吗"))

@@ -289,10 +289,55 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             plugin._cache_ttl_for_request(
+                FactCheckRequest("这个政策明天开始执行吗", "/事实核查")
+            ),
+            120,
+        )
+        self.assertEqual(
+            plugin._cache_ttl_for_request(
                 FactCheckRequest("历史人物出生年份", "/事实核查")
             ),
             600,
         )
+
+    def test_relative_time_cache_key_changes_with_local_date(self) -> None:
+        plugin = make_plugin()
+        request = FactCheckRequest("这个政策明天开始执行吗", "/事实核查")
+
+        with patch(
+            "astrbot_plugin_fact_check.main._current_cache_date",
+            return_value="2026-08-12",
+        ):
+            first = plugin._request_cache_key(request)
+        with patch(
+            "astrbot_plugin_fact_check.main._current_cache_date",
+            return_value="2026-08-13",
+        ):
+            second = plugin._request_cache_key(request)
+
+        self.assertNotEqual(first, second)
+
+    def test_image_fact_check_uses_date_bucket_and_shorter_cache(self) -> None:
+        plugin = make_plugin()
+        request = FactCheckRequest(
+            "",
+            "/事实核查",
+            images=[ImageInput("https://example.com/news.png", content_sha256="abc")],
+        )
+
+        self.assertEqual(plugin._cache_ttl_for_request(request), 300)
+        with patch(
+            "astrbot_plugin_fact_check.main._current_cache_date",
+            return_value="2026-08-12",
+        ):
+            first = plugin._request_cache_key(request)
+        with patch(
+            "astrbot_plugin_fact_check.main._current_cache_date",
+            return_value="2026-08-13",
+        ):
+            second = plugin._request_cache_key(request)
+
+        self.assertNotEqual(first, second)
 
     async def test_status_command_reports_persisted_aggregate_metrics(self) -> None:
         plugin = make_plugin()
@@ -528,7 +573,7 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.request_data.images, [])
         self.assertEqual(session.candidates[0].claim, "请核查：A 事件是否属实？")
 
-    def test_v1_session_store_loads_and_is_rewritten_as_v2(self) -> None:
+    def test_v1_session_store_loads_and_is_rewritten_as_v3(self) -> None:
         created_at = time.time() - 10
         payload = {
             "version": 1,
@@ -558,7 +603,11 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
                 rewritten = json.loads(store.read_text(encoding="utf-8"))
 
         self.assertEqual(session.updated_at, created_at)
-        self.assertEqual(rewritten["version"], 2)
+        self.assertEqual(rewritten["version"], 3)
+        self.assertEqual(
+            rewritten["sessions"][0]["baseline_reply"],
+            "事实核查：证据不足",
+        )
         self.assertEqual(rewritten["sessions"][0]["updated_at"], created_at)
 
     def test_forward_failure_dump_omits_reply_text_by_default(self) -> None:
@@ -744,6 +793,8 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             await plugin.fact_check_followup(event)
 
         self.assertEqual(session.reply, followup_result.reply)
+        self.assertEqual(session.baseline_reply, "事实核查：部分存疑")
+        self.assertEqual(session.followup_history, [followup_result.reply])
         self.assertEqual(
             session.sources,
             [
@@ -757,6 +808,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             followup.call_args.kwargs["previous_reply"],
             "事实核查：部分存疑",
         )
+        context = plugin._followup_context(session)
+        self.assertIn("初始核查结果：\n事实核查：部分存疑", context)
+        self.assertIn(followup_result.reply, context)
 
     async def test_failed_followup_send_does_not_advance_session(self) -> None:
         plugin = make_plugin()
