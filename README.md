@@ -19,6 +19,15 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Optionally searches Anysearch for extra pre-retrieval evidence before the grounded check.
 - Formats replies as plain QQ-friendly text with explicit per-point `结论：` lines.
 - Maps Gemini grounding support back to individual claim blocks and marks claims without direct support.
+- Validates that the rendered claim still matches the requested claim before accepting a verdict.
+- Requires stronger evidence for legal, medical, financial, safety, and other high-risk claims: one primary source or two independent sources.
+- Detects explicit source conflicts and prevents them from becoming high-confidence conclusions.
+- Keeps Anysearch evidence attached to its originating claim and rejects extracted pages that do not materially overlap that claim.
+- Uses numbered source references consistently between claim hints and the final clickable source list.
+- Automatically shortens cache lifetime for breaking-news and recent-event claims.
+- Coalesces identical in-flight requests so concurrent users share one pipeline run.
+- Tracks QQ delivery success separately from model/pipeline success.
+- Preserves malformed JSON state as a `.corrupt-*` file before starting with safe defaults.
 - Preserves structurally complete claim blocks when a model response is truncated instead of discarding the whole result.
 - Saves cache hits as full fact-check sessions, so replying to cached results still supports follow-up.
 - Falls back to segmented OneBot text when merged-forward sending fails.
@@ -44,6 +53,12 @@ Managed by AstrBot WebUI through `_conf_schema.json`.
 - `fact_check_show_failure_reason`: append a short friendly reason to failures.
 - `fact_check_session_store_enabled`: persist owner-scoped follow-up sessions across restarts.
 - `fact_check_access_control_fail_open`: keep disabled so an ACL import failure does not expose the command globally.
+
+## Quality and runtime notes
+
+- `fact_check.py` remains the synchronous evidence pipeline. AstrBot-facing runtime coordination and configuration translation live in `runtime.py` and `pipeline_config.py`.
+- The hard timeout bounds how long the bot waits. Python cannot forcibly stop an already-running worker thread, so upstream HTTP calls still retain their own bounded timeouts.
+- The quality corpus under `tests/fixtures/` covers source conflicts, high-risk source strength, unrelated evidence, and ordinary low-risk claims. It intentionally does not implement user-feedback learning.
 
 ## Anysearch evidence mode
 
