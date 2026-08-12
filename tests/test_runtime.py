@@ -92,6 +92,27 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.assertFalse(capacity.locked())
 
+    async def test_cancelled_blocking_call_waits_for_worker_to_really_exit(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def work() -> str:
+            started.set()
+            release.wait(timeout=1)
+            return "done"
+
+        task = asyncio.create_task(
+            run_blocking_with_timeout(work, timeout=2),
+        )
+        await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0.02)
+
+        self.assertFalse(task.done())
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
     async def test_singleflight_start_if_admits_or_joins_atomically(self) -> None:
         flight: AsyncSingleFlight[str] = AsyncSingleFlight()
         gate = asyncio.Event()

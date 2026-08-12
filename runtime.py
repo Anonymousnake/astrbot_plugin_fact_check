@@ -36,7 +36,14 @@ async def run_blocking_with_timeout(
             pass
 
     worker.add_done_callback(finalize)
-    return await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
+    try:
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
+    except asyncio.CancelledError:
+        # Python cannot stop a thread already running in ``to_thread``. During
+        # plugin shutdown, keep the owning coroutine alive until that worker
+        # exits so a reloaded instance cannot overlap its network activity.
+        await asyncio.shield(worker)
+        raise
 
 
 class AsyncSingleFlight(Generic[T]):
