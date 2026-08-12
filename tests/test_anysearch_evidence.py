@@ -11,7 +11,7 @@ for astrbot_root in (Path("D:/Codex/AstrBot"), Path("/home/ubuntu/AstrBot")):
     if astrbot_root.exists():
         sys.path.insert(0, str(astrbot_root))
 
-from evidence_mapping import has_strong_claim_evidence
+from evidence_mapping import claim_text_matches, has_strong_claim_evidence
 from fact_check import (
     AnysearchEvidence,
     ClaimCandidate,
@@ -45,6 +45,90 @@ from fact_check import (
 
 
 class AnysearchEvidenceTests(unittest.TestCase):
+    def test_claim_match_rejects_opposite_polarity(self) -> None:
+        self.assertFalse(
+            claim_text_matches(
+                ClaimCandidate("该规定禁止平台收集这类数据"),
+                "该规定允许平台收集这类数据",
+            )
+        )
+
+    def test_single_claim_does_not_receive_unrelated_grounding_support(self) -> None:
+        body = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "事实核查：可信"}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {
+                                "web": {
+                                    "title": "Weather report",
+                                    "uri": "https://weather.example/report",
+                                }
+                            }
+                        ],
+                        "groundingSupports": [
+                            {
+                                "segment": {"text": "明天局部地区有小雨。"},
+                                "groundingChunkIndices": [0],
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+
+        mapped = extract_claim_source_map(
+            body,
+            [ClaimCandidate("某药物已获准治疗该疾病")],
+        )
+
+        self.assertEqual(mapped, [[]])
+
+    def test_evidence_direction_mismatch_downgrades_decisive_conclusion(self) -> None:
+        reply = (
+            "事实核查：可信\n"
+            "1. 核查点：A 事件已经发生。\n"
+            "结论：已核实\n"
+            "依据：来源明确否认该事件。\n"
+            "证据关系：反驳一致"
+        )
+
+        guarded = enforce_evidence_coverage(
+            reply,
+            [["官方说明：https://agency.gov/report"]],
+            [ClaimCandidate("A 事件已经发生。")],
+        )
+
+        self.assertIn("结论：部分存疑（证据方向与结论不一致）", guarded)
+        self.assertIn("事实核查：部分存疑", guarded)
+
+    def test_anysearch_caps_urls_to_requested_results_per_claim(self) -> None:
+        search_text = "\n".join(
+            f"- **URL**: https://news.example/{index}" for index in range(100)
+        )
+
+        def fake_call_tool(*, tool_name, **kwargs):
+            if tool_name == "search":
+                return search_text
+            raise AssertionError(f"unexpected tool: {tool_name}")
+
+        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+            evidence = collect_anysearch_evidence(
+                [ClaimCandidate("A claim")],
+                enabled=True,
+                endpoint="https://api.anysearch.com/mcp",
+                api_key="",
+                timeout=5,
+                max_claims=1,
+                max_results_per_claim=3,
+                extract_top_urls=0,
+                max_chars=4000,
+            )
+
+        self.assertIn("urls=3", evidence.reason)
+        self.assertLessEqual(len(evidence.sources), 3)
+
     def test_ensure_claim_points_visible_restores_omitted_questions(self) -> None:
         reply = (
             "事实核查：可信\n结论：已核实。第一条依据。\n结论：部分存疑。第二条依据。"

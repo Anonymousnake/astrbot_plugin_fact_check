@@ -65,6 +65,76 @@ class LocalImage(Image):
 
 
 class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
+    def test_complete_result_rejects_conclusion_evidence_direction_mismatch(self) -> None:
+        body = complete_single_claim_body(
+            conclusion="已核实",
+            relation="反驳一致",
+        )
+
+        with self.assertRaises(fact_check.IncompleteGenerationError):
+            fact_check.validate_complete_fact_check_result(body, expected_claim_count=1)
+
+    def test_partial_result_downgrades_claim_without_direct_mapped_source(self) -> None:
+        incomplete = {
+            "candidates": [
+                {
+                    "finishReason": "MAX_TOKENS",
+                    "content": {
+                        "parts": [
+                            {
+                                "text": (
+                                    "事实核查：可信\n"
+                                    "1. 核查点：A 事件是否发生。\n"
+                                    "结论：已核实\n"
+                                    "依据：搜索摘要声称事件发生。\n"
+                                    "证据关系：支持一致"
+                                )
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+
+        result = fact_check.build_partial_fact_check_result(
+            bodies=[incomplete],
+            candidates=[fact_check.ClaimCandidate("A 事件是否发生。")],
+            extra_sources=["无关页面：https://example.com/background"],
+            failure_reason="truncated",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIn("结论：证据不足（未找到可核验的直接来源）", result.reply)
+        self.assertNotIn("结论：已核实", result.reply)
+
+    def test_followup_cannot_change_original_conclusion_without_new_grounding(self) -> None:
+        body = complete_fact_check_body(
+            "追问结论：旧结论应当推翻。\n"
+            "补充依据：根据此前资料重新判断。\n"
+            "是否改变原结论：原结论需要修正。\n"
+            "来源：上次来源"
+        )
+
+        with patch.object(
+            fact_check,
+            "generate_with_fallback",
+            return_value=(body, "gemini-2.5-flash"),
+        ):
+            result = fact_check.run_fact_check_followup(
+                original_text="原始说法",
+                candidates=[fact_check.ClaimCandidate("核查原始说法")],
+                previous_reply="事实核查：可信",
+                previous_sources=["旧来源：https://old.example/report"],
+                question="结论要改吗？",
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                main_models=["gemini-2.5-flash"],
+            )
+
+        self.assertIn("原结论暂不改变", result.reply)
+        self.assertIn("未获得新的可核验证据", result.reply)
+        self.assertEqual(result.sources, [])
+
     def test_trigger_requires_a_real_command_boundary(self) -> None:
         self.assertTrue(fact_check.is_trigger("/factcheck: claim"))
         self.assertTrue(fact_check.is_trigger("/事实核查 这是真的吗"))
@@ -1435,7 +1505,23 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             "追问结论：新证据支持限定原说法。\n"
             "补充依据：官方资料给出了适用范围。\n"
             "是否改变原结论：原结论需要修正。\n"
-            "来源：官方资料。"
+            "来源：官方资料。",
+            groundingMetadata={
+                "groundingChunks": [
+                    {
+                        "web": {
+                            "uri": "https://agency.gov/scope",
+                            "title": "官方资料",
+                        }
+                    }
+                ],
+                "groundingSupports": [
+                    {
+                        "segment": {"text": "官方资料给出了适用范围。"},
+                        "groundingChunkIndices": [0],
+                    }
+                ],
+            },
         )
 
         with patch.object(

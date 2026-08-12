@@ -24,6 +24,30 @@ WEAK_EVIDENCE_RELATIONS = {
     "无直接证据": "证据不足（现有来源没有直接支持该命题）",
 }
 
+_POSITIVE_LABELS = {"已核实", "条件性成立", "表述需限定"}
+_NEGATIVE_LABELS = {"不准确"}
+
+
+def conclusion_relation_compatible(conclusion: str, relation: str) -> bool:
+    """Return false when evidence direction contradicts a decisive verdict."""
+    conclusion_label = next(
+        (label for label in CLAIM_LABELS if str(conclusion or "").strip().startswith(label)),
+        "",
+    )
+    relation_label = next(
+        (
+            label
+            for label in EVIDENCE_RELATIONS
+            if str(relation or "").strip().startswith(label)
+        ),
+        "",
+    )
+    if conclusion_label in _POSITIVE_LABELS and relation_label == "反驳一致":
+        return False
+    if conclusion_label in _NEGATIVE_LABELS and relation_label == "支持一致":
+        return False
+    return True
+
 
 def claim_evidence_relations(reply: str) -> dict[int, str]:
     relations: dict[int, str] = {}

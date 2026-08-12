@@ -48,9 +48,17 @@ except ImportError:
     )
 
 try:
-    from .verdict_policy import EVIDENCE_RELATIONS, summary_matches_claim_labels
+    from .verdict_policy import (
+        EVIDENCE_RELATIONS,
+        conclusion_relation_compatible,
+        summary_matches_claim_labels,
+    )
 except ImportError:  # pragma: no cover - supports direct module imports in tests
-    from verdict_policy import EVIDENCE_RELATIONS, summary_matches_claim_labels
+    from verdict_policy import (
+        EVIDENCE_RELATIONS,
+        conclusion_relation_compatible,
+        summary_matches_claim_labels,
+    )
 
 
 TRIGGER_RE = re.compile(
@@ -645,6 +653,7 @@ def run_fact_check(
                 bodies=[initial_evidence_body],
                 candidates=deduped,
                 extra_sources=anysearch_evidence.sources,
+                extra_claim_sources=anysearch_evidence.claim_sources,
                 failure_reason=str(exc),
             )
             if partial_result is not None:
@@ -686,6 +695,7 @@ def run_fact_check(
                 bodies=[evidence_body, initial_evidence_body],
                 candidates=deduped,
                 extra_sources=anysearch_evidence.sources,
+                extra_claim_sources=anysearch_evidence.claim_sources,
                 failure_reason=str(retry_exc),
             )
             if partial_result is not None:
@@ -1070,11 +1080,36 @@ def run_fact_check_followup(
     sources = normalize_fact_check_sources(
         select_fact_check_sources(
             extract_sources(body),
-            previous_sources,
+            [],
             claims=[candidate.claim for candidate in candidates],
             limit=3,
         ),
     )
+    change_match = re.search(
+        r"(?:^|\n)是否改变原结论[：:]\s*([^\n]+)",
+        reply,
+    )
+    change_state = change_match.group(1).strip() if change_match else ""
+    requests_change = bool(
+        change_state
+        and not change_state.startswith(("原结论暂不改变", "不改变"))
+    )
+    has_new_grounding = bool(sources and has_grounding_supports(body))
+    if requests_change and not has_new_grounding:
+        reply = (
+            "追问结论：本次未获得新的可核验证据，无法据此修改原结论。\n"
+            "补充依据：本轮没有返回与追问直接对应的新来源。\n"
+            "是否改变原结论：原结论暂不改变\n"
+            "来源：本次无新增可核验来源"
+        )
+        sources = []
+    elif not sources:
+        reply = re.sub(
+            r"(?:^|\n)来源[：:]\s*[^\n]+",
+            "\n来源：本次未获得新的可核验来源（仅参考上次核查上下文）",
+            reply,
+            count=1,
+        ).strip()
     if sources and "来源" not in reply:
         reply += "\n来源：" + "；".join(
             compact_source_label(source) for source in sources
@@ -1825,14 +1860,23 @@ def collect_anysearch_evidence(
                     endpoint_validated=True,
                 )
 
-            urls = [
-                url
-                for url in extract_public_urls(search_text)
-                if is_public_http_url(url)
-            ]
+            search_text = shorten_text(search_text, 50000)
             query_url_groups = extract_anysearch_urls_by_query(
                 search_text,
                 query_count=len(query_payloads),
+            )
+            per_query_limit = _clamp_int(
+                max_results_per_claim,
+                default=3,
+                lower=1,
+                upper=10,
+            )
+            query_url_groups = [
+                group[:per_query_limit] for group in query_url_groups
+            ]
+            urls = select_round_robin_urls(
+                query_url_groups,
+                limit=min(30, per_query_limit * len(query_payloads)),
             )
             query_claim_indexes: list[list[int]] = []
             for payload in query_payloads:
@@ -1948,6 +1992,8 @@ def extract_anysearch_urls_by_query(text: str, *, query_count: int) -> list[list
 
 
 def select_round_robin_urls(groups: list[list[str]], *, limit: int) -> list[str]:
+    if int(limit or 0) <= 0:
+        return []
     selected: list[str] = []
     max_depth = max((len(group) for group in groups), default=0)
     for depth in range(max_depth):
@@ -2704,6 +2750,10 @@ def validate_complete_fact_check_result(
             raise IncompleteGenerationError(
                 f"claim {number} must have one valid evidence relation",
             )
+        if not conclusion_relation_compatible(conclusions[0], relations[0]):
+            raise IncompleteGenerationError(
+                f"claim {number} conclusion contradicts evidence direction",
+            )
     if not summary_matches_claim_labels(summary_match.group(1), child_labels):
         raise IncompleteGenerationError(
             "fact-check summary contradicts child conclusions",
@@ -2866,28 +2916,66 @@ def build_partial_fact_check_result(
     candidates: list[ClaimCandidate],
     extra_sources: list[str],
     failure_reason: str,
+    extra_claim_sources: list[list[str]] | None = None,
 ) -> FactCheckResult | None:
-    replies = [
-        salvage_partial_fact_check_reply(body, candidates)
+    reply_bodies = [
+        (salvage_partial_fact_check_reply(body, candidates), body)
         for body in bodies
         if isinstance(body, dict)
     ]
-    reply = max(
-        (item for item in replies if item),
-        key=lambda item: (item.count("\n结论："), len(item)),
-        default="",
+    selected = max(
+        (item for item in reply_bodies if item[0]),
+        key=lambda item: (item[0].count("\n结论："), len(item[0])),
+        default=("", {}),
     )
+    reply, selected_body = selected
     if not reply:
         return None
 
-    grounding_sources: list[str] = []
-    for body in bodies:
-        if isinstance(body, dict):
-            grounding_sources.extend(extract_sources(body))
+    original_claim_sources = merge_claim_sources(
+        extract_claim_source_map(selected_body, candidates),
+        extra_claim_sources or [],
+    )
+    rendered_blocks = _parse_fact_check_blocks(reply)
+    rendered_candidates: list[ClaimCandidate] = []
+    rendered_claim_sources: list[list[str]] = []
+    used_indexes: set[int] = set()
+    for _, point, _, _, _ in rendered_blocks:
+        matched_index = next(
+            (
+                index
+                for index, candidate in enumerate(candidates)
+                if index not in used_indexes and claim_text_matches(candidate, point)
+            ),
+            None,
+        )
+        if matched_index is None:
+            rendered_candidates.append(ClaimCandidate(point))
+            rendered_claim_sources.append([])
+            continue
+        used_indexes.add(matched_index)
+        rendered_candidates.append(candidates[matched_index])
+        rendered_claim_sources.append(
+            original_claim_sources[matched_index]
+            if matched_index < len(original_claim_sources)
+            else []
+        )
+    reply = enforce_evidence_coverage(
+        reply,
+        rendered_claim_sources,
+        rendered_candidates,
+    )
+
+    # Global search hits are not enough for a partial verdict. Only sources
+    # directly mapped to one of the salvaged claims may be displayed.
+    _ = extra_sources
+    direct_sources = [
+        source for claim_sources in rendered_claim_sources for source in claim_sources
+    ]
     sources = normalize_fact_check_sources(
         select_fact_check_sources(
-            grounding_sources,
-            extra_sources,
+            direct_sources,
+            [],
             claims=[candidate.claim for candidate in candidates],
             limit=3,
         ),

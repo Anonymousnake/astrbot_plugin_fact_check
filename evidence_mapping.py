@@ -8,6 +8,7 @@ try:
     from .verdict_policy import (
         WEAK_EVIDENCE_RELATIONS,
         claim_evidence_relations,
+        conclusion_relation_compatible,
         reconcile_fact_check_summary,
     )
 except ImportError:  # pragma: no cover - supports direct module imports in tests
@@ -15,6 +16,7 @@ except ImportError:  # pragma: no cover - supports direct module imports in test
     from verdict_policy import (
         WEAK_EVIDENCE_RELATIONS,
         claim_evidence_relations,
+        conclusion_relation_compatible,
         reconcile_fact_check_summary,
     )
 
@@ -63,6 +65,8 @@ def claim_text_matches(expected: Any, actual: str) -> bool:
     actual_compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", actual_text.lower())
     if not expected_compact or not actual_compact:
         return False
+    if _has_opposite_polarity(expected_compact, actual_compact):
+        return False
     if min(len(expected_compact), len(actual_compact)) >= 4 and (
         expected_compact in actual_compact or actual_compact in expected_compact
     ):
@@ -74,6 +78,27 @@ def claim_text_matches(expected: Any, actual: str) -> bool:
     shared = expected_terms.intersection(actual_terms)
     coverage = len(shared) / max(1, min(len(expected_terms), len(actual_terms)))
     return len(shared) >= 2 and coverage >= 0.45
+
+
+def _has_opposite_polarity(left: str, right: str) -> bool:
+    pairs = (
+        (("禁止", "不得", "不允许"), ("允许", "可以")),
+        (("未发生", "没有发生"), ("已发生", "已经发生")),
+        (("不支持",), ("支持",)),
+        (("不属于",), ("属于",)),
+    )
+
+    def state(text: str, negatives: tuple[str, ...], positives: tuple[str, ...]) -> int:
+        if any(term in text for term in negatives):
+            return -1
+        return 1 if any(term in text for term in positives) else 0
+
+    return any(
+        (left_state := state(left, negatives, positives))
+        and (right_state := state(right, negatives, positives))
+        and left_state != right_state
+        for negatives, positives in pairs
+    )
 
 
 _EVIDENCE_REQUIRED_LABELS = (
@@ -146,7 +171,11 @@ def enforce_evidence_coverage(
                 else []
             )
             relation = relations.get(current_claim, "")
-            if relation.startswith("来源冲突"):
+            conclusion_text = conclusion.group(0).split("：", 1)[-1].split(":", 1)[-1]
+            if not conclusion_relation_compatible(conclusion_text, relation):
+                line = conclusion.group(1) + "部分存疑（证据方向与结论不一致）"
+                downgraded += 1
+            elif relation.startswith("来源冲突"):
                 line = conclusion.group(1) + "部分存疑（直接来源之间存在冲突）"
                 downgraded += 1
             elif weak_reason := next(
@@ -246,12 +275,8 @@ def extract_claim_source_map(
         if best_index is None:
             segment_terms = _match_terms(segment_text)
             scores = [len(terms.intersection(segment_terms)) for terms in claim_terms]
-            best_index = (
-                0
-                if len(claims) == 1
-                else max(range(len(scores)), key=scores.__getitem__)
-            )
-            if len(claims) > 1 and not scores[best_index]:
+            best_index = max(range(len(scores)), key=scores.__getitem__)
+            if not scores[best_index]:
                 continue
         for index in support.get("groundingChunkIndices") or []:
             if not isinstance(index, int) or not 0 <= index < len(chunks):
