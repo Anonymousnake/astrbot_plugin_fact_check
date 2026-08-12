@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import sys
-import tempfile
-import time
-import unittest
+import asyncio
 import json
 import os
+import sys
+import tempfile
+import threading
+import time
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -13,8 +15,14 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from astrbot.api.message_components import Image, Plain, Reply
-from astrbot_plugin_fact_check.fact_check import ClaimCandidate, FactCheckRequest, FactCheckResult, ImageInput
 from astrbot_plugin_fact_check import main
+from astrbot_plugin_fact_check.fact_check import (
+    ClaimCandidate,
+    FactCheckRequest,
+    FactCheckResult,
+    ImageInput,
+)
+from astrbot_plugin_fact_check.runtime import AsyncSingleFlight
 from astrbot_plugin_fact_check.storage import FactCheckMetricsStore
 
 
@@ -128,6 +136,7 @@ def make_plugin() -> main.FactCheckPlugin:
     plugin._reply_cache = {}
     plugin._fact_check_sessions = {}
     plugin._fact_check_tasks = set()
+    plugin._singleflight = AsyncSingleFlight()
     plugin._active_followup_jobs = 0
     plugin._cooldown_until = 0.0
     plugin._fact_check_semaphore = main.asyncio.Semaphore(1)
@@ -138,6 +147,60 @@ def make_plugin() -> main.FactCheckPlugin:
 
 
 class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_outcome_is_recorded_separately_from_pipeline_success(
+        self,
+    ) -> None:
+        plugin = make_plugin()
+        event = FakeEvent(fail_send=False)
+
+        with patch.object(
+            plugin, "_send_fact_check_reply_impl", new=AsyncMock(return_value=False)
+        ):
+            sent = await plugin._send_fact_check_reply(
+                event,
+                "事实核查：可信",
+                label="test",
+                purpose="result",
+            )
+
+        self.assertFalse(sent)
+        self.assertEqual(plugin._metrics_store.snapshot()["delivery_failure"], 1)
+
+    async def test_duplicate_inflight_jobs_share_one_pipeline_call(self) -> None:
+        plugin = make_plugin()
+        request = FactCheckRequest(text="A 事件", trigger_text="/事实核查")
+        first_event = FakeEvent(fail_send=False)
+        second_event = FakeEvent(fail_send=False)
+        started = threading.Event()
+        release = threading.Event()
+
+        def run_once(*_args):
+            started.set()
+            release.wait(timeout=2)
+            return FactCheckResult("事实核查：可信", "ok")
+
+        with (
+            patch.object(plugin, "_run_fact_check_sync", side_effect=run_once) as run,
+            patch.object(plugin, "_send_fact_check_reply", new=AsyncMock()) as send,
+        ):
+            first = asyncio.create_task(
+                plugin._run_fact_check_job(
+                    first_event, request, time.perf_counter(), "same-key"
+                ),
+            )
+            await asyncio.to_thread(started.wait, 1)
+            second = asyncio.create_task(
+                plugin._run_fact_check_job(
+                    second_event, request, time.perf_counter(), "same-key"
+                ),
+            )
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(first, second)
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(send.await_count, 2)
+
     def test_cache_key_changes_when_pipeline_version_changes(self) -> None:
         plugin = make_plugin()
         request = FactCheckRequest(text="A 事件", trigger_text="/事实核查")
@@ -149,12 +212,30 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(first, second)
 
+    def test_breaking_news_uses_a_shorter_cache_ttl(self) -> None:
+        plugin = make_plugin()
+
+        self.assertEqual(
+            plugin._cache_ttl_for_request(
+                FactCheckRequest("今天最新突发消息", "/事实核查")
+            ),
+            120,
+        )
+        self.assertEqual(
+            plugin._cache_ttl_for_request(
+                FactCheckRequest("历史人物出生年份", "/事实核查")
+            ),
+            600,
+        )
+
     async def test_status_command_reports_persisted_aggregate_metrics(self) -> None:
         plugin = make_plugin()
         plugin._metrics_store.record(outcome="partial", elapsed=2.0)
         event = FakeEvent(fail_send=False)
 
-        with patch("astrbot_plugin_fact_check.main.is_plugin_allowed", return_value=True):
+        with patch(
+            "astrbot_plugin_fact_check.main.is_plugin_allowed", return_value=True
+        ):
             results = [item async for item in plugin.factcheck_status(event)]
 
         self.assertTrue(event.stopped)
@@ -179,8 +260,12 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             get_sender_id=lambda: "other-user",
         )
 
-        self.assertTrue(main.FactCheckPlugin._session_visible_to_event(session, owner_event))
-        self.assertFalse(main.FactCheckPlugin._session_visible_to_event(session, other_member_event))
+        self.assertTrue(
+            main.FactCheckPlugin._session_visible_to_event(session, owner_event)
+        )
+        self.assertFalse(
+            main.FactCheckPlugin._session_visible_to_event(session, other_member_event)
+        )
 
     def test_missing_access_control_fails_closed_by_default(self) -> None:
         plugin = make_plugin()
@@ -205,13 +290,17 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             patch("astrbot_plugin_fact_check.main.run_fact_check", return_value=failed),
             patch.object(plugin, "_send_fact_check_reply", new=AsyncMock()) as send,
         ):
-            await plugin._run_fact_check_job(event, request, time.perf_counter(), "cache-key")
+            await plugin._run_fact_check_job(
+                event, request, time.perf_counter(), "cache-key"
+            )
 
         self.assertEqual(plugin._reply_cache, {})
         self.assertEqual(plugin._fact_check_sessions, {})
         self.assertIsNone(send.call_args.kwargs["session_id"])
 
-    def test_request_cache_key_uses_image_content_instead_of_snapshot_path(self) -> None:
+    def test_request_cache_key_uses_image_content_instead_of_snapshot_path(
+        self,
+    ) -> None:
         plugin = make_plugin()
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -221,10 +310,14 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             second.write_bytes(b"same-image")
 
             first_key = plugin._request_cache_key(
-                FactCheckRequest("", "/事实核查", images=[ImageInput("", "first.png", str(first))]),
+                FactCheckRequest(
+                    "", "/事实核查", images=[ImageInput("", "first.png", str(first))]
+                ),
             )
             second_key = plugin._request_cache_key(
-                FactCheckRequest("", "/事实核查", images=[ImageInput("", "second.png", str(second))]),
+                FactCheckRequest(
+                    "", "/事实核查", images=[ImageInput("", "second.png", str(second))]
+                ),
             )
 
         self.assertEqual(first_key, second_key)
@@ -239,10 +332,14 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             second.write_bytes(b"second-image")
 
             first_key = plugin._request_cache_key(
-                FactCheckRequest("", "/事实核查", images=[ImageInput("", "first.png", str(first))]),
+                FactCheckRequest(
+                    "", "/事实核查", images=[ImageInput("", "first.png", str(first))]
+                ),
             )
             second_key = plugin._request_cache_key(
-                FactCheckRequest("", "/事实核查", images=[ImageInput("", "second.png", str(second))]),
+                FactCheckRequest(
+                    "", "/事实核查", images=[ImageInput("", "second.png", str(second))]
+                ),
             )
 
         self.assertNotEqual(first_key, second_key)
@@ -265,6 +362,7 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent()
         original_send_chain_result = main.send_chain_result
         original_sleep = main.asyncio.sleep
+
         async def fake_sleep(_seconds):
             return None
 
@@ -300,7 +398,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
     def test_public_forward_test_command_is_removed(self) -> None:
         self.assertFalse(hasattr(main.FactCheckPlugin, "fact_check_forward_test"))
 
-    def test_cached_result_preserves_candidates_and_sources_for_followup_session(self) -> None:
+    def test_cached_result_preserves_candidates_and_sources_for_followup_session(
+        self,
+    ) -> None:
         plugin = make_plugin()
         event = FakeEvent(fail_send=False)
         request = FactCheckRequest(text="A 事件是真的", trigger_text="/事实核查")
@@ -317,7 +417,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         session_id = plugin._remember_fact_check_session(event, request, cached)
 
         session = plugin._fact_check_sessions[session_id]
-        self.assertEqual([item.claim for item in session.candidates], ["请核查：A 事件是否属实？"])
+        self.assertEqual(
+            [item.claim for item in session.candidates], ["请核查：A 事件是否属实？"]
+        )
         self.assertEqual(session.sources, ["https://example.com/source"])
 
     def test_followup_sessions_persist_without_original_media_or_text(self) -> None:
@@ -414,7 +516,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("text", payload)
         self.assertNotIn("chunks", payload)
-        self.assertEqual(payload["length"], len("敏感事实核查正文 https://example.com/?token=secret"))
+        self.assertEqual(
+            payload["length"], len("敏感事实核查正文 https://example.com/?token=secret")
+        )
         self.assertIn("text_sha256", payload)
         self.assertNotIn("secret", payload["error"])
         self.assertNotIn("private.png", payload["error"])
@@ -475,7 +579,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)),
+            patch.object(
+                plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)
+            ),
             patch("astrbot_plugin_fact_check.main.is_plugin_allowed", None),
             patch("astrbot_plugin_fact_check.main.run_fact_check_followup") as followup,
         ):
@@ -507,7 +613,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)),
+            patch.object(
+                plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)
+            ),
             patch("astrbot_plugin_fact_check.main.is_plugin_allowed", None),
             patch("astrbot_plugin_fact_check.main.run_fact_check_followup") as followup,
         ):
@@ -554,8 +662,12 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)),
-            patch.object(plugin, "_send_fact_check_reply", new=AsyncMock(return_value=True)),
+            patch.object(
+                plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)
+            ),
+            patch.object(
+                plugin, "_send_fact_check_reply", new=AsyncMock(return_value=True)
+            ),
             patch.object(plugin, "_persist_fact_check_sessions") as persist,
             patch("astrbot_plugin_fact_check.main.is_plugin_allowed", None),
             patch(
@@ -594,13 +706,21 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         plugin._fact_check_sessions[session.session_id] = session
         event = FakeEvent(
             message_str="再查一下",
-            messages=[Reply(id="1", message_str=f"{session.reply}\n核查ID：{session.session_id}")],
+            messages=[
+                Reply(
+                    id="1", message_str=f"{session.reply}\n核查ID：{session.session_id}"
+                )
+            ],
             fail_send=False,
         )
 
         with (
-            patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)),
-            patch.object(plugin, "_send_fact_check_reply", new=AsyncMock(return_value=False)),
+            patch.object(
+                plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)
+            ),
+            patch.object(
+                plugin, "_send_fact_check_reply", new=AsyncMock(return_value=False)
+            ),
             patch.object(plugin, "_persist_fact_check_sessions") as persist,
             patch("astrbot_plugin_fact_check.main.is_plugin_allowed", None),
             patch(
@@ -623,7 +743,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.sources, ["https://example.com/old"])
         persist.assert_not_called()
 
-    async def test_onebot_text_retry_resumes_failed_chunk_without_duplicates(self) -> None:
+    async def test_onebot_text_retry_resumes_failed_chunk_without_duplicates(
+        self,
+    ) -> None:
         plugin = make_plugin()
         event = FakeEvent(fail_send=False, bot=FakeBot(fail_call_number=2))
         original_sleep = main.asyncio.sleep
@@ -643,7 +765,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             main.asyncio.sleep = original_sleep
 
         self.assertTrue(ok)
-        sent_chunks = [call[1]["message"][0]["data"]["text"] for call in event.bot.calls]
+        sent_chunks = [
+            call[1]["message"][0]["data"]["text"] for call in event.bot.calls
+        ]
         self.assertEqual(sent_chunks, ["A" * 350, "A" * 10, "A" * 10])
 
     async def test_onebot_confirm_timeout_continues_with_remaining_chunks(self) -> None:
@@ -651,7 +775,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(fail_send=False, bot=ConfirmTimeoutBot(timeout_call_number=1))
 
         with (
-            patch("astrbot_plugin_fact_check.main.is_confirm_timeout", return_value=True),
+            patch(
+                "astrbot_plugin_fact_check.main.is_confirm_timeout", return_value=True
+            ),
             patch("astrbot_plugin_fact_check.main.asyncio.sleep", new=AsyncMock()),
         ):
             ok = await plugin._send_text_via_onebot(
@@ -662,7 +788,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(ok)
-        sent_chunks = [call[1]["message"][0]["data"]["text"] for call in event.bot.calls]
+        sent_chunks = [
+            call[1]["message"][0]["data"]["text"] for call in event.bot.calls
+        ]
         self.assertEqual(sent_chunks, ["A" * 350, "A" * 10])
 
     async def test_forward_rejection_skips_identical_forward_retry(self) -> None:
@@ -709,7 +837,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(outputs), 1)
         self.assertIn("用法：回复一条消息后发送 /事实核查", outputs[0]["plain"])
 
-    async def test_expired_fact_check_reply_followup_gets_explicit_message(self) -> None:
+    async def test_expired_fact_check_reply_followup_gets_explicit_message(
+        self,
+    ) -> None:
         plugin = make_plugin()
         event = FakeEvent(
             message_str="还能展开说说吗",
@@ -718,7 +848,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)),
+            patch.object(
+                plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)
+            ),
             patch("astrbot_plugin_fact_check.main.is_plugin_allowed", None),
         ):
             await plugin.fact_check_followup(event)
@@ -727,7 +859,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(event.sent), 1)
         self.assertIn("上下文已过期", event.sent[0]["plain"])
 
-    async def test_unrelated_reply_without_sessions_does_not_fetch_remote_payload(self) -> None:
+    async def test_unrelated_reply_without_sessions_does_not_fetch_remote_payload(
+        self,
+    ) -> None:
         plugin = make_plugin()
         event = FakeEvent(
             message_str="这是什么意思",
@@ -742,7 +876,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(missing)
         fetch.assert_not_awaited()
 
-    async def test_local_fact_check_marker_matches_session_without_remote_fetch(self) -> None:
+    async def test_local_fact_check_marker_matches_session_without_remote_fetch(
+        self,
+    ) -> None:
         plugin = make_plugin()
         session = main.FactCheckSession(
             session_id="fc_aaaabbbb",
@@ -771,7 +907,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(missing)
         fetch.assert_not_awaited()
 
-    async def test_markerless_followup_matches_the_quoted_session_not_the_latest(self) -> None:
+    async def test_markerless_followup_matches_the_quoted_session_not_the_latest(
+        self,
+    ) -> None:
         plugin = make_plugin()
         older = main.FactCheckSession(
             session_id="fc_11111111",
@@ -789,20 +927,27 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             request_data=FactCheckRequest("latest", "/事实核查"),
             reply="事实核查：可信\n1. 核查点：新事件已经发生。\n结论：已核实。",
         )
-        plugin._fact_check_sessions = {older.session_id: older, latest.session_id: latest}
+        plugin._fact_check_sessions = {
+            older.session_id: older,
+            latest.session_id: latest,
+        }
         event = FakeEvent(
             message_str="再解释一下",
             messages=[Reply(id="1", message_str=older.reply)],
             fail_send=False,
         )
 
-        with patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)):
+        with patch.object(
+            plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)
+        ):
             session, missing = await plugin._find_followup_session_with_state(event)
 
         self.assertFalse(missing)
         self.assertIs(session, older)
 
-    async def test_ambiguous_markerless_followup_does_not_guess_latest_session(self) -> None:
+    async def test_ambiguous_markerless_followup_does_not_guess_latest_session(
+        self,
+    ) -> None:
         plugin = make_plugin()
         for index in range(2):
             session_id = f"fc_{index + 1:08d}"
@@ -820,7 +965,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             fail_send=False,
         )
 
-        with patch.object(plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)):
+        with patch.object(
+            plugin, "_fetch_reply_payload", new=AsyncMock(return_value=None)
+        ):
             session, missing = await plugin._find_followup_session_with_state(event)
 
         self.assertIsNone(session)
@@ -832,8 +979,13 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         images = [
             NoLocalImage(file="base64://QUJD", url="base64://QUJD"),
             NoLocalImage(file="file:///etc/passwd", url="file:///etc/passwd"),
-            NoLocalImage(file="http://127.0.0.1/private.png", url="http://127.0.0.1/private.png"),
-            NoLocalImage(file="https://example.com/public.png", url="https://example.com/public.png"),
+            NoLocalImage(
+                file="http://127.0.0.1/private.png", url="http://127.0.0.1/private.png"
+            ),
+            NoLocalImage(
+                file="https://example.com/public.png",
+                url="https://example.com/public.png",
+            ),
         ]
 
         result = await plugin._image_inputs(images, remaining=4)
@@ -849,7 +1001,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             source.write_bytes(b"stable-image-content")
             component = Image(file="quoted.png", path=str(source))
 
-            with patch.object(main.StarTools, "get_data_dir", return_value=root / "plugin-data"):
+            with patch.object(
+                main.StarTools, "get_data_dir", return_value=root / "plugin-data"
+            ):
                 result = await plugin._image_inputs([component], remaining=1)
 
             self.assertEqual(len(result), 1)
@@ -858,7 +1012,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             source.unlink()
             self.assertEqual(Path(result[0].path).read_bytes(), b"stable-image-content")
 
-    async def test_image_inputs_skip_duplicate_reference_before_resolution(self) -> None:
+    async def test_image_inputs_skip_duplicate_reference_before_resolution(
+        self,
+    ) -> None:
         plugin = make_plugin()
         first = CountingImage(
             file="same.png",
@@ -962,11 +1118,17 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temp_dir)
             source = root / "source.png"
             source.write_bytes(b"same-image")
-            with patch.object(main.StarTools, "get_data_dir", return_value=root / "data"):
-                target = Path(plugin._snapshot_image_path(str(source), file_name="source.png"))
+            with patch.object(
+                main.StarTools, "get_data_dir", return_value=root / "data"
+            ):
+                target = Path(
+                    plugin._snapshot_image_path(str(source), file_name="source.png")
+                )
                 old_time = time.time() - 100
                 os.utime(target, (old_time, old_time))
-                refreshed = Path(plugin._snapshot_image_path(str(source), file_name="source.png"))
+                refreshed = Path(
+                    plugin._snapshot_image_path(str(source), file_name="source.png")
+                )
 
             self.assertEqual(refreshed, target)
             self.assertGreater(refreshed.stat().st_mtime, old_time)
