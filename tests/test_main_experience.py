@@ -147,6 +147,55 @@ def make_plugin() -> main.FactCheckPlugin:
 
 
 class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_progress_send_does_not_start_fact_check_pipeline(self) -> None:
+        plugin = make_plugin()
+        event = FakeEvent(
+            message_str="/事实核查 A 事件是真的",
+            messages=[Plain("/事实核查 A 事件是真的")],
+            fail_send=True,
+        )
+        request = FactCheckRequest(
+            text="A 事件是真的",
+            trigger_text="/事实核查 A 事件是真的",
+        )
+
+        with (
+            patch("astrbot_plugin_fact_check.main.is_plugin_allowed", None),
+            patch.object(
+                plugin,
+                "_build_fact_check_request",
+                new=AsyncMock(return_value=request),
+            ),
+            patch.object(plugin, "_run_fact_check_sync") as run_sync,
+        ):
+            async for _ in plugin.fact_check(event):
+                pass
+            await asyncio.sleep(0)
+
+        run_sync.assert_not_called()
+        self.assertEqual(plugin._singleflight.active_count, 0)
+
+    async def test_terminate_cancels_singleflight_pipeline(self) -> None:
+        plugin = make_plugin()
+        started = asyncio.Event()
+
+        async def factory() -> FactCheckResult:
+            started.set()
+            await asyncio.Event().wait()
+            return FactCheckResult("never")
+
+        task, _ = plugin._singleflight.start_if(
+            "active",
+            factory,
+            can_start=lambda: True,
+        )
+        await started.wait()
+
+        await plugin.terminate()
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(plugin._singleflight.active_count, 0)
+
     async def test_send_outcome_is_recorded_separately_from_pipeline_success(
         self,
     ) -> None:

@@ -86,3 +86,12 @@ class AsyncSingleFlight(Generic[T]):
         task, joined = self.start_if(key, factory, can_start=lambda: True)
         assert task is not None
         return await asyncio.shield(task), joined
+
+    async def cancel_all(self) -> None:
+        """Cancel and await every shared pipeline owned by this instance."""
+        tasks = [task for task in self._tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()

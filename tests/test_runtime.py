@@ -16,6 +16,23 @@ from astrbot_plugin_fact_check.runtime import (
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_singleflight_cancel_all_stops_and_forgets_active_tasks(self) -> None:
+        flight: AsyncSingleFlight[str] = AsyncSingleFlight()
+        started = asyncio.Event()
+
+        async def factory() -> str:
+            started.set()
+            await asyncio.Event().wait()
+            return "never"
+
+        task, _ = flight.start_if("active", factory, can_start=lambda: True)
+        await started.wait()
+
+        await flight.cancel_all()
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(flight.active_count, 0)
+
     async def test_singleflight_runs_identical_work_only_once(self) -> None:
         flight: AsyncSingleFlight[str] = AsyncSingleFlight()
         calls = 0

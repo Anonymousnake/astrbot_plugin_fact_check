@@ -48,7 +48,7 @@ from .pipeline_config import build_fact_check_kwargs
 from .runtime import AsyncSingleFlight, run_blocking_with_timeout
 from .storage import FactCheckMetricsStore, atomic_write_json, read_json_file
 
-FACT_CHECK_PIPELINE_VERSION = "quality-v4"
+FACT_CHECK_PIPELINE_VERSION = "quality-v5"
 
 try:
     from astrbot_plugin_access_control.access_control import is_plugin_allowed
@@ -398,6 +398,28 @@ class FactCheckPlugin(Star):
                 capacity=self._fact_check_semaphore,
             )
 
+        if self._fact_check_queue_full() and not self._singleflight.has(cache_key):
+            logger.warning(
+                f"[astrbot-fact-check-queue-full] {self._event_label(event)}: "
+                f"jobs={self._active_fact_check_jobs()} max={self._max_fact_check_queue()}",
+            )
+            yield event.plain_result("事实核查队列满了，等前面的跑完再试一下。")
+            return
+
+        joining_hint = self._singleflight.has(cache_key)
+        try:
+            await event.send(
+                event.plain_result(
+                    "同一条正在核查，我复用结果。" if joining_hint else "我先查一下。"
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[astrbot-fact-check-progress-send-failed] "
+                f"{self._event_label(event)}: {exc!r}",
+            )
+            return
+
         pipeline_task, joining_existing = self._singleflight.start_if(
             cache_key,
             compute,
@@ -415,11 +437,6 @@ class FactCheckPlugin(Star):
             f"[astrbot-fact-check-queue] {self._event_label(event)}: "
             f"text_len={len(request_data.text)} images={len(request_data.images)} "
             f"active={len(self._fact_check_tasks)} key={cache_key[:12]}",
-        )
-        await event.send(
-            event.plain_result(
-                "同一条正在核查，我复用结果。" if joining_existing else "我先查一下。"
-            )
         )
         task = asyncio.create_task(
             self._run_fact_check_job(
@@ -2327,4 +2344,5 @@ class FactCheckPlugin(Star):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self._singleflight.cancel_all()
         logger.info("[astrbot-fact-check] terminated")
