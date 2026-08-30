@@ -151,24 +151,81 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
     def test_followup_wake_filter_requires_reply_and_actionable_question(self) -> None:
         wake_filter = main.FactCheckFollowupWakeFilter()
 
-        self.assertFalse(
-            wake_filter.filter(
-                FakeEvent(message_str="谢谢", messages=[Reply(id="1")]),
-                {},
-            )
+        ignored = (
+            "谢谢",
+            "谢谢你的解释",
+            "好的我知道了",
+            "收到",
+            "OK",
+            "辛苦了",
+            "明白了",
+            "原来如此",
+            "嗯嗯",
+            "哈哈",
+            "厉害",
+            "牛逼",
+            "行",
+            "可以",
+            "没事了",
+            "确实",
+            "有道理",
+            "这新闻真离谱",
+            "我去看看",
+            "先这样吧",
+            "晚安",
+            "确实有意思",
+            "不错",
+            "好吧",
+            "666",
+            "👍",
         )
+        for text in ignored:
+            with self.subTest(ignored=text):
+                self.assertFalse(
+                    wake_filter.filter(
+                        FakeEvent(message_str=text, messages=[Reply(id="1")]),
+                        {},
+                    )
+                )
+
         self.assertFalse(
             wake_filter.filter(
                 FakeEvent(message_str="来源是什么", messages=[Plain("来源是什么")]),
                 {},
             )
         )
-        self.assertTrue(
-            wake_filter.filter(
-                FakeEvent(message_str="来源是什么", messages=[Reply(id="1")]),
-                {},
-            )
+
+        actionable = (
+            "为什么这么判断",
+            "来源是什么",
+            "证据呢",
+            "能详细解释吗",
+            "继续查一下",
+            "这不对吧",
+            "能否复核第二点",
+            "谢谢，不过来源是什么？",
+            "给我看看证据",
+            "有没有原始来源",
+            "第二点依据在哪",
+            "再核实一下",
+            "重新查证",
+            "这结论有问题",
+            "我不信这个结论",
+            "原文链接呢",
+            "真的吗",
+            "Is this really true?",
+            "show sources",
+            "what is the evidence",
+            "can you verify this",
         )
+        for text in actionable:
+            with self.subTest(actionable=text):
+                self.assertTrue(
+                    wake_filter.filter(
+                        FakeEvent(message_str=text, messages=[Reply(id="1")]),
+                        {},
+                    )
+                )
 
     async def test_failed_progress_send_does_not_start_fact_check_pipeline(self) -> None:
         plugin = make_plugin()

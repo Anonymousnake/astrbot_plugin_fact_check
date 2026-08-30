@@ -118,18 +118,58 @@ def _trigger_text(event: AstrMessageEvent) -> str:
 
 
 def _is_actionable_followup_question(text: str) -> bool:
-    compact = re.sub(r"[\s!！。,.，~～]+", "", str(text or "")).casefold()
-    if not compact:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not re.search(r"[0-9a-zA-Z\u3400-\u9fff]", value):
         return False
-    if re.fullmatch(
-        r"(?:谢谢(?:你|啦|了|哈)?|多谢|感谢|好的?|好哒|行(?:了)?|收到|"
-        r"知道了|明白了|懂了|可以|辛苦了|ok(?:ay)?|thx|thanks?|"
-        r"[👍👌🙏]+|哈哈+|嗯+|哦+)",
-        compact,
+
+    # Only wake the grounded follow-up model for a positive question/request
+    # signal. Ordinary acknowledgements and chat pass through by default.
+    if re.search(
+        r"(?:为什么|为何|怎么(?:回事|判断|证明|查|会|能)?|如何|是否|是不是|"
+        r"能否|可否|哪里|哪儿|哪个|哪些|谁|何时|什么时候|多少|"
+        r"真假|真的吗|真吗|可信吗|可靠吗|"
+        r"什么(?:意思|原因|证据|来源|依据|结论|情况))",
+        value,
     ):
-        return False
-    signal = re.sub(r"[^0-9a-z\u3400-\u9fff]", "", compact)
-    return len(signal) >= 2
+        return True
+
+    if re.search(
+        r"(?:来源|证据|依据|出处|原文|链接|结论|说法)"
+        r"(?:是什么|在哪里|在哪|有吗|有没有|呢|吗|[?？])",
+        value,
+    ) or re.search(
+        r"(?:给|发|贴|列|看看|查看|提供|补充|有|有没有).{0,6}"
+        r"(?:来源|证据|依据|出处|原文|链接)",
+        value,
+    ):
+        return True
+
+    request_cue = (
+        r"(?:请|麻烦|帮我|给我|能不能|能否|(?:还)?能|可以|可否|再|继续|重新)"
+    )
+    action = (
+        r"(?:详细(?:解释|说明|说说)|解释|展开|补充|查(?:一下|下|查)?|"
+        r"核实|验证|查证|分析|说明|举例|对比|复核|重新判断)"
+    )
+    if re.search(rf"(?:^|[，,。；;])\s*(?:{request_cue}\s*)?{action}", value):
+        return True
+
+    if re.search(
+        r"(?:不对|不准确|有问题|错了|矛盾|存疑|不可信|我不信)",
+        value,
+    ):
+        return True
+
+    english = value.casefold()
+    return bool(
+        re.search(
+            r"\b(?:why|how|what|which|who|when|where|"
+            r"is\s+(?:this|that|it)|are\s+you\s+sure|really|"
+            r"sources?|evidence|explain|verify|recheck|fact[- ]?check|"
+            r"check\s+again|show\s+(?:me\s+)?sources?|more\s+details?)\b",
+            english,
+        )
+    )
 
 
 class FactCheckWakeFilter(CustomFilter):
