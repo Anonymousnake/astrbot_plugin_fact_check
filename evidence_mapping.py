@@ -88,10 +88,19 @@ def _has_opposite_polarity(left: str, right: str) -> bool:
         (("不属于",), ("属于",)),
     )
 
+    def contains_unnegated(text: str, term: str) -> bool:
+        offset = 0
+        while (index := text.find(term, offset)) >= 0:
+            prefix = text[max(0, index - 2) : index]
+            if not prefix.endswith(("不", "未", "无", "非", "并非", "不是")):
+                return True
+            offset = index + len(term)
+        return False
+
     def state(text: str, negatives: tuple[str, ...], positives: tuple[str, ...]) -> int:
-        if any(term in text for term in negatives):
+        if any(contains_unnegated(text, term) for term in negatives):
             return -1
-        return 1 if any(term in text for term in positives) else 0
+        return 1 if any(contains_unnegated(text, term) for term in positives) else 0
 
     return any(
         (left_state := state(left, negatives, positives))

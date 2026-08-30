@@ -120,7 +120,9 @@ def summary_matches_claim_labels(summary: str, labels: list[str]) -> bool:
     uncertain = {"证据不足", "无法判断"}
     return bool(
         (current.startswith("可信") and label_set == {"已核实"})
+        or (current.startswith("条件性成立") and label_set.issubset(positive))
         or (current.startswith("基本可信但需限定") and label_set.issubset(positive))
+        or (current.startswith("表述不准确") and label_set == {"不准确"})
         or (current.startswith("基本不实") and label_set == {"不准确"})
         or (current.startswith("证据不足") and label_set.issubset(uncertain))
         or current.startswith(("部分存疑", "混合结论"))

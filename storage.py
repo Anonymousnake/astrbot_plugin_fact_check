@@ -53,6 +53,13 @@ def read_json_file(path: Path, default: Any = None) -> Any:
                 logger.warning(
                     f"[astrbot-fact-check-storage-corrupt] moved={corrupt.name} error={type(exc).__name__}"
                 )
+                backups = sorted(
+                    target.parent.glob(f"{target.name}.corrupt-*"),
+                    key=lambda item: item.name,
+                    reverse=True,
+                )
+                for stale in backups[3:]:
+                    stale.unlink(missing_ok=True)
             except OSError:
                 pass
         return default

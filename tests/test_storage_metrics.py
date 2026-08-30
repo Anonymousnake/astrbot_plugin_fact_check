@@ -25,6 +25,18 @@ class StorageMetricsTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertEqual(len(list(Path(temp_dir).glob("state.json.corrupt-*"))), 1)
 
+    def test_corrupt_json_backups_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            for _ in range(6):
+                path.write_text("{broken", encoding="utf-8")
+                self.assertEqual(read_json_file(path, {}), {})
+
+            self.assertEqual(
+                len(list(Path(temp_dir).glob("state.json.corrupt-*"))),
+                3,
+            )
+
     def test_atomic_json_store_round_trips_without_leaving_temp_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "sessions.json"

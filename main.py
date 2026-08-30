@@ -1766,7 +1766,6 @@ class FactCheckPlugin(Star):
             if isinstance(comp, Reply):
                 speaker = str(comp.sender_nickname or comp.sender_id or "").strip()
                 before_text_count = len(quoted_texts)
-                before_image_count = len(images)
                 local_forward_ids: list[str] = []
                 local_texts: list[str] = []
                 if comp.message_str:
@@ -1794,7 +1793,6 @@ class FactCheckPlugin(Star):
                 if (
                     len(quoted_texts) == before_text_count
                     or self._is_unusable_quoted_text(local_text)
-                    or len(images) == before_image_count
                 ):
                     fetched = await self._fetch_reply_payload(event, comp)
                     if fetched:

@@ -86,6 +86,14 @@ class AnysearchEvidenceTests(unittest.TestCase):
             )
         )
 
+    def test_claim_match_does_not_treat_negated_prohibition_as_opposite(self) -> None:
+        self.assertTrue(
+            claim_text_matches(
+                ClaimCandidate("该法规不禁止平台提供这项服务"),
+                "该法规允许平台提供这项服务",
+            )
+        )
+
     def test_single_claim_does_not_receive_unrelated_grounding_support(self) -> None:
         body = {
             "candidates": [

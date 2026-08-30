@@ -65,6 +65,23 @@ def make_plugin() -> FactCheckPlugin:
 
 
 class ForwardExtractionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plain_text_reply_does_not_refetch_onebot_message(self) -> None:
+        plugin = make_plugin()
+        event = FakeEvent([Reply(id="123456", message_str="可直接核查的引用文字")])
+
+        with patch.object(
+            plugin,
+            "_fetch_reply_payload",
+            new=AsyncMock(return_value=None),
+        ) as fetch:
+            request = await plugin._build_fact_check_request(
+                event,
+                trigger_text="/事实核查",
+            )
+
+        fetch.assert_not_awaited()
+        self.assertEqual(request.text, "可直接核查的引用文字")
+
     async def test_reply_forward_placeholder_is_expanded(self) -> None:
         plugin = make_plugin()
         event = FakeEvent([Reply(id="123456", message_str="[CQ:forward,id=abc123]")])

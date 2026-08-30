@@ -96,7 +96,7 @@ _GEMINI_HTTP_CLIENT: contextvars.ContextVar[httpx.Client | None] = (
 )
 META_CLAIM_RE = re.compile(
     r"(系统自动生成|无需核查|不需要核查|不用核查|无法核查|没有必要核查|"
-    r"此问题|该问题|这个问题|本问题|用户请求|机器人|bot|工具调用|"
+    r"用户请求|机器人|bot|工具调用|"
     r"事实核查命令|核查指令|不是事实断言|无事实断言)",
     re.IGNORECASE,
 )
@@ -1343,8 +1343,6 @@ def _mark_model_unavailable(
     if cooldown_seconds <= 0 or not _is_model_capacity_error(exc):
         return
     seconds = max(1, int(cooldown_seconds))
-    if isinstance(exc, httpx.TimeoutException):
-        seconds = min(seconds, 180)
     with _MODEL_FAILURE_LOCK:
         _MODEL_FAILURE_UNTIL[model] = time.monotonic() + seconds
     logger.warning(
@@ -1354,8 +1352,6 @@ def _mark_model_unavailable(
 
 
 def _is_model_capacity_error(exc: Exception) -> bool:
-    if isinstance(exc, httpx.TimeoutException):
-        return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in {429, 503}
     lowered = str(exc or "").lower()

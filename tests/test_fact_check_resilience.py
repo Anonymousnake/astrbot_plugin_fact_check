@@ -672,6 +672,67 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("事实核查：基本可信但需限定", cleaned)
         self.assertIn("结论：表述需限定", cleaned)
 
+    def test_prompt_summary_labels_are_accepted_by_complete_result_validator(
+        self,
+    ) -> None:
+        cases = (
+            complete_single_claim_body(
+                summary="条件性成立",
+                conclusion="条件性成立",
+                basis="只有满足公开规则中的限定条件时才成立。",
+            ),
+            complete_single_claim_body(
+                summary="表述不准确",
+                conclusion="不准确",
+                basis="官方原文直接反驳了这项表述。",
+                relation="反驳一致",
+            ),
+        )
+
+        for body in cases:
+            with self.subTest(body=body):
+                fact_check.validate_complete_fact_check_result(
+                    body,
+                    expected_claim_count=1,
+                )
+
+    def test_conditional_summary_does_not_retry_the_grounded_evidence_call(
+        self,
+    ) -> None:
+        claim = "某项规则在满足公开条件时适用。"
+        response = complete_single_claim_body(
+            summary="条件性成立",
+            claim=claim,
+            conclusion="条件性成立",
+            basis="官方资料列出了适用条件。",
+            grounded=True,
+        )
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate(claim)],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                return_value=(response, "gemini-2.5-flash"),
+            ) as generate,
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(text=claim, trigger_text="/事实核查"),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_policy="never",
+            )
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertFalse(result.reason.startswith("ok; partial"))
+        self.assertIn("事实核查：条件性成立", result.reply)
+
     def test_partial_result_keeps_completed_claims_and_marks_missing_ones(self) -> None:
         incomplete = {
             "candidates": [
@@ -1508,7 +1569,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         generate.assert_not_called()
 
-    def test_timeout_cooldown_is_shorter_than_capacity_cooldown(self) -> None:
+    def test_timeout_does_not_cool_model_but_capacity_error_does(self) -> None:
         request = fact_check.httpx.Request(
             "POST", "https://example.invalid/models/generateContent"
         )
@@ -1531,11 +1592,16 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 unavailable,
                 cooldown_seconds=900,
             )
-            timeout_until = fact_check._MODEL_FAILURE_UNTIL["timeout-model"]
             capacity_until = fact_check._MODEL_FAILURE_UNTIL["capacity-model"]
 
-        self.assertEqual(timeout_until, 280.0)
+        self.assertNotIn("timeout-model", fact_check._MODEL_FAILURE_UNTIL)
         self.assertEqual(capacity_until, 1000.0)
+
+    def test_legitimate_claim_with_problem_word_is_not_treated_as_meta(self) -> None:
+        self.assertFalse(
+            fact_check._is_meta_claim("请核查：这个问题已经导致三人受伤是否属实？")
+        )
+        self.assertTrue(fact_check._is_meta_claim("这个问题无需核查"))
 
     def test_complete_multi_claim_result_requires_every_claim_block(self) -> None:
         incomplete = complete_fact_check_body(
