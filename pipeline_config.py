@@ -58,10 +58,10 @@ def build_fact_check_kwargs(
             config.get("fact_check_main_timeout_seconds") or 45
         ),
         "evidence_max_output_tokens": int(
-            config.get("fact_check_evidence_max_output_tokens") or 1536
+            config.get("fact_check_evidence_max_output_tokens") or 3072
         ),
         "evidence_retry_max_output_tokens": int(
-            config.get("fact_check_evidence_retry_max_output_tokens") or 3072
+            config.get("fact_check_evidence_retry_max_output_tokens") or 4096
         ),
         "anysearch_enabled": bool(config.get("fact_check_anysearch_enabled", False)),
         "anysearch_endpoint": str(

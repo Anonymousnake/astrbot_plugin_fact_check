@@ -1278,8 +1278,8 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1. 核查点：请核查：A 是否属实？", result.reply)
         self.assertIn("结论：表述需限定", result.reply)
         self.assertEqual(generate.call_count, 3)
-        self.assertEqual(generate.call_args_list[0].kwargs["max_output_tokens"], 1536)
-        self.assertEqual(generate.call_args_list[1].kwargs["max_output_tokens"], 3072)
+        self.assertEqual(generate.call_args_list[0].kwargs["max_output_tokens"], 3072)
+        self.assertEqual(generate.call_args_list[1].kwargs["max_output_tokens"], 4096)
 
     def test_twice_incomplete_grounded_evidence_is_not_sent_or_reviewed(self) -> None:
         truncated_evidence = {

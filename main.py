@@ -117,6 +117,21 @@ def _trigger_text(event: AstrMessageEvent) -> str:
     return ""
 
 
+def _is_actionable_followup_question(text: str) -> bool:
+    compact = re.sub(r"[\s!！。,.，~～]+", "", str(text or "")).casefold()
+    if not compact:
+        return False
+    if re.fullmatch(
+        r"(?:谢谢(?:你|啦|了|哈)?|多谢|感谢|好的?|好哒|行(?:了)?|收到|"
+        r"知道了|明白了|懂了|可以|辛苦了|ok(?:ay)?|thx|thanks?|"
+        r"[👍👌🙏]+|哈哈+|嗯+|哦+)",
+        compact,
+    ):
+        return False
+    signal = re.sub(r"[^0-9a-z\u3400-\u9fff]", "", compact)
+    return len(signal) >= 2
+
+
 class FactCheckWakeFilter(CustomFilter):
     """Wake only for explicit fact-check triggers."""
 
@@ -161,6 +176,16 @@ class FactCheckPlugin(Star):
         self._session_store_enabled = bool(
             self.config.get("fact_check_session_store_enabled", True),
         )
+        if is_plugin_allowed is None:
+            logger.error(
+                "[astrbot-fact-check-dependency] access-control unavailable; "
+                f"fail_open={bool(self.config.get('fact_check_access_control_fail_open', False))}"
+            )
+        if send_chain_result is None:
+            logger.warning(
+                "[astrbot-fact-check-dependency] qq-agent-core media sender unavailable; "
+                "plain/OneBot fallback remains enabled"
+            )
         self._load_fact_check_sessions()
         self._cleanup_forward_failure_dump()
 
@@ -172,18 +197,10 @@ class FactCheckPlugin(Star):
         if _trigger_text(event):
             return
         question = self._extract_followup_question(event)
-        if not question:
+        if not _is_actionable_followup_question(question):
             return
-        session, missing_context = await self._find_followup_session_with_state(event)
+        session, _ = await self._find_followup_session_with_state(event)
         if not session:
-            if missing_context and self._is_fact_check_allowed(event):
-                event.set_extra("qq_agent_command_handled", True)
-                event.stop_event()
-                await event.send(
-                    event.plain_result(
-                        "这条事实核查上下文已过期，请重新发送 /事实核查 再查一次。"
-                    )
-                )
             return
         if not self._session_visible_to_event(session, event):
             return
@@ -933,11 +950,11 @@ class FactCheckPlugin(Star):
                     self.config.get("fact_check_evidence_model") or "gemini-2.5-flash"
                 ).strip(),
                 "evidence_max_output_tokens": str(
-                    cache_config_value("fact_check_evidence_max_output_tokens", 1536),
+                    cache_config_value("fact_check_evidence_max_output_tokens", 3072),
                 ),
                 "evidence_retry_max_output_tokens": str(
                     cache_config_value(
-                        "fact_check_evidence_retry_max_output_tokens", 3072
+                        "fact_check_evidence_retry_max_output_tokens", 4096
                     ),
                 ),
                 "verdict": self._list_config(

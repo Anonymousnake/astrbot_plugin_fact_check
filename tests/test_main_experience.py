@@ -707,6 +707,40 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("冷却", event.sent[0]["plain"])
         self.assertNotIn("我接着查一下", event.sent[0]["plain"])
 
+    async def test_courtesy_reply_does_not_start_followup_or_stop_event(self) -> None:
+        plugin = make_plugin()
+        session = main.FactCheckSession(
+            session_id="fc_aaaabbbb",
+            created_at=time.time(),
+            group_id="123456",
+            user_id="654321",
+            request_data=FactCheckRequest("A 事件", "/事实核查"),
+            reply="事实核查：可信",
+        )
+        plugin._fact_check_sessions[session.session_id] = session
+
+        for text in ("谢谢", "好的", "收到", "OK", "👍"):
+            with self.subTest(text=text):
+                event = FakeEvent(
+                    message_str=text,
+                    messages=[
+                        Reply(
+                            id="1",
+                            message_str=f"{session.reply}\n核查ID：{session.session_id}",
+                        )
+                    ],
+                    fail_send=False,
+                )
+                with patch(
+                    "astrbot_plugin_fact_check.main.run_fact_check_followup"
+                ) as followup:
+                    await plugin.fact_check_followup(event)
+
+                followup.assert_not_called()
+                self.assertFalse(event.stopped)
+                self.assertEqual(event.sent, [])
+                self.assertNotIn("qq_agent_command_handled", event.extras)
+
     async def test_followup_respects_queue_limit_before_progress_message(self) -> None:
         plugin = make_plugin()
         plugin._fact_check_tasks = {object()}
@@ -957,7 +991,7 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(outputs), 1)
         self.assertIn("用法：回复一条消息后发送 /事实核查", outputs[0]["plain"])
 
-    async def test_expired_fact_check_reply_followup_gets_explicit_message(
+    async def test_expired_fact_check_reply_passes_through_without_claiming_event(
         self,
     ) -> None:
         plugin = make_plugin()
@@ -975,9 +1009,9 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         ):
             await plugin.fact_check_followup(event)
 
-        self.assertTrue(event.stopped)
-        self.assertEqual(len(event.sent), 1)
-        self.assertIn("上下文已过期", event.sent[0]["plain"])
+        self.assertFalse(event.stopped)
+        self.assertEqual(event.sent, [])
+        self.assertNotIn("qq_agent_command_handled", event.extras)
 
     async def test_unrelated_reply_without_sessions_does_not_fetch_remote_payload(
         self,

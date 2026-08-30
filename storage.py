@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from astrbot.api import logger
+
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path = Path(path)
@@ -48,9 +50,8 @@ def read_json_file(path: Path, default: Any = None) -> Any:
             corrupt = target.with_name(f"{target.name}.corrupt-{time.time_ns()}")
             try:
                 target.replace(corrupt)
-                print(
-                    f"[astrbot-fact-check-storage-corrupt] moved={corrupt.name} error={type(exc).__name__}",
-                    flush=True,
+                logger.warning(
+                    f"[astrbot-fact-check-storage-corrupt] moved={corrupt.name} error={type(exc).__name__}"
                 )
             except OSError:
                 pass
