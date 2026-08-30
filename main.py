@@ -139,6 +139,23 @@ class FactCheckWakeFilter(CustomFilter):
         return bool(_trigger_text(event))
 
 
+class FactCheckFollowupWakeFilter(CustomFilter):
+    """Wake only for actionable text replying to another message."""
+
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        if _trigger_text(event):
+            return False
+        try:
+            if not any(isinstance(comp, Reply) for comp in event.get_messages()):
+                return False
+        except Exception:
+            return False
+        return any(
+            _is_actionable_followup_question(text)
+            for text in _event_text_candidates(event)
+        )
+
+
 @dataclass(slots=True)
 class FactCheckSession:
     session_id: str
@@ -189,7 +206,7 @@ class FactCheckPlugin(Star):
         self._load_fact_check_sessions()
         self._cleanup_forward_failure_dump()
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=998_500)
+    @filter.custom_filter(FactCheckFollowupWakeFilter, priority=998_500)
     async def fact_check_followup(self, event: AstrMessageEvent):
         """Answer follow-up questions by replying to a previous fact-check result."""
         if not bool(self.config.get("enable_fact_check", True)):

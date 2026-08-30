@@ -148,6 +148,28 @@ def make_plugin() -> main.FactCheckPlugin:
 
 
 class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
+    def test_followup_wake_filter_requires_reply_and_actionable_question(self) -> None:
+        wake_filter = main.FactCheckFollowupWakeFilter()
+
+        self.assertFalse(
+            wake_filter.filter(
+                FakeEvent(message_str="谢谢", messages=[Reply(id="1")]),
+                {},
+            )
+        )
+        self.assertFalse(
+            wake_filter.filter(
+                FakeEvent(message_str="来源是什么", messages=[Plain("来源是什么")]),
+                {},
+            )
+        )
+        self.assertTrue(
+            wake_filter.filter(
+                FakeEvent(message_str="来源是什么", messages=[Reply(id="1")]),
+                {},
+            )
+        )
+
     async def test_failed_progress_send_does_not_start_fact_check_pipeline(self) -> None:
         plugin = make_plugin()
         event = FakeEvent(
