@@ -156,7 +156,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 return search_text
             raise AssertionError(f"unexpected tool: {tool_name}")
 
-        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
             evidence = collect_anysearch_evidence(
                 [ClaimCandidate("A claim")],
                 enabled=True,
@@ -278,7 +281,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 return f"## Extracted\nA 事件 B 事件正文来自 {arguments['url']}"
             raise AssertionError(f"unexpected tool: {tool_name}")
 
-        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
             evidence = collect_anysearch_evidence(
                 [
                     ClaimCandidate("请核查：A 事件是否属实？", priority=5),
@@ -336,7 +342,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 return "extracted"
             raise AssertionError(f"unexpected tool: {tool_name}")
 
-        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
             collect_anysearch_evidence(
                 [ClaimCandidate("A claim"), ClaimCandidate("B claim")],
                 enabled=True,
@@ -369,7 +378,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 return "extracted evidence"
             raise AssertionError(f"unexpected tool: {tool_name}")
 
-        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
             collect_anysearch_evidence(
                 [ClaimCandidate("A claim"), ClaimCandidate("B claim"), ClaimCandidate("C claim")],
                 enabled=True,
@@ -1594,6 +1606,26 @@ class AnysearchEvidenceTests(unittest.TestCase):
         )
 
         self.assertEqual(kwargs["anysearch_extract_top_urls"], 0)
+
+    def test_pipeline_config_uses_capacity_model_fallbacks_by_default(self) -> None:
+        kwargs = build_fact_check_kwargs(
+            {},
+            FactCheckRequest(text="A 事件", trigger_text="/事实核查"),
+            30,
+            list_config=lambda _key, default: default,
+        )
+
+        self.assertEqual(
+            kwargs["verdict_models"],
+            [
+                "gemini-3-flash-preview",
+                "gemini-3.5-flash",
+                "gemini-3.6-flash",
+                "gemini-3.7-flash",
+                "gemini-3.8-flash",
+            ],
+        )
+        self.assertEqual(kwargs["verdict_max_attempts"], 5)
 
     def test_sanitize_anysearch_evidence_removes_markdown_url_labels(self) -> None:
         text = "### Query\n- **URL**: https://example.com/a\n- **Title**: Example"

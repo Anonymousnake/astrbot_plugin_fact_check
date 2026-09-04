@@ -1547,6 +1547,50 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_verdict_fallback_can_use_all_configured_capacity_models(self) -> None:
+        request = fact_check.httpx.Request(
+            "POST", "https://example.invalid/models/generateContent"
+        )
+        busy = fact_check.httpx.HTTPStatusError(
+            "busy",
+            request=request,
+            response=fact_check.httpx.Response(503, request=request),
+        )
+        success = {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+        models = [
+            "gemini-3-flash-preview",
+            "gemini-3.5-flash",
+            "gemini-3.6-flash",
+            "gemini-3.7-flash",
+        ]
+
+        with (
+            patch.object(fact_check, "_MODEL_FAILURE_UNTIL", {}),
+            patch.object(
+                fact_check,
+                "gemini_generate",
+                side_effect=[busy, busy, busy, success],
+            ) as generate,
+            patch.object(fact_check.time, "sleep"),
+        ):
+            body, model = fact_check.generate_with_fallback(
+                prompt="Use the supplied evidence.",
+                models=models,
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                temperature=0,
+                max_output_tokens=128,
+                grounding=False,
+                max_attempts=len(models),
+            )
+
+        self.assertEqual(body, success)
+        self.assertEqual(model, models[-1])
+        self.assertEqual(
+            [call.kwargs["model"] for call in generate.call_args_list],
+            models,
+        )
+
     def test_single_model_in_cooldown_is_not_called_again(self) -> None:
         with (
             patch.object(

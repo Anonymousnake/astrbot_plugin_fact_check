@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from .fact_check import FactCheckRequest
+from .fact_check import DEFAULT_VERDICT_MODELS, FactCheckRequest
 
 
 def build_fact_check_kwargs(
@@ -29,7 +29,7 @@ def build_fact_check_kwargs(
             config.get("fact_check_evidence_model") or "gemini-2.5-flash"
         ).strip(),
         "verdict_models": list_config(
-            "fact_check_verdict_models", ["gemini-3-flash-preview"]
+            "fact_check_verdict_models", list(DEFAULT_VERDICT_MODELS)
         ),
         "max_image_bytes": int(
             config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024
@@ -97,6 +97,9 @@ def build_fact_check_kwargs(
         ),
         "verdict_request_timeout": int(
             config.get("fact_check_verdict_timeout_seconds") or 25
+        ),
+        "verdict_max_attempts": int(
+            config.get("fact_check_verdict_max_attempts") or len(DEFAULT_VERDICT_MODELS)
         ),
         "verdict_max_output_tokens": int(
             config.get("fact_check_verdict_max_output_tokens") or 2048
