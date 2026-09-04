@@ -33,6 +33,7 @@ from fact_check import (
     extract_claims_from_text,
     extract_public_urls,
     extract_sources,
+    _extract_visible_page_text,
     infer_anysearch_freshness,
     is_public_http_url,
     merge_claim_sources,
@@ -503,6 +504,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 endpoint="https://api.anysearch.com/mcp",
                 api_key="",
                 timeout=5,
+                anysearch_direct_fetch_fallback=False,
                 max_claims=1,
                 max_results_per_claim=1,
                 extract_top_urls=1,
@@ -538,6 +540,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 endpoint="https://api.anysearch.com/mcp",
                 api_key="",
                 timeout=5,
+                anysearch_direct_fetch_fallback=False,
                 max_claims=1,
                 max_results_per_claim=2,
                 extract_top_urls=2,
@@ -548,6 +551,60 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence.extract_attempted, 2)
         self.assertEqual(evidence.extract_succeeded, 1)
         self.assertEqual(evidence.extract_failed, 1)
+
+    def test_collect_anysearch_uses_bounded_direct_fetch_fallback(self) -> None:
+        def fake_call_tool(*, tool_name, **kwargs):
+            if tool_name == "search":
+                return "- **URL**: https://example.com/report"
+            if tool_name == "extract":
+                raise RuntimeError("Anysearch tool returned an error: extract_failed")
+            raise AssertionError(f"unexpected tool: {tool_name}")
+
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch(
+                "fact_check.fetch_public_page_text",
+                return_value="A 事件的直接网页证据",
+            ) as fetch_page,
+            patch("fact_check.ensure_public_url_target"),
+        ):
+            evidence = collect_anysearch_evidence(
+                [ClaimCandidate("核查新闻")],
+                enabled=True,
+                endpoint="https://api.anysearch.com/mcp",
+                api_key="",
+                timeout=5,
+                max_claims=1,
+                max_results_per_claim=1,
+                extract_top_urls=1,
+                max_chars=4000,
+            )
+
+        fetch_page.assert_called_once_with(
+            "https://example.com/report",
+            timeout=5,
+            max_chars=4000,
+        )
+        self.assertEqual(evidence.status, "ok")
+        self.assertEqual(evidence.extract_fallbacks, 1)
+        self.assertIn("direct_fallbacks=1", evidence.reason)
+        self.assertIn("直接网页证据", evidence.text)
+
+    def test_extract_visible_page_text_removes_non_content_markup(self) -> None:
+        body = (
+            b"<html><head><title>Hidden</title></head><body>"
+            b"<script>secret()</script><main>Hello&nbsp;world</main>"
+            b"</body></html>"
+        )
+
+        self.assertEqual(
+            _extract_visible_page_text(
+                body,
+                content_type="text/html; charset=utf-8",
+                max_chars=100,
+            ),
+            "Hello world",
+        )
 
     def test_public_url_dns_resolution_timeout_fails_closed(self) -> None:
         future = MagicMock()

@@ -257,6 +257,12 @@
     "description": "Timeout seconds for each Anysearch search/extract call",
     "default": 20
   },
+  "fact_check_anysearch_direct_fetch_fallback": {
+    "type": "bool",
+    "description": "Use a bounded direct public-page fetch when Anysearch extraction fails",
+    "hint": "Only public HTTP(S) URLs are allowed; redirects and response sizes are bounded.",
+    "default": true
+  },
   "fact_check_anysearch_max_claims": {
     "type": "int",
     "description": "Max extracted claims to search with Anysearch",
