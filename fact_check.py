@@ -863,7 +863,10 @@ def run_fact_check(
                     if current_index >= 0
                     else verdict_models
                 )
-                for candidate_model in remaining_models[: max(0, attempt_limit - 1)]:
+                already_considered = max(1, current_index + 1)
+                for candidate_model in remaining_models[
+                    : max(0, attempt_limit - already_considered)
+                ]:
                     if candidate_model not in try_models:
                         try_models.append(candidate_model)
                 last_verdict_error: Exception = exc
