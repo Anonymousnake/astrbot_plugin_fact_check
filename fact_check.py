@@ -2162,6 +2162,20 @@ def anysearch_call_tool(
 
 def extract_anysearch_text(data: dict[str, Any]) -> str:
     result = data.get("result") or {}
+    if isinstance(result, dict) and result.get("isError"):
+        content = result.get("content") or []
+        if isinstance(content, list):
+            details = "\n".join(
+                str(item.get("text") or "").strip()
+                for item in content
+                if isinstance(item, dict) and item.get("text")
+            ).strip()
+        else:
+            details = str(content).strip()
+        raise RuntimeError(
+            "Anysearch tool returned an error"
+            + (f": {details[:500]}" if details else "")
+        )
     content = result.get("content") or []
     if isinstance(content, list):
         texts = [

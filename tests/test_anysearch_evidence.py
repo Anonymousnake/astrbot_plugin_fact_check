@@ -17,6 +17,7 @@ from fact_check import (
     ClaimCandidate,
     FactCheckRequest,
     ImageInput,
+    anysearch_call_tool,
     append_claim_source_hints,
     append_source_links,
     build_anysearch_queries,
@@ -452,6 +453,37 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertEqual(client.post.call_count, 2)
         self.assertFalse(client.post.call_args.kwargs["follow_redirects"])
         self.assertEqual((first, second), ("ok", "ok"))
+
+    def test_anysearch_call_tool_raises_on_tool_level_error(self) -> None:
+        response = MagicMock()
+        response.json.return_value = {
+            "result": {
+                "isError": True,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "extract_failed\nUnable to extract content from the URL.",
+                    }
+                ],
+            },
+        }
+        client = MagicMock()
+        client.post.return_value = response
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Anysearch tool returned an error: extract_failed",
+        ):
+            anysearch_call_tool(
+                tool_name="extract",
+                arguments={"url": "https://example.com"},
+                endpoint="https://api.anysearch.com/mcp",
+                api_key="",
+                timeout=5,
+                max_retries=0,
+                client=client,
+                endpoint_validated=True,
+            )
 
     def test_public_url_dns_resolution_timeout_fails_closed(self) -> None:
         future = MagicMock()
