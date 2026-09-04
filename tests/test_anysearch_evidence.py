@@ -1595,6 +1595,26 @@ class AnysearchEvidenceTests(unittest.TestCase):
 
         self.assertEqual(kwargs["anysearch_extract_top_urls"], 0)
 
+    def test_pipeline_config_uses_capacity_model_fallbacks_by_default(self) -> None:
+        kwargs = build_fact_check_kwargs(
+            {},
+            FactCheckRequest(text="A 事件", trigger_text="/事实核查"),
+            30,
+            list_config=lambda _key, default: default,
+        )
+
+        self.assertEqual(
+            kwargs["verdict_models"],
+            [
+                "gemini-3-flash-preview",
+                "gemini-3.5-flash",
+                "gemini-3.6-flash",
+                "gemini-3.7-flash",
+                "gemini-3.8-flash",
+            ],
+        )
+        self.assertEqual(kwargs["verdict_max_attempts"], 5)
+
     def test_sanitize_anysearch_evidence_removes_markdown_url_labels(self) -> None:
         text = "### Query\n- **URL**: https://example.com/a\n- **Title**: Example"
 

@@ -31,6 +31,7 @@ from astrbot.core.utils.quoted_message.extractor import (
 from astrbot.core.utils.quoted_message.onebot_client import OneBotClient
 
 from .fact_check import (
+    DEFAULT_VERDICT_MODELS,
     FAILED_REPLY,
     ClaimCandidate,
     FactCheckRequest,
@@ -1016,7 +1017,13 @@ class FactCheckPlugin(Star):
                 ),
                 "verdict": self._list_config(
                     "fact_check_verdict_models",
-                    ["gemini-3-flash-preview"],
+                    list(DEFAULT_VERDICT_MODELS),
+                ),
+                "verdict_max_attempts": str(
+                    cache_config_value(
+                        "fact_check_verdict_max_attempts",
+                        len(DEFAULT_VERDICT_MODELS),
+                    ),
                 ),
                 "verdict_timeout_seconds": str(
                     cache_config_value("fact_check_verdict_timeout_seconds", 25),

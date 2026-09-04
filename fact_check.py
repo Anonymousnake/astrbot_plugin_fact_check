@@ -82,6 +82,13 @@ ANYSEARCH_STATUS_SEARCH_ONLY = "search_only"
 ANYSEARCH_STATUS_EXTRACT_FAILED = "extract_failed"
 ANYSEARCH_STATUS_PARTIAL = "partial"
 ANYSEARCH_STATUS_OK = "ok"
+DEFAULT_VERDICT_MODELS = (
+    "gemini-3-flash-preview",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+)
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 URL_RE = re.compile(
     r"(?:-\s*\*\*URL\*\*:\s*)?(https?://[^\s<>\]\)\"']+)", re.IGNORECASE
@@ -421,6 +428,7 @@ def run_fact_check(
     anysearch_content_types: list[str] | None = None,
     model_failure_cooldown_seconds: int = 0,
     verdict_request_timeout: int = 25,
+    verdict_max_attempts: int = 5,
     verdict_max_output_tokens: int = 2048,
     verdict_retry_max_output_tokens: int = 4096,
     verdict_policy: str = "risk_based",
@@ -783,6 +791,13 @@ def run_fact_check(
                 thinking_level=verdict_thinking_level,
                 model_failure_cooldown_seconds=model_failure_cooldown_seconds,
                 http_max_retries=0,
+                max_attempts=max(
+                    1,
+                    min(
+                        len(verdict_models),
+                        int(verdict_max_attempts or len(verdict_models)),
+                    ),
+                ),
                 request_timeout=verdict_request_timeout,
             )
             try:
