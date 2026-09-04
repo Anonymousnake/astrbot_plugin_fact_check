@@ -72,6 +72,9 @@ def build_fact_check_kwargs(
         "anysearch_timeout": int(
             config.get("fact_check_anysearch_timeout_seconds") or 20
         ),
+        "anysearch_direct_fetch_fallback": bool(
+            config.get("fact_check_anysearch_direct_fetch_fallback", True)
+        ),
         "anysearch_max_claims": int(config.get("fact_check_anysearch_max_claims") or 3),
         "anysearch_max_results_per_claim": int(
             config.get("fact_check_anysearch_max_results_per_claim") or 3

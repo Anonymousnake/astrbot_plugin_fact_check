@@ -4,6 +4,8 @@ import base64
 import concurrent.futures
 import contextvars
 import functools
+from html import unescape
+from html.parser import HTMLParser
 import io
 import ipaddress
 import json
@@ -243,6 +245,30 @@ class AnysearchEvidence:
     extract_attempted: int = 0
     extract_succeeded: int = 0
     extract_failed: int = 0
+    extract_fallbacks: int = 0
+
+
+class _VisibleHtmlTextParser(HTMLParser):
+    """Extract readable text without adding an HTML parser dependency."""
+
+    _SKIP_TAGS = {"head", "script", "style", "template", "noscript", "svg"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in self._SKIP_TAGS:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self._SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth and data.strip():
+            self.parts.append(data)
 
 
 class IncompleteGenerationError(RuntimeError):
@@ -386,6 +412,7 @@ def run_fact_check(
     anysearch_endpoint: str = ANYSEARCH_DEFAULT_ENDPOINT,
     anysearch_api_key: str = "",
     anysearch_timeout: int = 20,
+    anysearch_direct_fetch_fallback: bool = True,
     anysearch_max_claims: int = 3,
     anysearch_max_results_per_claim: int = 3,
     anysearch_extract_top_urls: int = 3,
@@ -546,6 +573,7 @@ def run_fact_check(
         endpoint=anysearch_endpoint,
         api_key=anysearch_api_key,
         timeout=anysearch_timeout,
+        anysearch_direct_fetch_fallback=anysearch_direct_fetch_fallback,
         max_claims=anysearch_max_claims,
         max_results_per_claim=anysearch_max_results_per_claim,
         extract_top_urls=anysearch_extract_top_urls,
@@ -1822,6 +1850,80 @@ def format_candidates(candidates: list[ClaimCandidate]) -> str:
     )
 
 
+def _extract_visible_page_text(body: bytes, *, content_type: str, max_chars: int) -> str:
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    if media_type and not (
+        media_type.startswith("text/")
+        or media_type in {"application/xhtml+xml", "application/json", "application/xml"}
+    ):
+        raise ValueError(f"unsupported content type: {media_type}")
+    text = body.decode("utf-8", errors="replace")
+    if "html" in media_type or re.search(r"<\s*(?:html|body|article|main)\b", text, re.I):
+        parser = _VisibleHtmlTextParser()
+        try:
+            parser.feed(text)
+            parser.close()
+            text = " ".join(parser.parts)
+        except Exception:
+            text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(re.sub(r"\s+", " ", text)).strip()
+    if not text:
+        raise ValueError("page contains no readable text")
+    return text[: max(100, int(max_chars or 6000))]
+
+
+def fetch_public_page_text(
+    url: str,
+    *,
+    timeout: int = 8,
+    max_bytes: int = 1_500_000,
+    max_chars: int = 6000,
+) -> str:
+    """Fetch a public HTML page as a bounded fallback for Anysearch extract."""
+    current = normalize_url(url)
+    timeout_seconds = max(3, min(int(timeout or 8), 10))
+    deadline = time.monotonic() + timeout_seconds
+    inherited_deadline = _REQUEST_DEADLINE.get()
+    if inherited_deadline is not None:
+        deadline = min(deadline, inherited_deadline)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AstrBotFactCheck/1.0)"}
+    with httpx.Client(follow_redirects=False, trust_env=True, headers=headers) as client:
+        for _ in range(3):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise httpx.TimeoutException("direct page fetch deadline exceeded")
+            ensure_public_url_target(current)
+            with client.stream(
+                "GET",
+                current,
+                timeout=httpx.Timeout(
+                    min(8.0, remaining),
+                    connect=min(3.0, remaining),
+                    read=min(8.0, remaining),
+                    write=min(3.0, remaining),
+                ),
+                follow_redirects=False,
+            ) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("redirect without location")
+                    current = normalize_url(urljoin(current, location))
+                    continue
+                response.raise_for_status()
+                data = bytearray()
+                for chunk in response.iter_bytes():
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        raise ValueError("page exceeds direct fallback size limit")
+                return _extract_visible_page_text(
+                    bytes(data),
+                    content_type=response.headers.get("content-type", ""),
+                    max_chars=max_chars,
+                )
+    raise RuntimeError("too many redirects")
+
+
 def collect_anysearch_evidence(
     candidates: list[ClaimCandidate],
     *,
@@ -1829,6 +1931,7 @@ def collect_anysearch_evidence(
     endpoint: str,
     api_key: str,
     timeout: int,
+    anysearch_direct_fetch_fallback: bool = True,
     max_claims: int,
     max_results_per_claim: int,
     extract_top_urls: int,
@@ -1928,7 +2031,7 @@ def collect_anysearch_evidence(
                 extract_urls = urls[:extract_limit]
             request_deadline = _REQUEST_DEADLINE.get()
 
-            def extract_page(url: str) -> tuple[str, str, str]:
+            def extract_page(url: str) -> tuple[str, str, str, bool]:
                 token = _REQUEST_DEADLINE.set(request_deadline)
                 try:
                     # Anysearch fetches this URL remotely. Local validation only
@@ -1945,12 +2048,31 @@ def collect_anysearch_evidence(
                         endpoint_validated=True,
                     )
                 except Exception as exc:
-                    return url, "", error_label(exc)
+                    if anysearch_direct_fetch_fallback:
+                        try:
+                            extracted = fetch_public_page_text(
+                                url,
+                                timeout=min(max(3, timeout), 8),
+                                max_chars=max_chars,
+                            )
+                            logger.info(
+                                "[astrbot-fact-check-anysearch-direct-fallback] "
+                                f"url={shorten_text(url, 160)}"
+                            )
+                            return url, extracted, "", True
+                        except Exception as fallback_exc:
+                            return (
+                                url,
+                                "",
+                                f"{error_label(exc)}; direct fallback: {error_label(fallback_exc)}",
+                                False,
+                            )
+                    return url, "", error_label(exc), False
                 finally:
                     _REQUEST_DEADLINE.reset(token)
-                return url, extracted, ""
+                return url, extracted, "", False
 
-            extract_results: list[tuple[str, str, str]] = []
+            extract_results: list[tuple[str, str, str, bool]] = []
             if extract_urls:
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(2, len(extract_urls)),
@@ -1966,8 +2088,11 @@ def collect_anysearch_evidence(
     excerpt_sources: list[str] = []
     claim_sources: list[list[str]] = [[] for _ in candidates]
     extract_attempted = len(extract_results)
-    extract_failed = sum(1 for _, _, error in extract_results if error)
-    for url, extracted, error in extract_results:
+    extract_failed = sum(1 for _, _, error, _ in extract_results if error)
+    extract_fallbacks = sum(
+        1 for _, _, _, fallback_used in extract_results if fallback_used
+    )
+    for url, extracted, error, _ in extract_results:
         if error:
             logger.warning(
                 f"[astrbot-fact-check-anysearch-extract-error] {shorten_text(url, 160)}: {error}"
@@ -2016,13 +2141,14 @@ def collect_anysearch_evidence(
         sources=sources,
         reason=(
             f"{reason_prefix}; queries={len(query_payloads)} urls={len(urls)} "
-            f"extracts={len(excerpts)}"
+            f"extracts={len(excerpts)} direct_fallbacks={extract_fallbacks}"
         ),
         claim_sources=claim_sources,
         status=status,
         extract_attempted=extract_attempted,
         extract_succeeded=len(excerpts),
         extract_failed=extract_failed,
+        extract_fallbacks=extract_fallbacks,
     )
 
 

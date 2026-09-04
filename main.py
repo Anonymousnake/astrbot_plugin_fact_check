@@ -1070,6 +1070,9 @@ class FactCheckPlugin(Star):
                 "timeout_seconds": str(
                     cache_config_value("fact_check_anysearch_timeout_seconds", 20)
                 ),
+                "direct_fetch_fallback": bool(
+                    self.config.get("fact_check_anysearch_direct_fetch_fallback", True)
+                ),
                 "max_claims": str(
                     cache_config_value("fact_check_anysearch_max_claims", 3)
                 ),
