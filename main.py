@@ -47,7 +47,7 @@ from .fact_check import (
     run_fact_check_followup,
     safe_image_log_label,
 )
-from .pipeline_config import build_fact_check_kwargs
+from .pipeline_config import build_fact_check_kwargs, resolve_verdict_models
 from .runtime import AsyncSingleFlight, run_blocking_with_timeout
 from .storage import FactCheckMetricsStore, atomic_write_json, read_json_file
 
@@ -1015,9 +1015,8 @@ class FactCheckPlugin(Star):
                         "fact_check_evidence_retry_max_output_tokens", 4096
                     ),
                 ),
-                "verdict": self._list_config(
-                    "fact_check_verdict_models",
-                    list(DEFAULT_VERDICT_MODELS),
+                "verdict": resolve_verdict_models(
+                    list_config=self._list_config,
                 ),
                 "verdict_max_attempts": str(
                     cache_config_value(

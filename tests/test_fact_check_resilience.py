@@ -1443,6 +1443,70 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generate.call_args_list[1].kwargs["max_output_tokens"], 2048)
         self.assertEqual(generate.call_args_list[2].kwargs["max_output_tokens"], 4096)
 
+    def test_incomplete_verdict_advances_to_next_configured_model(self) -> None:
+        evidence_response = complete_single_claim_body(
+            summary="可信",
+            claim="请核查：A 是否属实？",
+            conclusion="已核实",
+            basis="完整证据。",
+            grounded=True,
+        )
+        incomplete_verdict = {
+            "candidates": [
+                {
+                    "finishReason": "MAX_TOKENS",
+                    "content": {"parts": [{"text": "事实核查：混合结论\n结论：表述需限定，"}]},
+                }
+            ],
+        }
+        completed_verdict = complete_single_claim_body(
+            summary="混合结论",
+            claim="请核查：A 是否属实？",
+            conclusion="表述需限定",
+            basis="备用模型完成复核。",
+        )
+
+        with (
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("请核查：A 是否属实？")],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                side_effect=[
+                    (evidence_response, "gemini-2.5-flash"),
+                    (incomplete_verdict, "gemini-3-flash-preview"),
+                    (incomplete_verdict, "gemini-3-flash-preview"),
+                    (completed_verdict, "gemini-3.5-flash"),
+                ],
+            ) as generate,
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(
+                    text="A claim", trigger_text="/factcheck"
+                ),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                evidence_model="gemini-2.5-flash",
+                verdict_models=["gemini-3-flash-preview", "gemini-3.5-flash"],
+                verdict_max_attempts=2,
+                verdict_policy="always",
+            )
+
+        self.assertIn("备用模型完成复核", result.reply)
+        self.assertEqual(generate.call_count, 4)
+        self.assertEqual(
+            [call.kwargs.get("models") for call in generate.call_args_list[1:]],
+            [
+                ["gemini-3-flash-preview", "gemini-3.5-flash"],
+                ["gemini-3-flash-preview"],
+                ["gemini-3.5-flash"],
+            ],
+        )
+
     def test_twice_truncated_verdict_falls_back_to_grounded_evidence(self) -> None:
         evidence_response = complete_single_claim_body(
             summary="可信",
