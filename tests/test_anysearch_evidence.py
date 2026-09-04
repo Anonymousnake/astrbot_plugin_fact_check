@@ -34,6 +34,8 @@ from fact_check import (
     extract_public_urls,
     extract_sources,
     _extract_visible_page_text,
+    _redact_url_for_log,
+    fetch_public_page_text,
     infer_anysearch_freshness,
     is_public_http_url,
     merge_claim_sources,
@@ -45,7 +47,10 @@ from fact_check import (
     sanitize_fact_check_reply,
     select_fact_check_sources,
 )
-from astrbot_plugin_fact_check.pipeline_config import build_fact_check_kwargs
+from astrbot_plugin_fact_check.pipeline_config import (
+    build_fact_check_kwargs,
+    resolve_verdict_models,
+)
 
 
 class AnysearchEvidenceTests(unittest.TestCase):
@@ -617,6 +622,53 @@ class AnysearchEvidenceTests(unittest.TestCase):
             ),
             "Hello world",
         )
+
+    def test_extract_visible_page_text_honors_declared_gbk_charset(self) -> None:
+        body = "<main>中文证据</main>".encode("gb18030")
+
+        self.assertEqual(
+            _extract_visible_page_text(
+                body,
+                content_type="text/html; charset=gb18030",
+                max_chars=100,
+            ),
+            "中文证据",
+        )
+
+    def test_redact_url_for_log_removes_query_and_fragment(self) -> None:
+        self.assertEqual(
+            _redact_url_for_log("https://example.com/report?token=secret#section"),
+            "https://example.com/report",
+        )
+
+    def test_direct_fetch_connects_to_the_validated_ip(self) -> None:
+        connection = MagicMock()
+        response = connection.getresponse.return_value
+        response.status = 200
+        response.reason = "OK"
+        response.getheader.side_effect = lambda name, default="": (
+            "text/html; charset=utf-8" if name == "Content-Type" else default
+        )
+        response.read.side_effect = [b"<main>Pinned page</main>", b""]
+
+        with (
+            patch(
+                "fact_check._resolve_public_target_ip",
+                return_value="93.184.216.34",
+            ),
+            patch("fact_check._PinnedHTTPSConnection", return_value=connection) as conn,
+        ):
+            text = fetch_public_page_text(
+                "https://example.com/report",
+                timeout=8,
+                max_chars=100,
+            )
+
+        self.assertEqual(text, "Pinned page")
+        conn.assert_called_once()
+        self.assertEqual(conn.call_args.args[:3], ("example.com", "93.184.216.34", 443))
+        connection.request.assert_called_once()
+        self.assertEqual(connection.request.call_args.args[:2], ("GET", "/report"))
 
     def test_public_url_dns_resolution_timeout_fails_closed(self) -> None:
         future = MagicMock()
@@ -1626,6 +1678,26 @@ class AnysearchEvidenceTests(unittest.TestCase):
             ],
         )
         self.assertEqual(kwargs["verdict_max_attempts"], 5)
+
+    def test_legacy_single_verdict_model_is_upgraded_but_custom_order_is_preserved(self) -> None:
+        self.assertEqual(
+            resolve_verdict_models(
+                list_config=lambda _key, _default: ["gemini-3-flash-preview"],
+            ),
+            [
+                "gemini-3-flash-preview",
+                "gemini-3.5-flash",
+                "gemini-3.6-flash",
+                "gemini-3.7-flash",
+                "gemini-3.8-flash",
+            ],
+        )
+        self.assertEqual(
+            resolve_verdict_models(
+                list_config=lambda _key, _default: ["custom-a", "custom-b"],
+            ),
+            ["custom-a", "custom-b"],
+        )
 
     def test_sanitize_anysearch_evidence_removes_markdown_url_labels(self) -> None:
         text = "### Query\n- **URL**: https://example.com/a\n- **Title**: Example"

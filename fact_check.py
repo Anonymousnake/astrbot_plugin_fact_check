@@ -4,6 +4,7 @@ import base64
 import concurrent.futures
 import contextvars
 import functools
+import http.client
 from html import unescape
 from html.parser import HTMLParser
 import io
@@ -21,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -276,6 +277,35 @@ class _VisibleHtmlTextParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self._skip_depth and data.strip():
             self.parts.append(data)
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, pinned_ip: str, port: int, *, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port),
+            timeout=self.timeout,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, pinned_ip: str, port: int, *, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        sock = socket.create_connection(
+            (self._pinned_ip, self.port),
+            timeout=self.timeout,
+        )
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self._tunnel_host or self.host)
+        except Exception:
+            sock.close()
+            raise
 
 
 class IncompleteGenerationError(RuntimeError):
@@ -816,23 +846,60 @@ def run_fact_check(
                     "[astrbot-fact-check-verdict-retry] "
                     f"model={verdict_model} max_output_tokens={retry_tokens} reason={exc}"
                 )
-                verdict_body, verdict_model = generate_with_fallback(
-                    prompt=verdict_prompt,
-                    models=[verdict_model],
-                    api_key=api_key,
-                    base_url=base_url,
-                    temperature=0.1,
-                    max_output_tokens=retry_tokens,
-                    grounding=False,
-                    thinking_level=verdict_thinking_level,
-                    model_failure_cooldown_seconds=model_failure_cooldown_seconds,
-                    http_max_retries=0,
-                    request_timeout=verdict_request_timeout,
+                try_models = [verdict_model]
+                try:
+                    current_index = verdict_models.index(verdict_model)
+                except ValueError:
+                    current_index = -1
+                attempt_limit = max(
+                    1,
+                    min(
+                        len(verdict_models),
+                        int(verdict_max_attempts or len(verdict_models)),
+                    ),
                 )
-                validate_complete_fact_check_result(
-                    verdict_body,
-                    expected_claims=deduped,
+                remaining_models = (
+                    verdict_models[current_index + 1 :]
+                    if current_index >= 0
+                    else verdict_models
                 )
+                already_considered = max(1, current_index + 1)
+                for candidate_model in remaining_models[
+                    : max(0, attempt_limit - already_considered)
+                ]:
+                    if candidate_model not in try_models:
+                        try_models.append(candidate_model)
+                last_verdict_error: Exception = exc
+                for candidate_index, candidate_model in enumerate(try_models):
+                    if candidate_index:
+                        logger.warning(
+                            "[astrbot-fact-check-verdict-advance] "
+                            f"from={verdict_model} next={candidate_model} "
+                            f"reason={error_label(last_verdict_error)}"
+                        )
+                    try:
+                        verdict_body, verdict_model = generate_with_fallback(
+                            prompt=verdict_prompt,
+                            models=[candidate_model],
+                            api_key=api_key,
+                            base_url=base_url,
+                            temperature=0.1,
+                            max_output_tokens=retry_tokens,
+                            grounding=False,
+                            thinking_level=verdict_thinking_level,
+                            model_failure_cooldown_seconds=model_failure_cooldown_seconds,
+                            http_max_retries=0,
+                            request_timeout=verdict_request_timeout,
+                        )
+                        validate_complete_fact_check_result(
+                            verdict_body,
+                            expected_claims=deduped,
+                        )
+                        break
+                    except Exception as retry_exc:
+                        last_verdict_error = retry_exc
+                else:
+                    raise last_verdict_error
             body, used_model = verdict_body, verdict_model
             logger.info(
                 "[astrbot-fact-check-stage] verdict-review done "
@@ -1872,7 +1939,30 @@ def _extract_visible_page_text(body: bytes, *, content_type: str, max_chars: int
         or media_type in {"application/xhtml+xml", "application/json", "application/xml"}
     ):
         raise ValueError(f"unsupported content type: {media_type}")
-    text = body.decode("utf-8", errors="replace")
+    charset_match = re.search(
+        r"charset\s*=\s*[\"']?([\w.-]+)",
+        content_type,
+        flags=re.IGNORECASE,
+    )
+    declared_charset = charset_match.group(1) if charset_match else ""
+    if not declared_charset:
+        header = body[:4096].decode("latin-1", errors="ignore")
+        meta_match = re.search(
+            r"charset\s*=\s*[\"']?([\w.-]+)",
+            header,
+            flags=re.IGNORECASE,
+        )
+        declared_charset = meta_match.group(1) if meta_match else ""
+    encodings = [encoding for encoding in (declared_charset, "utf-8", "gb18030") if encoding]
+    text = ""
+    for encoding in encodings:
+        try:
+            text = body.decode(encoding)
+            break
+        except (LookupError, UnicodeDecodeError):
+            continue
+    if not text:
+        text = body.decode("utf-8", errors="replace")
     if "html" in media_type or re.search(r"<\s*(?:html|body|article|main)\b", text, re.I):
         parser = _VisibleHtmlTextParser()
         try:
@@ -1885,6 +1975,43 @@ def _extract_visible_page_text(body: bytes, *, content_type: str, max_chars: int
     if not text:
         raise ValueError("page contains no readable text")
     return text[: max(100, int(max_chars or 6000))]
+
+
+def _resolve_public_target_ip(host: str, port: int) -> str:
+    """Resolve once and pin the validated address used by the fallback socket."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        if not address.is_global:
+            raise ValueError("URL hostname resolves to a non-public address")
+        return host
+    future = _DNS_RESOLVER.submit(
+        socket.getaddrinfo,
+        host,
+        port,
+        0,
+        socket.SOCK_STREAM,
+    )
+    try:
+        records = future.result(timeout=_bounded_timeout(3.0))
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        raise ValueError(f"URL hostname resolution timed out: {host}") from exc
+    except OSError as exc:
+        raise ValueError(f"URL hostname could not be resolved: {host}") from exc
+    addresses = list(dict.fromkeys(item[4][0] for item in records if item and item[4]))
+    if not addresses or any(not ipaddress.ip_address(item).is_global for item in addresses):
+        raise ValueError("URL hostname resolves to a non-public address")
+    return addresses[0]
+
+
+def _redact_url_for_log(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    if not parsed.scheme or not parsed.netloc:
+        return shorten_text(url, 160)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def fetch_public_page_text(
@@ -1901,41 +2028,63 @@ def fetch_public_page_text(
     inherited_deadline = _REQUEST_DEADLINE.get()
     if inherited_deadline is not None:
         deadline = min(deadline, inherited_deadline)
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; AstrBotFactCheck/1.0)"}
-    with httpx.Client(follow_redirects=False, trust_env=True, headers=headers) as client:
-        for _ in range(3):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise httpx.TimeoutException("direct page fetch deadline exceeded")
-            ensure_public_url_target(current)
-            with client.stream(
-                "GET",
-                current,
-                timeout=httpx.Timeout(
-                    min(8.0, remaining),
-                    connect=min(3.0, remaining),
-                    read=min(8.0, remaining),
-                    write=min(3.0, remaining),
-                ),
-                follow_redirects=False,
-            ) as response:
-                if response.status_code in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise ValueError("redirect without location")
-                    current = normalize_url(urljoin(current, location))
-                    continue
-                response.raise_for_status()
-                data = bytearray()
-                for chunk in response.iter_bytes():
-                    data.extend(chunk)
-                    if len(data) > max_bytes:
-                        raise ValueError("page exceeds direct fallback size limit")
-                return _extract_visible_page_text(
-                    bytes(data),
-                    content_type=response.headers.get("content-type", ""),
-                    max_chars=max_chars,
-                )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; AstrBotFactCheck/1.0)",
+        "Accept": "text/html,application/xhtml+xml,text/plain,application/json",
+        "Accept-Encoding": "identity",
+    }
+    for _ in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise httpx.TimeoutException("direct page fetch deadline exceeded")
+        parsed = urlparse(current)
+        host = str(parsed.hostname or "")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        pinned_ip = _resolve_public_target_ip(host, port)
+        connection_type = (
+            _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
+        )
+        connection = connection_type(
+            host,
+            pinned_ip,
+            port,
+            timeout=min(8.0, remaining),
+        )
+        try:
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+            host_header = host
+            if (parsed.scheme == "https" and port != 443) or (
+                parsed.scheme == "http" and port != 80
+            ):
+                host_header = f"{host_header}:{port}"
+            connection.request("GET", path, headers={**headers, "Host": host_header})
+            response = connection.getresponse()
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.getheader("Location")
+                if not location:
+                    raise ValueError("redirect without location")
+                current = normalize_url(urljoin(current, location))
+                continue
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(f"HTTP {response.status} {response.reason}")
+            content_type = response.getheader("Content-Type", "")
+            data = bytearray()
+            while True:
+                chunk = response.read(min(64 * 1024, max_bytes + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > max_bytes:
+                    raise ValueError("page exceeds direct fallback size limit")
+            return _extract_visible_page_text(
+                bytes(data),
+                content_type=content_type,
+                max_chars=max_chars,
+            )
+        finally:
+            connection.close()
     raise RuntimeError("too many redirects")
 
 
@@ -2072,7 +2221,7 @@ def collect_anysearch_evidence(
                             )
                             logger.info(
                                 "[astrbot-fact-check-anysearch-direct-fallback] "
-                                f"url={shorten_text(url, 160)}"
+                                f"url={_redact_url_for_log(url)}"
                             )
                             return url, extracted, "", True
                         except Exception as fallback_exc:
@@ -2110,7 +2259,8 @@ def collect_anysearch_evidence(
     for url, extracted, error, _ in extract_results:
         if error:
             logger.warning(
-                f"[astrbot-fact-check-anysearch-extract-error] {shorten_text(url, 160)}: {error}"
+                f"[astrbot-fact-check-anysearch-extract-error] "
+                f"{_redact_url_for_log(url)}: {error}"
             )
             continue
         excerpt_sources.append(url)

@@ -6,6 +6,19 @@ from typing import Any
 from .fact_check import DEFAULT_VERDICT_MODELS, FactCheckRequest
 
 
+LEGACY_VERDICT_MODELS = ["gemini-3-flash-preview"]
+
+
+def resolve_verdict_models(
+    list_config: Callable[[str, list[str]], list[str]],
+) -> list[str]:
+    """Upgrade the pre-capacity default without overriding other custom lists."""
+    configured = list_config("fact_check_verdict_models", [])
+    if not configured or configured == LEGACY_VERDICT_MODELS:
+        return list(DEFAULT_VERDICT_MODELS)
+    return configured
+
+
 def build_fact_check_kwargs(
     config: Any,
     request_data: FactCheckRequest,
@@ -28,9 +41,7 @@ def build_fact_check_kwargs(
         "evidence_model": str(
             config.get("fact_check_evidence_model") or "gemini-2.5-flash"
         ).strip(),
-        "verdict_models": list_config(
-            "fact_check_verdict_models", list(DEFAULT_VERDICT_MODELS)
-        ),
+        "verdict_models": resolve_verdict_models(list_config=list_config),
         "max_image_bytes": int(
             config.get("fact_check_max_image_bytes") or 5 * 1024 * 1024
         ),
