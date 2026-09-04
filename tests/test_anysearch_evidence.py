@@ -485,6 +485,70 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 endpoint_validated=True,
             )
 
+    def test_collect_anysearch_marks_tool_level_extract_errors(self) -> None:
+        def fake_call_tool(*, tool_name, **kwargs):
+            if tool_name == "search":
+                return "- **URL**: https://example.com/report"
+            if tool_name == "extract":
+                raise RuntimeError("Anysearch tool returned an error: extract_failed")
+            raise AssertionError(f"unexpected tool: {tool_name}")
+
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
+            evidence = collect_anysearch_evidence(
+                [ClaimCandidate("核查新闻")],
+                enabled=True,
+                endpoint="https://api.anysearch.com/mcp",
+                api_key="",
+                timeout=5,
+                max_claims=1,
+                max_results_per_claim=1,
+                extract_top_urls=1,
+                max_chars=4000,
+            )
+
+        self.assertEqual(evidence.status, "extract_failed")
+        self.assertEqual(evidence.extract_attempted, 1)
+        self.assertEqual(evidence.extract_succeeded, 0)
+        self.assertEqual(evidence.extract_failed, 1)
+        self.assertIn("extracts=0", evidence.reason)
+
+    def test_collect_anysearch_marks_partial_extract_results(self) -> None:
+        def fake_call_tool(*, tool_name, arguments=None, **kwargs):
+            if tool_name == "search":
+                return (
+                    "- **URL**: https://example.com/report-a\n"
+                    "- **URL**: https://example.com/report-b"
+                )
+            if tool_name == "extract":
+                if arguments["url"].endswith("report-a"):
+                    return "A 事件的正文证据"
+                raise RuntimeError("Anysearch tool returned an error: extract_failed")
+            raise AssertionError(f"unexpected tool: {tool_name}")
+
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
+            evidence = collect_anysearch_evidence(
+                [ClaimCandidate("核查新闻")],
+                enabled=True,
+                endpoint="https://api.anysearch.com/mcp",
+                api_key="",
+                timeout=5,
+                max_claims=1,
+                max_results_per_claim=2,
+                extract_top_urls=2,
+                max_chars=4000,
+            )
+
+        self.assertEqual(evidence.status, "partial")
+        self.assertEqual(evidence.extract_attempted, 2)
+        self.assertEqual(evidence.extract_succeeded, 1)
+        self.assertEqual(evidence.extract_failed, 1)
+
     def test_public_url_dns_resolution_timeout_fails_closed(self) -> None:
         future = MagicMock()
         future.result.side_effect = TimeoutError
@@ -603,6 +667,59 @@ class AnysearchEvidenceTests(unittest.TestCase):
         self.assertIn("事实核查：基本可信但需限定", result.reply)
         self.assertIn("可核验链接：", result.reply)
         self.assertIn("https://example.com/source", result.reply)
+
+    def test_run_fact_check_explains_degraded_anysearch_retrieval(self) -> None:
+        response = {
+            "candidates": [
+                {
+                    "finishReason": "STOP",
+                    "content": {
+                        "parts": [
+                            {
+                                "text": (
+                                    "事实核查：证据不足\n"
+                                    "1. 核查点：A 事件已经发生\n"
+                                    "结论：证据不足\n"
+                                    "依据：没有找到直接来源。\n"
+                                    "证据关系：无直接证据"
+                                )
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+
+        with (
+            patch(
+                "fact_check.extract_claims_from_text",
+                return_value=[ClaimCandidate("A 事件已经发生")],
+            ),
+            patch(
+                "fact_check.collect_anysearch_evidence",
+                return_value=AnysearchEvidence(
+                    text="搜索摘要：\n无可用网页正文",
+                    status="extract_failed",
+                    reason="extract_failed; queries=1 urls=1 extracts=0",
+                ),
+            ),
+            patch("fact_check.generate_with_fallback", return_value=(response, "gemini-test")),
+        ):
+            result = run_fact_check(
+                request_data=FactCheckRequest(
+                    text="A 事件已经发生",
+                    trigger_text="/事实核查",
+                ),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-pre",
+                main_models=["gemini-main"],
+                anysearch_enabled=True,
+                verdict_policy="never",
+            )
+
+        self.assertIn("网页正文提取失败", result.reply)
+        self.assertIn("证据不足", result.reply)
 
     def test_final_reply_always_appends_clickable_source_urls(self) -> None:
         reply = append_source_links(
