@@ -156,7 +156,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 return search_text
             raise AssertionError(f"unexpected tool: {tool_name}")
 
-        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
             evidence = collect_anysearch_evidence(
                 [ClaimCandidate("A claim")],
                 enabled=True,
@@ -278,7 +281,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 return f"## Extracted\nA 事件 B 事件正文来自 {arguments['url']}"
             raise AssertionError(f"unexpected tool: {tool_name}")
 
-        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
             evidence = collect_anysearch_evidence(
                 [
                     ClaimCandidate("请核查：A 事件是否属实？", priority=5),
@@ -336,7 +342,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 return "extracted"
             raise AssertionError(f"unexpected tool: {tool_name}")
 
-        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
             collect_anysearch_evidence(
                 [ClaimCandidate("A claim"), ClaimCandidate("B claim")],
                 enabled=True,
@@ -369,7 +378,10 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 return "extracted evidence"
             raise AssertionError(f"unexpected tool: {tool_name}")
 
-        with patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool):
+        with (
+            patch("fact_check.anysearch_call_tool", side_effect=fake_call_tool),
+            patch("fact_check.ensure_public_url_target"),
+        ):
             collect_anysearch_evidence(
                 [ClaimCandidate("A claim"), ClaimCandidate("B claim"), ClaimCandidate("C claim")],
                 enabled=True,
