@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -1939,7 +1939,30 @@ def _extract_visible_page_text(body: bytes, *, content_type: str, max_chars: int
         or media_type in {"application/xhtml+xml", "application/json", "application/xml"}
     ):
         raise ValueError(f"unsupported content type: {media_type}")
-    text = body.decode("utf-8", errors="replace")
+    charset_match = re.search(
+        r"charset\s*=\s*[\"']?([\w.-]+)",
+        content_type,
+        flags=re.IGNORECASE,
+    )
+    declared_charset = charset_match.group(1) if charset_match else ""
+    if not declared_charset:
+        header = body[:4096].decode("latin-1", errors="ignore")
+        meta_match = re.search(
+            r"charset\s*=\s*[\"']?([\w.-]+)",
+            header,
+            flags=re.IGNORECASE,
+        )
+        declared_charset = meta_match.group(1) if meta_match else ""
+    encodings = [encoding for encoding in (declared_charset, "utf-8", "gb18030") if encoding]
+    text = ""
+    for encoding in encodings:
+        try:
+            text = body.decode(encoding)
+            break
+        except (LookupError, UnicodeDecodeError):
+            continue
+    if not text:
+        text = body.decode("utf-8", errors="replace")
     if "html" in media_type or re.search(r"<\s*(?:html|body|article|main)\b", text, re.I):
         parser = _VisibleHtmlTextParser()
         try:
@@ -1982,6 +2005,13 @@ def _resolve_public_target_ip(host: str, port: int) -> str:
     if not addresses or any(not ipaddress.ip_address(item).is_global for item in addresses):
         raise ValueError("URL hostname resolves to a non-public address")
     return addresses[0]
+
+
+def _redact_url_for_log(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    if not parsed.scheme or not parsed.netloc:
+        return shorten_text(url, 160)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def fetch_public_page_text(
@@ -2191,7 +2221,7 @@ def collect_anysearch_evidence(
                             )
                             logger.info(
                                 "[astrbot-fact-check-anysearch-direct-fallback] "
-                                f"url={shorten_text(url, 160)}"
+                                f"url={_redact_url_for_log(url)}"
                             )
                             return url, extracted, "", True
                         except Exception as fallback_exc:
@@ -2229,7 +2259,8 @@ def collect_anysearch_evidence(
     for url, extracted, error, _ in extract_results:
         if error:
             logger.warning(
-                f"[astrbot-fact-check-anysearch-extract-error] {shorten_text(url, 160)}: {error}"
+                f"[astrbot-fact-check-anysearch-extract-error] "
+                f"{_redact_url_for_log(url)}: {error}"
             )
             continue
         excerpt_sources.append(url)

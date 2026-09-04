@@ -34,6 +34,7 @@ from fact_check import (
     extract_public_urls,
     extract_sources,
     _extract_visible_page_text,
+    _redact_url_for_log,
     fetch_public_page_text,
     infer_anysearch_freshness,
     is_public_http_url,
@@ -620,6 +621,24 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 max_chars=100,
             ),
             "Hello world",
+        )
+
+    def test_extract_visible_page_text_honors_declared_gbk_charset(self) -> None:
+        body = "<main>中文证据</main>".encode("gb18030")
+
+        self.assertEqual(
+            _extract_visible_page_text(
+                body,
+                content_type="text/html; charset=gb18030",
+                max_chars=100,
+            ),
+            "中文证据",
+        )
+
+    def test_redact_url_for_log_removes_query_and_fragment(self) -> None:
+        self.assertEqual(
+            _redact_url_for_log("https://example.com/report?token=secret#section"),
+            "https://example.com/report",
         )
 
     def test_direct_fetch_connects_to_the_validated_ip(self) -> None:
