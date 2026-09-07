@@ -979,7 +979,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
             "1. 核查点：Alpha policy claim\n结论：已核实\n依据：shared evidence\n"
             "2. 核查点：Beta policy claim\n结论：已核实\n依据：shared evidence"
         )
-        second_offset = text.rindex("shared evidence")
+        second_offset = len(text[: text.rindex("shared evidence")].encode("utf-8"))
         body = {
             "candidates": [
                 {

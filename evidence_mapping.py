@@ -253,11 +253,11 @@ def extract_claim_source_map(
     content = (response_candidates[0] if response_candidates else {}).get(
         "content"
     ) or {}
-    response_text = "".join(
-        str(part.get("text") or "")
+    part_texts = [
+        str(part.get("text") or "") if isinstance(part, dict) else ""
         for part in content.get("parts") or []
-        if isinstance(part, dict)
-    )
+    ]
+    response_text = "".join(part_texts)
     point_matches = list(
         re.finditer(r"^\s*(\d+)\.\s*核查点[：:]", response_text, flags=re.MULTILINE),
     )
@@ -266,10 +266,40 @@ def extract_claim_source_map(
         if not isinstance(support, dict):
             continue
         segment = support.get("segment") or {}
+        if not isinstance(segment, dict):
+            continue
         segment_text = str(segment.get("text") or "").strip()
-        segment_start = segment.get("startIndex")
+        segment_start: int | None = None
+        if "startIndex" in segment or "endIndex" in segment:
+            # Gemini offsets are UTF-8 bytes inside one Part. Invalid spans must
+            # not acquire another claim's sources through the text fallback.
+            part_index = segment.get("partIndex", 0)
+            byte_start = segment.get("startIndex", 0)
+            byte_end = segment.get("endIndex")
+            if type(part_index) is not int or not 0 <= part_index < len(part_texts):
+                continue
+            if type(byte_start) is not int:
+                continue
+            if byte_end is None:
+                byte_end = byte_start + len(segment_text.encode("utf-8"))
+            part_bytes = part_texts[part_index].encode("utf-8")
+            if type(byte_end) is not int or not 0 <= byte_start < byte_end <= len(
+                part_bytes
+            ):
+                continue
+            try:
+                prefix = part_bytes[:byte_start].decode("utf-8")
+                cited_text = part_bytes[byte_start:byte_end].decode("utf-8").strip()
+            except UnicodeDecodeError:
+                continue
+            if segment_text and segment_text != cited_text:
+                continue
+            segment_text = cited_text
+            segment_start = sum(len(text) for text in part_texts[:part_index]) + len(
+                prefix
+            )
         best_index: int | None = None
-        if isinstance(segment_start, int) and point_matches:
+        if segment_start is not None and point_matches:
             for point_index, point_match in enumerate(point_matches):
                 next_start = (
                     point_matches[point_index + 1].start()
