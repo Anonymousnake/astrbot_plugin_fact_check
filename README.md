@@ -17,6 +17,7 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Uses Gemini 2.5 Flash with Google Search grounding to collect evidence and produce a complete fallback result.
 - Uses Gemini 3 Flash without native grounding for multi-claim and high-risk topics by default; ordinary single claims use the grounded result directly.
 - Optionally searches Anysearch for extra pre-retrieval evidence before the grounded check.
+- Optionally uses SerpAPI Google search when Anysearch fails, returns only snippets, or leaves a claim without direct evidence. Successful primary evidence is preserved.
 - Formats replies as plain QQ-friendly text with explicit per-point `结论：` lines.
 - Maps Gemini grounding support back to individual claim blocks and marks claims without direct support.
 - Interprets grounding offsets as UTF-8 bytes within the specified content part and rejects malformed spans.
@@ -52,6 +53,10 @@ Managed by AstrBot WebUI through `_conf_schema.json`.
 - `fact_check_anysearch_enabled`: enable Anysearch pre-retrieval evidence.
 - `fact_check_anysearch_api_key`: optional Anysearch API key. Empty means anonymous access or `ANYSEARCH_API_KEY`.
 - `fact_check_anysearch_extract_top_urls`: number of public result pages to extract into plain-text snippets.
+- `fact_check_serpapi_enabled`: enable independent backup search, including when Anysearch is disabled.
+- `fact_check_serpapi_api_key`: SerpAPI key, or `SERPAPI_API_KEY` when empty.
+- `fact_check_serpapi_max_queries`: backup queries per request, default 2 (range 1–3).
+- `fact_check_serpapi_timeout_seconds`: combined backup search/extraction budget, default 20 seconds (maximum 30), within the total request deadline.
 - `fact_check_show_failure_reason`: append a short friendly reason to failures.
 - `fact_check_session_store_enabled`: persist owner-scoped follow-up sessions across restarts.
 - `fact_check_access_control_fail_open`: keep disabled so an ACL import failure does not expose the command globally.
@@ -86,5 +91,13 @@ forward-message output flow.
 
 Do not enable this mode for groups where fact-check queries may contain private data, because the
 claims and extracted public URLs are sent to Anysearch.
+
+## Backup search
+
+SerpAPI is disabled by default. Enable it and supply a key in the plugin configuration to use it as a backup to Anysearch. Healthy primary retrieval with sources for every claim uses no backup quota. Otherwise, the plugin prioritizes claims without direct sources, with at most two additional searches by default. These searches consume the configured SerpAPI account's quota.
+
+The adapter uses the documented [SerpAPI Google search endpoint](https://serpapi.com/search-api) and fetches selected public pages directly, so neither backup search nor page extraction depends on Anysearch. Google Search grounding in Gemini continues to run as a separate evidence step. SerpAPI and Gemini grounding both use Google's index; the fallback provides an independent service path, not a separate search index.
+
+Search snippets remain hints. A page must be successfully fetched and pass the existing relevance check before its URL becomes direct claim evidence. Backup failures preserve the primary evidence and do not prevent the grounded check. Backup input is restricted to the extracted claims; the plugin does not send chat identities or images to SerpAPI.
 
 The old bot files under `D:\Codex\QQ_Agent` and `D:\Codex\PDF_OCR` are not modified by this plugin.

@@ -75,6 +75,10 @@ def build_fact_check_kwargs(
             config.get("fact_check_evidence_retry_max_output_tokens") or 4096
         ),
         "anysearch_enabled": bool(config.get("fact_check_anysearch_enabled", False)),
+        "serpapi_enabled": bool(config.get("fact_check_serpapi_enabled", False)),
+        "serpapi_api_key": str(config.get("fact_check_serpapi_api_key") or ""),
+        "serpapi_timeout": int(config.get("fact_check_serpapi_timeout_seconds") or 20),
+        "serpapi_max_queries": int(config.get("fact_check_serpapi_max_queries") or 2),
         "anysearch_endpoint": str(
             config.get("fact_check_anysearch_endpoint")
             or "https://api.anysearch.com/mcp"

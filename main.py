@@ -5,6 +5,7 @@ import difflib
 import hashlib
 import html
 import json
+import os
 import re
 import shutil
 import sys
@@ -51,7 +52,7 @@ from .pipeline_config import build_fact_check_kwargs, resolve_verdict_models
 from .runtime import AsyncSingleFlight, run_blocking_with_timeout
 from .storage import FactCheckMetricsStore, atomic_write_json, read_json_file
 
-FACT_CHECK_PIPELINE_VERSION = "quality-v7"
+FACT_CHECK_PIPELINE_VERSION = "quality-v8"
 
 
 def _current_cache_date() -> str:
@@ -995,6 +996,11 @@ class FactCheckPlugin(Star):
         anysearch_api_key = str(
             self.config.get("fact_check_anysearch_api_key") or ""
         ).strip()
+        serpapi_api_key = (
+            str(self.config.get("fact_check_serpapi_api_key") or "").strip()
+            or os.getenv("SERPAPI_API_KEY")
+            or ""
+        ).strip()
         payload = {
             "pipeline_version": FACT_CHECK_PIPELINE_VERSION,
             "text": request_data.text.strip(),
@@ -1097,6 +1103,20 @@ class FactCheckPlugin(Star):
                 "content_types": self._list_config(
                     "fact_check_anysearch_content_types",
                     ["web", "news"],
+                ),
+            },
+            "serpapi": {
+                "enabled": bool(self.config.get("fact_check_serpapi_enabled", False)),
+                "api_key_sha256": hashlib.sha256(
+                    serpapi_api_key.encode("utf-8")
+                ).hexdigest()
+                if serpapi_api_key
+                else "",
+                "timeout_seconds": str(
+                    cache_config_value("fact_check_serpapi_timeout_seconds", 20)
+                ),
+                "max_queries": str(
+                    cache_config_value("fact_check_serpapi_max_queries", 2)
                 ),
             },
         }
