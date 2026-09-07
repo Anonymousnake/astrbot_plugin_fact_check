@@ -11,6 +11,7 @@ from astrbot_plugin_fact_check.fact_check import (
     ClaimCandidate,
     IncompleteGenerationError,
     dedupe_candidates,
+    format_candidates,
     salvage_partial_fact_check_reply,
     validate_complete_fact_check_result,
 )
@@ -157,6 +158,16 @@ class ClaimIdentityTests(unittest.TestCase):
             ):
                 validate_complete_fact_check_result(
                     self.body(actual), expected_claims=[ClaimCandidate(expected)]
+                )
+
+    def test_verbatim_prompt_claim_passes_without_copying_origin_metadata(self):
+        text = "阿波罗11号于1969年完成人类首次载人登月。"
+        for origin in (text, "图片1"):
+            with self.subTest(origin=origin):
+                claim = ClaimCandidate(text, source=origin)
+                copied_claim = format_candidates([claim]).split(". ", 1)[1]
+                validate_complete_fact_check_result(
+                    self.body(copied_claim), expected_claims=[claim]
                 )
 
     def test_partial_recovery_cannot_restore_an_altered_claim(self):

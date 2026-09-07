@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import time
 from pathlib import Path
 
-from ..fact_check import FactCheckRequest, run_fact_check
+from ..fact_check import FactCheckRequest, error_label, run_fact_check
 from ..pipeline_config import build_fact_check_kwargs
 from ..verdict_policy import CLAIM_LABELS
 
 
 def main() -> None:
+    logging.disable(logging.DEBUG)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -31,6 +33,8 @@ def main() -> None:
     selected = [case for case in cases if not args.case or case["id"] in args.case]
     results = []
     for case in selected:
+        if results:
+            time.sleep(10)
         started = time.monotonic()
         print(f"Evaluating {case['id']}", flush=True)
         try:
@@ -60,6 +64,7 @@ def main() -> None:
                 "complete": result.reason.startswith("ok")
                 and not result.reason.startswith("ok; partial"),
                 "sources": result.sources,
+                "reason": result.reason,
                 "reply": result.reply,
             }
         except Exception as exc:  # noqa: BLE001 - keep evaluating after one provider failure
@@ -68,7 +73,7 @@ def main() -> None:
                 "verdict_matches": False,
                 "complete": False,
                 "sources": [],
-                "error": type(exc).__name__,
+                "error": error_label(exc),
             }
         row["elapsed_seconds"] = round(time.monotonic() - started, 2)
         results.append(row)

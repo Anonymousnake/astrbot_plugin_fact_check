@@ -1931,7 +1931,7 @@ def _claim_tokens(compact: str) -> set[str]:
 
 def format_candidates(candidates: list[ClaimCandidate]) -> str:
     return "\n".join(
-        f"{index}. {item.claim}（来自：{item.source or 'unknown'}）"
+        f"{index}. {item.claim}"
         for index, item in enumerate(candidates, start=1)
     )
 
