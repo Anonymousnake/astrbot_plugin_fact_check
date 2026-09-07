@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from collections import Counter
 from typing import Any
 
 try:
@@ -56,11 +58,30 @@ _CLAIM_MATCH_STOPWORDS = {
     "whether",
 }
 
+_CLAIM_QUANTITY_RE = re.compile(
+    r"[+-]?(?:\d{1,3}(?:,\d{3})+(?!\d)|\d+)(?:\.\d+)?"
+    r"(?:\s*(?:%|‰|[万亿]?(?:美元|欧元|元)|万|亿|"
+    r"毫克|微克|千克|公斤|克|吨|毫升|升|毫米|厘米|千米|公里|米|"
+    r"年|月|日|天|小时|分钟|秒|°c|"
+    r"(?:mcg|mg|kg|g|ml|l|km|cm|mm|m)(?![a-z])))?"
+)
+
 
 def claim_text_matches(expected: Any, actual: str) -> bool:
     """Return whether a rendered point still represents its expected claim."""
-    expected_text = _claim_text(expected)
-    actual_text = str(actual or "").strip()
+    expected_text = unicodedata.normalize("NFKC", _claim_text(expected)).lower()
+    actual_text = unicodedata.normalize("NFKC", str(actual or "").strip()).lower()
+    # Check quantities before fuzzy matching can erase a decimal, sign, unit,
+    # or date. Formatting may vary, but their values and multiplicity may not.
+    quantities = [
+        Counter(
+            re.sub(r"\s+", "", match).replace(",", "").lstrip("+")
+            for match in _CLAIM_QUANTITY_RE.findall(text.replace("−", "-"))
+        )
+        for text in (expected_text, actual_text)
+    ]
+    if quantities[0] != quantities[1]:
+        return False
     expected_compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", expected_text.lower())
     actual_compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", actual_text.lower())
     if not expected_compact or not actual_compact:
@@ -86,6 +107,10 @@ def _has_opposite_polarity(left: str, right: str) -> bool:
         (("未发生", "没有发生"), ("已发生", "已经发生")),
         (("不支持",), ("支持",)),
         (("不属于",), ("属于",)),
+        (
+            ("下降", "下跌", "减少", "降低", "不增长", "未增长"),
+            ("增长", "上涨", "增加", "上升", "提高"),
+        ),
     )
 
     def contains_unnegated(text: str, term: str) -> bool:

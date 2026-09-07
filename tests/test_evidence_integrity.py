@@ -7,6 +7,13 @@ from astrbot_plugin_fact_check.evidence_mapping import (
     enforce_evidence_coverage,
     extract_claim_source_map,
 )
+from astrbot_plugin_fact_check.fact_check import (
+    ClaimCandidate,
+    IncompleteGenerationError,
+    dedupe_candidates,
+    salvage_partial_fact_check_reply,
+    validate_complete_fact_check_result,
+)
 
 
 class GroundingOffsetTests(unittest.TestCase):
@@ -109,6 +116,81 @@ class GroundingOffsetTests(unittest.TestCase):
         self.assertEqual(
             extract_claim_source_map(body, self.claims), [[], [self.source]]
         )
+
+
+class ClaimIdentityTests(unittest.TestCase):
+    changed_claims = (
+        ("该药物每日服用5毫克。", "该药物每日服用50毫克。"),
+        ("该政策于2025年生效。", "该政策于2026年生效。"),
+        ("该公司2025年营收增长10%。", "该公司2025年营收下降10%。"),
+        ("该药物每日服用0.5毫克。", "该药物每日服用5毫克。"),
+        ("该药物每日服用5毫克。", "该药物每日服用5克。"),
+        ("该公司2025年利润增幅为-10%。", "该公司2025年利润增幅为10%。"),
+        ("该公司2025年营收增长10%。", "该公司2025年营收增长10。"),
+        ("该政策于2025年生效。", "该政策已经生效。"),
+    )
+
+    def body(self, claim: str) -> dict:
+        return {
+            "candidates": [
+                {
+                    "finishReason": "STOP",
+                    "content": {
+                        "parts": [
+                            {
+                                "text": (
+                                    f"事实核查：可信\n1. 核查点：{claim}\n结论：已核实\n"
+                                    "依据：公开公告列明了上述数值和时间。\n证据关系：支持一致"
+                                )
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+
+    def test_complete_result_rejects_changed_quantities_dates_and_direction(self):
+        for expected, actual in self.changed_claims:
+            with (
+                self.subTest(expected=expected, actual=actual),
+                self.assertRaises(IncompleteGenerationError),
+            ):
+                validate_complete_fact_check_result(
+                    self.body(actual), expected_claims=[ClaimCandidate(expected)]
+                )
+
+    def test_partial_recovery_cannot_restore_an_altered_claim(self):
+        for expected, actual in self.changed_claims:
+            with self.subTest(expected=expected, actual=actual):
+                body = self.body(actual)
+                body["candidates"][0]["finishReason"] = "MAX_TOKENS"
+                self.assertEqual(
+                    salvage_partial_fact_check_reply(body, [ClaimCandidate(expected)]),
+                    "",
+                )
+
+    def test_deduplication_keeps_distinct_decimals_and_signs(self):
+        claims = [
+            "该药物每日服用5.0毫克。",
+            "该药物每日服用50毫克。",
+            "该公司利润增幅为-10%。",
+            "该公司利润增幅为10%。",
+        ]
+        result = dedupe_candidates([ClaimCandidate(claim) for claim in claims], limit=4)
+        self.assertEqual([item.claim for item in result], claims)
+
+    def test_equivalent_wording_and_numeric_formatting_remain_valid(self):
+        for expected, actual in (
+            ("请核查：该政策于2025年生效是否属实？", "该政策于2025年生效是否属实。"),
+            ("该药物每日服用５ 毫克。", "该药物每日服用5毫克。"),
+            ("该政策于2025年生效。", "该政策于2025年正式生效。"),
+            ("该公司营收增长1,000万元。", "该公司营收增长1000万元。"),
+            ("该公司营收增长10%。", "该公司营收增加10%。"),
+        ):
+            with self.subTest(expected=expected, actual=actual):
+                validate_complete_fact_check_result(
+                    self.body(actual), expected_claims=[ClaimCandidate(expected)]
+                )
 
 
 if __name__ == "__main__":

@@ -665,6 +665,7 @@ def run_fact_check(
 - 不要使用 Markdown 粗体、Markdown 标题、代码块或裸列表符号。
 - 先给总结论，只能从这些标签中选择：可信 / 基本可信但需限定 / 条件性成立 / 混合结论 / 部分存疑 / 证据不足 / 基本不实 / 表述不准确。
 - 每个核查点都必须单独写“结论：...”，子问题结论只能从这些标签中选择：已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断。
+- “核查点”必须原样保留对应的待核查问题，不得改动数字、单位、日期、主体或增减/否定方向；对原说法的纠正只能写在“结论”和“依据”中。
 - 如果原文是“可以被视为符合某条件”“在满足条件下适用”“eligible”“aligned”“taxonomy-compatible”这类条件性表述，不要写“已证实”；优先写“条件性成立”或“表述需限定”，并说明条件。
 - 证据不足就明确说不确定，不要硬判。
 - 对复合命题逐项写清“已核实 / 条件性成立 / 表述需限定 / 部分存疑 / 证据不足 / 不准确 / 无法判断”，不要只回答其中一个子事实。
@@ -1040,6 +1041,7 @@ Grounded source URLs:
 
 Write a concise Chinese QQ-ready result. Start with "事实核查：" and choose one overall verdict from: 可信 / 基本可信但需限定 / 条件性成立 / 混合结论 / 部分存疑 / 证据不足 / 基本不实 / 表述不准确.
 For every atomic claim, preserve the order of Checkable claims and write this exact four-line block:
+Copy each Checkable claim verbatim into its 核查点 field. Do not change quantities, units, dates, named entities, negation, or direction; put corrections only in 结论 and 依据.
 1. 核查点：<do not omit or merge the claim>
 结论：<one allowed verdict>
 依据：<short evidence-based reason>
@@ -1884,12 +1886,14 @@ def dedupe_candidates(
     candidates: list[ClaimCandidate], *, limit: int
 ) -> list[ClaimCandidate]:
     deduped: list[ClaimCandidate] = []
-    seen: set[str] = set()
     for item in sorted(candidates, key=lambda x: x.priority, reverse=True):
         keys = _candidate_dedupe_keys(item.claim)
-        if any(key in seen for key in keys):
+        if any(
+            keys.intersection(_candidate_dedupe_keys(previous.claim))
+            and claim_text_matches(previous, item.claim)
+            for previous in deduped
+        ):
             continue
-        seen.update(keys)
         deduped.append(item)
         if len(deduped) >= limit:
             break
