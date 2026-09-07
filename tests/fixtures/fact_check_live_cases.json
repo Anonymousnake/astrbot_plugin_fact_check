@@ -1,0 +1,50 @@
+[
+  {
+    "id": "apollo-year-true",
+    "claim": "阿波罗11号于1969年完成人类首次载人登月。",
+    "expected_conclusion": "已核实",
+    "reference_url": "https://www.nasa.gov/history/apollo-11-mission-overview/",
+    "reference_quote": "Apollo 11 launched from Cape Kennedy on July 16, 1969, carrying Commander Neil Armstrong, Command Module Pilot Michael Collins and Lunar Module Pilot Edwin “Buzz” Aldrin into an initial Earth-orbit of 114 by 116 miles.",
+    "verified_on": "2026-09-07"
+  },
+  {
+    "id": "apollo-year-false",
+    "claim": "阿波罗11号于1970年完成人类首次载人登月。",
+    "expected_conclusion": "不准确",
+    "reference_url": "https://www.nasa.gov/history/apollo-11-mission-overview/",
+    "reference_quote": "Apollo 11 launched from Cape Kennedy on July 16, 1969, carrying Commander Neil Armstrong, Command Module Pilot Michael Collins and Lunar Module Pilot Edwin “Buzz” Aldrin into an initial Earth-orbit of 114 by 116 miles.",
+    "verified_on": "2026-09-07"
+  },
+  {
+    "id": "mars-moon-count-true",
+    "claim": "火星有2颗已知天然卫星。",
+    "expected_conclusion": "已核实",
+    "reference_url": "https://science.nasa.gov/mars/moons/",
+    "reference_quote": "Mars has two moons, Phobos and Deimos.",
+    "verified_on": "2026-09-07"
+  },
+  {
+    "id": "mars-moon-count-false",
+    "claim": "火星有3颗已知天然卫星。",
+    "expected_conclusion": "不准确",
+    "reference_url": "https://science.nasa.gov/mars/moons/",
+    "reference_quote": "Mars has two moons, Phobos and Deimos.",
+    "verified_on": "2026-09-07"
+  },
+  {
+    "id": "antibiotic-virus-true",
+    "claim": "抗生素不能治疗病毒感染。",
+    "expected_conclusion": "已核实",
+    "reference_url": "https://medlineplus.gov/antibiotics.html",
+    "reference_quote": "Antibiotics do not work on viral infections.",
+    "verified_on": "2026-09-07"
+  },
+  {
+    "id": "antibiotic-virus-false",
+    "claim": "抗生素可以直接治疗病毒感染。",
+    "expected_conclusion": "不准确",
+    "reference_url": "https://medlineplus.gov/antibiotics.html",
+    "reference_quote": "Antibiotics do not work on viral infections.",
+    "verified_on": "2026-09-07"
+  }
+]

@@ -19,7 +19,9 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Optionally searches Anysearch for extra pre-retrieval evidence before the grounded check.
 - Formats replies as plain QQ-friendly text with explicit per-point `结论：` lines.
 - Maps Gemini grounding support back to individual claim blocks and marks claims without direct support.
+- Interprets grounding offsets as UTF-8 bytes within the specified content part and rejects malformed spans.
 - Validates that the rendered claim still matches the requested claim before accepting a verdict.
+- Preserves quantities, units, dates, signs, and increase/decrease direction during verdict validation and partial recovery; candidate deduplication uses the same identity checks.
 - Requires stronger evidence for legal, medical, financial, safety, and other high-risk claims: one primary source or two independent sources.
 - Detects explicit source conflicts and prevents them from becoming high-confidence conclusions.
 - Keeps Anysearch evidence attached to its originating claim and rejects extracted pages that do not materially overlap that claim.
@@ -59,6 +61,20 @@ Managed by AstrBot WebUI through `_conf_schema.json`.
 - `fact_check.py` remains the synchronous evidence pipeline. AstrBot-facing runtime coordination and configuration translation live in `runtime.py` and `pipeline_config.py`.
 - The hard timeout bounds how long the bot waits. Python cannot forcibly stop an already-running worker thread, so upstream HTTP calls still retain their own bounded timeouts.
 - The quality corpus under `tests/fixtures/` covers source conflicts, high-risk source strength, unrelated evidence, and ordinary low-risk claims. It intentionally does not implement user-feedback learning.
+
+### Live quality regression sample
+
+`tests/fixtures/fact_check_live_cases.json` contains six true/false claims checked against NASA and MedlinePlus pages. The optional runner calls the configured APIs through the full pipeline; it sends only each claim, keeping the expected answer and reference excerpt out of the model input. Its report separates verdict matches, completed requests, source availability, and latency.
+
+Run from the AstrBot directory with the plugin installed:
+
+```bash
+PYTHONPATH="$PWD/data/plugins" .venv/bin/python -m astrbot_plugin_fact_check.tests.run_live_quality \
+  --config data/config/astrbot_plugin_fact_check_config.json \
+  --output /tmp/fact-check-quality.json
+```
+
+Use `--case apollo-year-false` to rerun one case and `--timeout 120` to set each request's budget. Treat this as a small regression sample; estimating general accuracy requires a larger independently labeled corpus.
 
 ## Anysearch evidence mode
 
