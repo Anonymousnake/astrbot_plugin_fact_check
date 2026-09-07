@@ -19,11 +19,16 @@ The server copy should live at:
 Update it with:
 
 ```bash
-cd /home/ubuntu/AstrBot/data/plugins/astrbot_plugin_fact_check
-git pull
-if [ -f requirements.txt ]; then /home/ubuntu/AstrBot/.venv/bin/pip install -r requirements.txt; fi
+cd /home/ubuntu/repos/astrbot-plugins
+git status --short --branch
+git pull --ff-only
+git submodule update --init plugins/astrbot_plugin_fact_check
+git status --short --branch
+/home/ubuntu/AstrBot/.venv/bin/python -m py_compile plugins/astrbot_plugin_fact_check/*.py
 sudo systemctl restart astrbot
 ```
+
+Commit and push the plugin update first, then commit and push its submodule pointer in the control repository. Production loads the control repository's pinned commit through a symlink. Start from a clean workspace and restart only after the submodule update, compilation, and final clean-workspace check succeed. Preserve any existing deploy-key SSH URL overrides.
 
 ## Config and data policy
 
