@@ -344,7 +344,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
                 )
             if tool_name == "extract":
                 extracted_urls.append(arguments["url"])
-                return "extracted"
+                return "Alpha launch happened. Beta launch happened."
             raise AssertionError(f"unexpected tool: {tool_name}")
 
         with (
@@ -352,7 +352,7 @@ class AnysearchEvidenceTests(unittest.TestCase):
             patch("fact_check.ensure_public_url_target"),
         ):
             collect_anysearch_evidence(
-                [ClaimCandidate("A claim"), ClaimCandidate("B claim")],
+                [ClaimCandidate("Alpha launch happened"), ClaimCandidate("Beta launch happened")],
                 enabled=True,
                 endpoint="https://api.anysearch.com/mcp",
                 api_key="",

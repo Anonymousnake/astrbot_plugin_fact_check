@@ -18,6 +18,9 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Uses Gemini 2.5 Flash with Google Search grounding to collect evidence and produce a complete fallback result.
 - Uses Gemini 3 Flash without native grounding for multi-claim and high-risk topics by default; ordinary single claims use the grounded result directly.
 - Optionally searches Anysearch for extra pre-retrieval evidence before the grounded check.
+- Failed or irrelevant page extraction tries alternative search results for uncovered claims, capped at two additional pages and ten seconds. It preserves the original claim-to-source mapping and cancellation deadline.
+- Current-state and previous/next calendar-period claims do not automatically exclude older publications. Explicit freshness settings still take precedence, and relative-time result caching remains short-lived.
+- Complete claim blocks with a contradictory overall headline are reconciled locally, without regenerating grounded evidence. Truncated claims, unsupported evidence directions, and mismatched claim identities still fail validation. Raw model text remains intact for grounding byte offsets.
 - Optionally uses SerpAPI Google search when Anysearch fails, returns only snippets, or leaves a claim without direct evidence. Successful primary evidence is preserved.
 - Formats replies as plain QQ-friendly text with explicit per-point `结论：` lines.
 - Maps Gemini grounding support back to individual claim blocks and marks claims without direct support.

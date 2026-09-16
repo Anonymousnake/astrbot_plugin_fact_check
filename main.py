@@ -53,7 +53,7 @@ from .pipeline_config import build_fact_check_kwargs, resolve_verdict_models
 from .runtime import AsyncSingleFlight, run_blocking_with_timeout
 from .storage import FactCheckMetricsStore, atomic_write_json, read_json_file
 
-FACT_CHECK_PIPELINE_VERSION = "quality-v9"
+FACT_CHECK_PIPELINE_VERSION = "quality-v10"
 
 
 def _current_cache_date() -> str:
@@ -61,7 +61,14 @@ def _current_cache_date() -> str:
 
 
 def _request_uses_current_time(request_data: FactCheckRequest) -> bool:
-    return bool(request_data.images or infer_anysearch_freshness(request_data.text))
+    return bool(
+        request_data.images or infer_anysearch_freshness(request_data.text)
+        or re.search(
+            r"目前|当前|即将|马上|尚未发生|将于|上月|下月|去年|明年|"
+            r"\b(?:now|upcoming|soon|next month|last month|next year|last year)\b",
+            request_data.text, re.IGNORECASE,
+        )
+    )
 
 try:
     from astrbot_plugin_access_control.access_control import is_plugin_allowed

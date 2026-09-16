@@ -58,12 +58,14 @@ except ImportError:
 try:
     from .verdict_policy import (
         EVIDENCE_RELATIONS,
+        reconcile_fact_check_summary,
         conclusion_relation_compatible,
         summary_matches_claim_labels,
     )
 except ImportError:  # pragma: no cover - supports direct module imports in tests
     from verdict_policy import (
         EVIDENCE_RELATIONS,
+        reconcile_fact_check_summary,
         conclusion_relation_compatible,
         summary_matches_claim_labels,
     )
@@ -722,6 +724,7 @@ def run_fact_check(
         validate_complete_fact_check_result(
             evidence_body,
             expected_claims=deduped,
+            reconcile_summary=True,
         )
     except IncompleteGenerationError as exc:
         retry_tokens = _clamp_int(
@@ -765,6 +768,7 @@ def run_fact_check(
             validate_complete_fact_check_result(
                 evidence_body,
                 expected_claims=deduped,
+                reconcile_summary=True,
             )
         except IncompleteGenerationError as retry_exc:
             logger.error(
@@ -847,6 +851,7 @@ def run_fact_check(
                 validate_complete_fact_check_result(
                     verdict_body,
                     expected_claims=deduped,
+                    reconcile_summary=True,
                 )
             except IncompleteGenerationError as exc:
                 retry_tokens = _clamp_int(
@@ -907,6 +912,7 @@ def run_fact_check(
                         validate_complete_fact_check_result(
                             verdict_body,
                             expected_claims=deduped,
+                            reconcile_summary=True,
                         )
                         break
                     except Exception as retry_exc:
@@ -2211,9 +2217,11 @@ def collect_anysearch_evidence(
             if not extract_urls:
                 extract_urls = urls[:extract_limit]
             request_deadline = _REQUEST_DEADLINE.get()
+            request_cancel = _REQUEST_CANCEL_EVENT.get()
 
             def extract_page(url: str) -> tuple[str, str, str, bool]:
                 token = _REQUEST_DEADLINE.set(request_deadline)
+                cancel_token = _REQUEST_CANCEL_EVENT.set(request_cancel)
                 try:
                     # Anysearch fetches this URL remotely. Local validation only
                     # checks the URL syntax/literal host to avoid DNS stalls and
@@ -2228,6 +2236,8 @@ def collect_anysearch_evidence(
                         client=shared_client,
                         endpoint_validated=True,
                     )
+                    if not extracted.strip():
+                        raise ValueError("empty page extraction")
                 except Exception as exc:
                     if anysearch_direct_fetch_fallback:
                         try:
@@ -2250,6 +2260,7 @@ def collect_anysearch_evidence(
                             )
                     return url, "", error_label(exc), False
                 finally:
+                    _REQUEST_CANCEL_EVENT.reset(cancel_token)
                     _REQUEST_DEADLINE.reset(token)
                 return url, extracted, "", False
 
@@ -2259,6 +2270,36 @@ def collect_anysearch_evidence(
                     max_workers=min(2, len(extract_urls)),
                 ) as executor:
                     extract_results = list(executor.map(extract_page, extract_urls))
+                    # Recover uncovered claims using other already-found pages.
+                    # At most two extra pages and ten seconds across all claims.
+                    recovery_deadline = time.monotonic() + 10
+                    request_deadline = min(request_deadline, recovery_deadline) if request_deadline is not None else recovery_deadline
+                    remaining_attempts = 2
+                    while remaining_attempts and request_deadline - time.monotonic() > 1:
+                        if request_cancel is not None and request_cancel.is_set():
+                            break
+                        attempted = {row[0] for row in extract_results}
+                        recovery_urls = []
+                        for group, indexes in zip(query_url_groups, query_claim_indexes):
+                            uncovered = any(
+                                not any(
+                                    url in group and not error and evidence_text_relevant(candidates[index], content)
+                                    for url, content, error, _ in extract_results
+                                )
+                                for index in indexes
+                            )
+                            if not uncovered:
+                                continue
+                            next_url = next((url for url in group if url not in attempted and url not in recovery_urls), None)
+                            if next_url:
+                                recovery_urls.append(next_url)
+                            if len(recovery_urls) >= remaining_attempts:
+                                break
+                        if not recovery_urls:
+                            break
+                        logger.info(f"[astrbot-fact-check-extract-recovery] pages={len(recovery_urls)}")
+                        extract_results.extend(executor.map(extract_page, recovery_urls))
+                        remaining_attempts -= len(recovery_urls)
     except Exception as exc:
         return AnysearchEvidence(
             reason=f"search failed: {error_label(exc)}",
@@ -2555,18 +2596,17 @@ def infer_anysearch_freshness(claim: str) -> str:
     text = str(claim or "").lower()
     if re.search(
         r"(今天|今日|昨天|昨日|前天|明天|后天|今晚|今早|今晨|明早|"
-        r"刚刚|突发|实时|最新|目前|当前|即将|马上|尚未发生|将于|"
-        r"now|today|yesterday|tomorrow|breaking|latest|upcoming|soon)",
+        r"刚刚|突发|实时|\btoday\b|\byesterday\b|\btomorrow\b|\bbreaking\b)",
         text,
     ):
         return "day"
     if re.search(
-        r"(本周|这周|近日|近期|最近|过去几天|this week|recent|past few days)", text
+        r"(本周|这周|近日|近期|最近|最新|过去几天|this week|\brecent\b|\blatest\b|past few days)", text
     ):
         return "week"
-    if re.search(r"(本月|这个月|上月|下月|this month|next month|last month)", text):
+    if re.search(r"(本月|这个月|this month)", text):
         return "month"
-    if re.search(r"(今年|本年度|去年|明年|this year|next year|last year)", text):
+    if re.search(r"(今年|本年度|this year)", text):
         return "year"
     return ""
 
@@ -3223,6 +3263,7 @@ def validate_complete_fact_check_result(
     *,
     expected_claim_count: int = 0,
     expected_claims: list[ClaimCandidate] | None = None,
+    reconcile_summary: bool = False,
 ) -> None:
     candidates = body.get("candidates", []) or []
     candidate = candidates[0] if candidates else {}
@@ -3302,9 +3343,17 @@ def validate_complete_fact_check_result(
                 f"claim {number} conclusion contradicts evidence direction",
             )
     if not summary_matches_claim_labels(summary_match.group(1), child_labels):
-        raise IncompleteGenerationError(
-            "fact-check summary contradicts child conclusions",
-        )
+        if not reconcile_summary:
+            raise IncompleteGenerationError(
+                "fact-check summary contradicts child conclusions",
+            )
+        # Keep raw parts intact: grounding spans index their original UTF-8 bytes.
+        # Rendering derives the headline from the validated, evidence-guarded claims.
+        repaired = reconcile_fact_check_summary(text)
+        repaired_summary = re.search(r"(?:^|\n)事实核查[：:]\s*([^\n]+)", repaired)
+        if not repaired_summary or not summary_matches_claim_labels(repaired_summary.group(1), child_labels):
+            raise IncompleteGenerationError("fact-check summary could not be reconciled")
+        logger.info("[astrbot-fact-check-summary-reconciled] derived from complete claim blocks")
     if text.rstrip().endswith((",", "，", "、", ":", "：", ";", "；", "/", "（")):
         raise IncompleteGenerationError("reply ended mid-sentence")
 
