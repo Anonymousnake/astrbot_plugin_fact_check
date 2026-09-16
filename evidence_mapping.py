@@ -144,7 +144,7 @@ _EVIDENCE_REQUIRED_LABELS = (
 )
 
 _HIGH_RISK_CLAIM_RE = re.compile(
-    r"(法规|政策|法律|违法|法院|医学|疾病|治疗|药物|疫苗|金融|投资|证券|安全|事故|伤亡|"
+    r"(法规|政策|法律|违法|法院|医学|医疗|医美|抗衰|针剂|注射|基因|疾病|治疗|药物|疫苗|金融|投资|证券|安全|事故|伤亡|"
     r"policy|law|legal|court|medical|disease|treatment|drug|vaccine|finance|investment|security|accident|injury)",
     flags=re.IGNORECASE,
 )

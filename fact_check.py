@@ -137,7 +137,8 @@ CLAIM_EXTRACTION_FIDELITY_RULES = """\
 - 核查对象必须是原文断言本身。不能把“X发生了”改成“是否存在X的传闻/说法”；传闻存在不等于事件属实。
 - 不要添加原文没有提及的国家法规、安全规范、行业背景等泛化问题，也不要把肯定断言改成笼统的“是否可能”。
 - 每个问题只保留一个具体可检索断言，优先明确主体、产品名、数字、价格、时间和因果关系。涉及多个要点时，将原文最重要的三个独立断言排在前面。
-- 问题尽量简短，保留可用于搜索的原文关键词。来源不明的信息保留为待核实断言，不要替原文补充事实。"""
+- 问题尽量简短，保留可用于搜索的原文关键词。来源不明的信息保留为待核实断言，不要替原文补充事实。
+- 图片水印、账号名只记录为来源线索；除非用户明确询问发布者真伪，不要让“某账号是否发过报道”挤掉原文的价格、日期、材料或风险断言。"""
 HIGH_RISK_COMPOSITE_EXTRACTION_RULES = """\
 - 对法规、政策、医学、法律、金融、安全等高风险复合命题要拆成 atomic claims，不要只保留一个笼统问题。
 - 如果原文同时声称“某法规/政策存在”和“某具体产品、硬件、功能、销售行为、违法性会被该法规直接覆盖”，至少拆成两个问题：
@@ -3263,7 +3264,7 @@ def should_run_verdict_review(
     )
     return len(candidates) > 1 or bool(
         re.search(
-            r"(法规|政策|法律|违法|医学|疾病|治疗|药物|金融|投资|证券|安全|事故|伤亡|policy|law|legal|medical|disease|treatment|drug|finance|investment|security|accident|injury)",
+            r"(法规|政策|法律|违法|医学|医疗|医美|抗衰|针剂|注射|基因|疾病|治疗|药物|金融|投资|证券|安全|事故|伤亡|policy|law|legal|medical|disease|treatment|drug|finance|investment|security|accident|injury)",
             combined,
             flags=re.IGNORECASE,
         )

@@ -11,6 +11,17 @@ from astrbot_plugin_fact_check import fact_check as fc
 
 
 class RetrievalRecoveryTests(unittest.TestCase):
+    def test_cosmetic_injection_claims_still_need_strong_evidence(self):
+        claim = "抗衰针剂可能残留基因片段。"
+        reply = f"事实核查：可信\n1. 核查点：{claim}\n结论：已核实\n依据：有一篇报道。\n证据关系：支持一致"
+        guarded = fc.enforce_evidence_coverage(
+            reply, [["https://news.example/report"]], [fc.ClaimCandidate(claim)]
+        )
+        self.assertIn("高风险命题缺少", guarded)
+        self.assertTrue(fc.should_run_verdict_review(
+            "risk_based", candidates=[fc.ClaimCandidate(claim)], evidence_text="",
+        ))
+
     def test_government_country_sources_survive_link_selection(self):
         for host in ("www.chp.gov.hk", "www.health.gov.au", "www.gov.uk"):
             with self.subTest(host=host):
