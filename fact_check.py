@@ -133,6 +133,11 @@ META_CLAIM_RE = re.compile(
     r"事实核查命令|核查指令|不是事实断言|无事实断言)",
     re.IGNORECASE,
 )
+CLAIM_EXTRACTION_FIDELITY_RULES = """\
+- 核查对象必须是原文断言本身。不能把“X发生了”改成“是否存在X的传闻/说法”；传闻存在不等于事件属实。
+- 不要添加原文没有提及的国家法规、安全规范、行业背景等泛化问题，也不要把肯定断言改成笼统的“是否可能”。
+- 每个问题只保留一个具体可检索断言，优先明确主体、产品名、数字、价格、时间和因果关系。涉及多个要点时，将原文最重要的三个独立断言排在前面。
+- 问题尽量简短，保留可用于搜索的原文关键词。来源不明的信息保留为待核实断言，不要替原文补充事实。"""
 HIGH_RISK_COMPOSITE_EXTRACTION_RULES = """\
 - 对法规、政策、医学、法律、金融、安全等高风险复合命题要拆成 atomic claims，不要只保留一个笼统问题。
 - 如果原文同时声称“某法规/政策存在”和“某具体产品、硬件、功能、销售行为、违法性会被该法规直接覆盖”，至少拆成两个问题：
@@ -1317,6 +1322,7 @@ def extract_claims_from_text(
 - 只有完全没有可查信息才输出 []。
 - 不要输出关于“是否需要核查”“系统自动生成”“工具/机器人提示”“用户请求事实核查”的元问题。
 {HIGH_RISK_COMPOSITE_EXTRACTION_RULES}
+{CLAIM_EXTRACTION_FIDELITY_RULES}
 
 只输出 JSON 数组：
 [
@@ -1368,6 +1374,7 @@ def extract_claims_from_images(
                 "只有纯表情包、纯风景、完全看不清、或没有任何可查信息时才输出 []。\n"
                 "不要输出关于“是否需要核查”“系统自动生成”“工具/机器人提示”“用户请求事实核查”的元问题。\n"
                 f"{HIGH_RISK_COMPOSITE_EXTRACTION_RULES}\n"
+                f"{CLAIM_EXTRACTION_FIDELITY_RULES}\n"
                 "只输出 JSON 数组，格式："
                 '[{"question":"给大模型的核查问题","source":"图片OCR/图片含义/用户文字+图片","priority":1-5}]\n'
                 f"用户附带文字：{context_text or '无'}"
