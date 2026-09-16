@@ -11,6 +11,14 @@ from astrbot_plugin_fact_check import fact_check as fc
 
 
 class RetrievalRecoveryTests(unittest.TestCase):
+    def test_government_country_sources_survive_link_selection(self):
+        for host in ("www.chp.gov.hk", "www.health.gov.au", "www.gov.uk"):
+            with self.subTest(host=host):
+                source = f"https://{host}/resources/report"
+                self.assertEqual(fc.select_fact_check_sources([source], []), [source])
+        for host in ("who.int.evil.example", "agency.gov.hk.evil.example"):
+            self.assertEqual(fc.select_fact_check_sources([f"https://{host}/report"], []), [])
+
     def test_current_state_and_calendar_dates_do_not_exclude_old_sources(self):
         for claim in (
             "目前这个法律仍然有效", "当前疾病的治疗方法", "去年发布的公告",

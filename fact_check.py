@@ -56,6 +56,11 @@ except ImportError:
     )
 
 try:
+    from .source_quality import is_primary_source
+except ImportError:
+    from source_quality import is_primary_source
+
+try:
     from .verdict_policy import (
         EVIDENCE_RELATIONS,
         reconcile_fact_check_summary,
@@ -3016,7 +3021,7 @@ def _host_matches_suffix(host: str, suffix: str) -> bool:
 
 
 def _is_official_source_domain(host: str) -> bool:
-    return any(
+    return is_primary_source(f"https://{host}") or any(
         _host_matches_suffix(host, suffix) for suffix in _OFFICIAL_DOMAIN_SUFFIXES
     )
 
