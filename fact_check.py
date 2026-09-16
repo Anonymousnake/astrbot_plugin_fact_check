@@ -111,6 +111,9 @@ _REQUEST_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar
     "fact_check_request_deadline",
     default=None,
 )
+_REQUEST_CANCEL_EVENT: contextvars.ContextVar[threading.Event | None] = (
+    contextvars.ContextVar("fact_check_request_cancel_event", default=None)
+)
 _GEMINI_HTTP_CLIENT: contextvars.ContextVar[httpx.Client | None] = (
     contextvars.ContextVar(
         "fact_check_gemini_http_client",
@@ -182,13 +185,23 @@ FACT_CHECK_CLAIM_LABEL_ALIASES = {
     "不实": "不准确",
     "错误": "不准确",
 }
-FOLLOWUP_CHANGE_LABELS = (
+FOLLOWUP_UNCHANGED_LABELS = (
+    "原结论暂不改变",
+    "原结论维持不变",
+    "维持原结论",
+    "原结论保持不变",
+    "原结论不变",
+    "结论无需调整",
+    "无需改变原结论",
+    "不改变",
+)
+FOLLOWUP_CHANGE_LABELS = FOLLOWUP_UNCHANGED_LABELS + (
     "原结论需要部分修正",
     "原结论部分需要修正",
     "原结论需要修正",
-    "原结论暂不改变",
+    "原结论应修正",
+    "需要调整原结论",
     "部分改变",
-    "不改变",
     "改变",
 )
 WEAK_BASIS_VALUES = {
@@ -371,6 +384,9 @@ def _with_request_deadline(func):
         deadline_token = _REQUEST_DEADLINE.set(
             effective_deadline,
         )
+        cancel_token = _REQUEST_CANCEL_EVENT.set(
+            kwargs.get("cancel_event") or _REQUEST_CANCEL_EVENT.get(),
+        )
         existing_client = _GEMINI_HTTP_CLIENT.get()
         client = existing_client
         client_token = None
@@ -394,12 +410,16 @@ def _with_request_deadline(func):
                             f"error={error_label(exc)}"
                         )
             finally:
+                _REQUEST_CANCEL_EVENT.reset(cancel_token)
                 _REQUEST_DEADLINE.reset(deadline_token)
 
     return wrapped
 
 
 def _bounded_timeout(timeout: float, *, minimum: float = 0.25) -> float:
+    cancel_event = _REQUEST_CANCEL_EVENT.get()
+    if cancel_event is not None and cancel_event.is_set():
+        raise httpx.TimeoutException("fact-check shutdown requested")
     requested = max(minimum, float(timeout))
     deadline = _REQUEST_DEADLINE.get()
     if deadline is None:
@@ -413,18 +433,25 @@ def _bounded_timeout(timeout: float, *, minimum: float = 0.25) -> float:
 def _sleep_with_deadline(seconds: float) -> None:
     delay = max(0.0, float(seconds))
     deadline = _REQUEST_DEADLINE.get()
-    if deadline is None:
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise httpx.TimeoutException("fact-check total deadline exceeded")
+        delay = min(delay, remaining)
+    cancel_event = _REQUEST_CANCEL_EVENT.get()
+    if cancel_event is not None:
+        if cancel_event.wait(delay):
+            raise httpx.TimeoutException("fact-check shutdown requested")
+    else:
         time.sleep(delay)
-        return
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise httpx.TimeoutException("fact-check total deadline exceeded")
-    time.sleep(min(delay, remaining))
-    if deadline - time.monotonic() <= 0:
+    if deadline is not None and deadline - time.monotonic() <= 0:
         raise httpx.TimeoutException("fact-check total deadline exceeded")
 
 
 def _retry_budget_available(*, minimum: float = 0.5) -> bool:
+    cancel_event = _REQUEST_CANCEL_EVENT.get()
+    if cancel_event is not None and cancel_event.is_set():
+        return False
     deadline = _REQUEST_DEADLINE.get()
     return deadline is None or deadline - time.monotonic() > minimum
 
@@ -474,6 +501,7 @@ def run_fact_check(
     verdict_policy: str = "risk_based",
     verdict_thinking_level: str = "medium",
     total_timeout_seconds: int = 0,
+    cancel_event: threading.Event | None = None,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -494,7 +522,6 @@ def run_fact_check(
 
     candidates: list[ClaimCandidate] = []
     text_context = request_data.text.strip()
-    text_preprocess_attempted = False
     main_image_parts = build_inline_image_parts(
         request_data.images,
         max_image_bytes=max_image_bytes,
@@ -507,8 +534,7 @@ def run_fact_check(
         max_pixels=image_max_pixels,
         total_inline_bytes=image_total_inline_bytes,
     )
-    if text_context and not request_data.images:
-        text_preprocess_attempted = True
+    if text_context:
         logger.info(
             f"[astrbot-fact-check-stage] text-preprocess start len={len(text_context)} model={pre_model}"
         )
@@ -556,42 +582,9 @@ def run_fact_check(
             logger.warning(
                 f"[astrbot-fact-check-image-preprocess-error] {error_label(exc)}"
             )
-            if text_context:
-                text_preprocess_attempted = True
-                try:
-                    candidates.extend(
-                        extract_claims_from_text(
-                            text_context,
-                            model=pre_model,
-                            api_key=api_key,
-                            base_url=base_url,
-                            request_timeout=pre_request_timeout,
-                        ),
-                    )
-                except Exception as text_exc:
-                    logger.warning(
-                        f"[astrbot-fact-check-text-preprocess-error] {error_label(text_exc)}"
-                    )
         logger.info(
             f"[astrbot-fact-check-stage] image-preprocess done candidates={len(candidates)}"
         )
-
-    if text_context and not candidates and not text_preprocess_attempted:
-        text_preprocess_attempted = True
-        try:
-            candidates.extend(
-                extract_claims_from_text(
-                    text_context,
-                    model=pre_model,
-                    api_key=api_key,
-                    base_url=base_url,
-                    request_timeout=pre_request_timeout,
-                ),
-            )
-        except Exception as exc:
-            logger.warning(
-                f"[astrbot-fact-check-text-preprocess-error] {error_label(exc)}"
-            )
 
     if not candidates:
         if text_context:
@@ -1119,6 +1112,7 @@ def run_fact_check_followup(
     max_output_tokens: int = 1024,
     retry_max_output_tokens: int = 2048,
     total_timeout_seconds: int = 0,
+    cancel_event: threading.Event | None = None,
 ) -> FactCheckResult:
     api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -1251,7 +1245,7 @@ def run_fact_check_followup(
     change_state = change_match.group(1).strip() if change_match else ""
     requests_change = bool(
         change_state
-        and not change_state.startswith(("原结论暂不改变", "不改变"))
+        and not _value_starts_with_allowed_label(change_state, FOLLOWUP_UNCHANGED_LABELS)
     )
     has_new_grounding = bool(sources)
     if requests_change and not has_new_grounding:

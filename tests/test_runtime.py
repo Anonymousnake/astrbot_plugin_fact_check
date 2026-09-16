@@ -113,6 +113,53 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
 
+    async def test_cancelled_blocking_call_signals_cooperative_worker_shutdown(
+        self,
+    ) -> None:
+        started = threading.Event()
+        cancel_event = threading.Event()
+        stopped = threading.Event()
+
+        def work() -> str:
+            started.set()
+            cancel_event.wait(timeout=1)
+            stopped.set()
+            return "done"
+
+        task = asyncio.create_task(
+            run_blocking_with_timeout(
+                work,
+                timeout=2,
+                cancel_event=cancel_event,
+            ),
+        )
+        await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.2)
+        self.assertTrue(cancel_event.is_set())
+        self.assertTrue(stopped.is_set())
+
+    async def test_cooperative_worker_error_preserves_cancellation_and_capacity(self) -> None:
+        started = threading.Event()
+        cancel_event = threading.Event()
+        capacity = asyncio.Semaphore(1)
+
+        def work():
+            started.set()
+            cancel_event.wait(1)
+            raise TimeoutError("shutdown requested")
+
+        task = asyncio.create_task(run_blocking_with_timeout(
+            work, timeout=2, capacity=capacity, cancel_event=cancel_event,
+        ))
+        await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(capacity.locked())
+
     async def test_singleflight_start_if_admits_or_joins_atomically(self) -> None:
         flight: AsyncSingleFlight[str] = AsyncSingleFlight()
         gate = asyncio.Event()

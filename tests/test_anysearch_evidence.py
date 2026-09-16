@@ -1217,6 +1217,65 @@ class AnysearchEvidenceTests(unittest.TestCase):
             )
         )
 
+    def test_authoritative_grounding_titles_and_public_institution_domains_are_strong(
+        self,
+    ) -> None:
+        redirect = (
+            "https://vertexaisearch.cloud.google.com/grounding-api-redirect/source"
+        )
+
+        normalized = normalize_fact_check_sources([f"世界卫生组织：{redirect}"])
+
+        self.assertEqual(normalized, ["世界卫生组织"])
+        self.assertTrue(has_strong_claim_evidence(normalized))
+        self.assertTrue(has_strong_claim_evidence([f"国家卫健委：{redirect}"]))
+        self.assertTrue(
+            has_strong_claim_evidence(
+                [f"BBC News：{redirect}bbc", f"Reuters：{redirect}reuters"]
+            )
+        )
+        self.assertTrue(
+            has_strong_claim_evidence(
+                ["高校公告：https://news.example.edu.cn/policy/notice"]
+            )
+        )
+        self.assertTrue(
+            has_strong_claim_evidence(
+                ["澳大利亚政府：https://www.health.gov.au/resources/report"]
+            )
+        )
+        self.assertFalse(has_strong_claim_evidence([f"某自媒体文章：{redirect}"]))
+
+    def test_authority_mentions_do_not_override_publisher_identity(self) -> None:
+        redirect = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/x"
+        for source in (
+            "WHO：https://reddit.com/post",
+            "国家卫健委：https://blog.example/report",
+            f"WHO warns about disease：{redirect}",
+            f"世界卫生组织被质疑：{redirect}",
+            "校园博客：https://news.example.edu.cn/blog/post",
+            "学生主页：https://student.example.edu.cn/report",
+            "新华社",
+        ):
+            with self.subTest(source=source):
+                self.assertFalse(has_strong_claim_evidence([source]))
+        self.assertFalse(has_strong_claim_evidence([
+            f"Reuters：{redirect}", "Reuters：https://reuters.com/report"
+        ]))
+
+    def test_grounding_authority_survives_normalization_and_high_risk_gate(self) -> None:
+        claim = ClaimCandidate("某医疗政策已经公布。")
+        reply = (
+            "事实核查：可信\n1. 核查点：某医疗政策已经公布。\n"
+            "结论：已核实\n依据：主管部门正式公告已公布该政策。\n证据关系：支持一致"
+        )
+        sources = normalize_fact_check_sources([
+            "国家卫健委：https://vertexaisearch.cloud.google.com/grounding-api-redirect/a"
+        ])
+        guarded = enforce_evidence_coverage(reply, [sources], [claim])
+        self.assertIn("结论：已核实", guarded)
+        self.assertNotIn("高风险命题缺少", guarded)
+
     def test_anysearch_extract_must_overlap_the_claim_to_be_direct_evidence(
         self,
     ) -> None:

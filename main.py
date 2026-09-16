@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Iterable
@@ -52,7 +53,7 @@ from .pipeline_config import build_fact_check_kwargs, resolve_verdict_models
 from .runtime import AsyncSingleFlight, run_blocking_with_timeout
 from .storage import FactCheckMetricsStore, atomic_write_json, read_json_file
 
-FACT_CHECK_PIPELINE_VERSION = "quality-v8"
+FACT_CHECK_PIPELINE_VERSION = "quality-v9"
 
 
 def _current_cache_date() -> str:
@@ -296,11 +297,12 @@ class FactCheckPlugin(Star):
         if followup_task is not None:
             self._followup_tasks.add(followup_task)
             followup_task.add_done_callback(self._followup_tasks.discard)
-        await event.send(event.plain_result("我接着查一下。"))
         self._active_followup_jobs = (
             max(0, int(getattr(self, "_active_followup_jobs", 0))) + 1
         )
+        cancel_event = threading.Event()
         try:
+            await event.send(event.plain_result("我接着查一下。"))
             total_timeout = max(
                 10,
                 int(self.config.get("fact_check_total_timeout_seconds") or 90),
@@ -341,9 +343,11 @@ class FactCheckPlugin(Star):
                             or 2048,
                         ),
                         total_timeout_seconds=total_timeout,
+                        cancel_event=cancel_event,
                 ),
                 timeout=total_timeout,
                 capacity=self._fact_check_semaphore,
+                cancel_event=cancel_event,
             )
         except asyncio.TimeoutError:
             reason = f"follow-up timeout after {time.perf_counter() - started_at:.1f}s"
@@ -495,10 +499,17 @@ class FactCheckPlugin(Star):
         )
 
         async def compute() -> FactCheckResult:
+            cancel_event = threading.Event()
             return await run_blocking_with_timeout(
-                partial(self._run_fact_check_sync, request_data, timeout_seconds),
+                partial(
+                    self._run_fact_check_sync,
+                    request_data,
+                    timeout_seconds,
+                    cancel_event,
+                ),
                 timeout=timeout_seconds,
                 capacity=self._fact_check_semaphore,
+                cancel_event=cancel_event,
             )
 
         if self._fact_check_queue_full() and not self._singleflight.has(cache_key):
@@ -574,14 +585,17 @@ class FactCheckPlugin(Star):
         try:
             if pipeline_task is None:
                 async def compute() -> FactCheckResult:
+                    cancel_event = threading.Event()
                     return await run_blocking_with_timeout(
                         partial(
                             self._run_fact_check_sync,
                             request_data,
                             timeout_seconds,
+                            cancel_event,
                         ),
                         timeout=timeout_seconds,
                         capacity=self._fact_check_semaphore,
+                        cancel_event=cancel_event,
                     )
 
                 result, joined_existing = await self._singleflight.run(
@@ -657,15 +671,16 @@ class FactCheckPlugin(Star):
         self,
         request_data: FactCheckRequest,
         timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
     ) -> FactCheckResult:
-        return run_fact_check(
-            **build_fact_check_kwargs(
-                self.config,
-                request_data,
-                timeout_seconds,
-                list_config=self._list_config,
-            ),
+        kwargs = build_fact_check_kwargs(
+            self.config,
+            request_data,
+            timeout_seconds,
+            list_config=self._list_config,
         )
+        kwargs["cancel_event"] = cancel_event
+        return run_fact_check(**kwargs)
 
     async def _send_fact_check_reply(
         self,

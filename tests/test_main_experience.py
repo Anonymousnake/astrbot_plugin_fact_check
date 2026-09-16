@@ -432,6 +432,19 @@ class MainExperienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(results), 1)
         self.assertIn("部分完成：1", results[0]["plain"])
 
+    async def test_status_command_obeys_fact_check_access_control(self) -> None:
+        plugin = make_plugin()
+        plugin._metrics_store.record(outcome="partial", elapsed=2.0)
+        event = FakeEvent(fail_send=False)
+
+        with patch(
+            "astrbot_plugin_fact_check.main.is_plugin_allowed", return_value=False
+        ):
+            results = [item async for item in plugin.factcheck_status(event)]
+
+        self.assertTrue(event.stopped)
+        self.assertEqual(results, [{"plain": "这个群没开事实核查。"}])
+
     def test_group_followup_session_is_visible_only_to_its_owner(self) -> None:
         session = main.FactCheckSession(
             session_id="fc_abcd1234",

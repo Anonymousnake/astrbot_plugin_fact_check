@@ -14,6 +14,7 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Extracts quoted text and inline text.
 - Extracts up to `fact_check_max_images` image URLs from the current or quoted message.
 - Uses a lightweight Gemini model to turn text/images into checkable questions.
+- Mixed messages extract text and image claims independently, then deduplicate them.
 - Uses Gemini 2.5 Flash with Google Search grounding to collect evidence and produce a complete fallback result.
 - Uses Gemini 3 Flash without native grounding for multi-claim and high-risk topics by default; ordinary single claims use the grounded result directly.
 - Optionally searches Anysearch for extra pre-retrieval evidence before the grounded check.
@@ -24,6 +25,8 @@ Standalone `/事实核查` plugin split out from `astrbot_plugin_qq_agent_core`.
 - Validates that the rendered claim still matches the requested claim before accepting a verdict.
 - Preserves quantities, units, dates, signs, and increase/decrease direction during verdict validation and partial recovery; candidate deduplication uses the same identity checks.
 - Requires stronger evidence for legal, medical, financial, safety, and other high-risk claims: one primary source or two independent sources.
+- Recognizes explicit publisher labels in opaque grounding links and normalized titles. Direct URL hosts take precedence; anonymous redirects and article titles merely mentioning an authority remain unverified. Xinhua and other media count as independent publishers, not primary authorities.
+- Includes government country domains and institutional `edu.cn` / `ac.uk` sources, while excluding labeled blogs and student sites.
 - Detects explicit source conflicts and prevents them from becoming high-confidence conclusions.
 - Keeps Anysearch evidence attached to its originating claim and rejects extracted pages that do not materially overlap that claim.
 - Uses numbered source references consistently between claim hints and the final clickable source list.
@@ -65,6 +68,7 @@ Managed by AstrBot WebUI through `_conf_schema.json`.
 
 - `fact_check.py` remains the synchronous evidence pipeline. AstrBot-facing runtime coordination and configuration translation live in `runtime.py` and `pipeline_config.py`.
 - The hard timeout bounds how long the bot waits. Python cannot forcibly stop an already-running worker thread, so upstream HTTP calls still retain their own bounded timeouts.
+- Cancellation signals the worker to stop retries and subsequent requests, and interrupts backoff sleeps. Shutdown still waits for an in-flight HTTP call to return or time out before releasing concurrency capacity.
 - The quality corpus under `tests/fixtures/` covers source conflicts, high-risk source strength, unrelated evidence, and ordinary low-risk claims. It intentionally does not implement user-feedback learning.
 
 ### Live quality regression sample

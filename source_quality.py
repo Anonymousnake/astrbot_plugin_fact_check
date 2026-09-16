@@ -14,6 +14,8 @@ _MULTI_LABEL_SUFFIXES = {
     "com.hk",
     "edu.cn",
     "gov.cn",
+    "gov.au",
+    "gov.nz",
     "gov.uk",
     "net.cn",
     "org.cn",
@@ -35,6 +37,28 @@ _LOW_TRUST_TERMS = re.compile(
     r"(?:博客|论坛|个人主页|自媒体|社交平台|\bblog\b|\bforum\b|\bsocial\b)",
     flags=re.IGNORECASE,
 )
+_TITLE_IDENTITIES = (
+    ("who.int", re.compile(r"^\s*(?:世界卫生组织|World Health Organization|WHO\b)", re.I)),
+    ("nhc.gov.cn", re.compile(r"^\s*(?:国家卫生健康委员会|国家卫健委|National Health Commission\b)", re.I)),
+    ("gov.cn", re.compile(r"^\s*(?:中国政府网|国务院(?:办公厅)?)", re.I)),
+    ("court.gov.cn", re.compile(r"^\s*最高人民法院", re.I)),
+    ("spp.gov.cn", re.compile(r"^\s*最高人民检察院", re.I)),
+    ("un.org", re.compile(r"^\s*(?:联合国|United Nations\b)", re.I)),
+    ("europa.eu", re.compile(r"^\s*(?:欧盟委员会|European Commission\b)", re.I)),
+    ("xinhuanet.com", re.compile(r"^\s*(?:新华社|新华网|Xinhua(?: News Agency)?\b)", re.I)),
+    ("reuters.com", re.compile(r"^\s*(?:路透社|Reuters\b)", re.I)),
+    ("apnews.com", re.compile(r"^\s*(?:美联社|Associated Press\b|AP News\b)", re.I)),
+    ("bbc.com", re.compile(r"^\s*BBC(?: News)?\b", re.I)),
+)
+_AUTHORITATIVE_TITLE_IDENTITIES = {
+    "who.int",
+    "nhc.gov.cn",
+    "gov.cn",
+    "court.gov.cn",
+    "spp.gov.cn",
+    "un.org",
+    "europa.eu",
+}
 
 
 def _source_url(source: str) -> str:
@@ -45,6 +69,25 @@ def _source_url(source: str) -> str:
 def _normalized_host(source: str) -> str:
     host = (urlparse(_source_url(source)).hostname or "").lower().rstrip(".")
     return host.removeprefix("www.")
+
+
+def _title_identity(source: str) -> str:
+    host = _normalized_host(source)
+    if host and host != _GROUNDING_REDIRECT_HOST:
+        return ""
+    title = str(source or "").split("http", 1)[0].rstrip(" ：:")
+    if _LOW_TRUST_TERMS.search(title):
+        return ""
+    for identity, pattern in _TITLE_IDENTITIES:
+        # Only a publisher label or explicit publisher prefix is an identity.
+        match = pattern.match(title)
+        if match:
+            suffix = title[match.end():].strip()
+            if not suffix or suffix.startswith(("：", ":", "|", "- ")):
+                return identity
+        if title.lower().removeprefix("www.") == identity:
+            return identity
+    return ""
 
 
 def _host_matches(host: str, suffix: str) -> bool:
@@ -64,6 +107,9 @@ def _registered_domain(host: str) -> str:
 
 def source_identity(source: str) -> str:
     """Return an organization-level identity suitable for independence checks."""
+    title_identity = _title_identity(source)
+    if title_identity:
+        return title_identity
     host = _normalized_host(source)
     if not host:
         return ""
@@ -75,13 +121,21 @@ def source_identity(source: str) -> str:
 
 
 def is_primary_source(source: str) -> bool:
-    """Recognize official authorities without treating arbitrary schools as one."""
+    """Recognize official or institutionally authoritative evidence sources."""
+    if _LOW_TRUST_TERMS.search(str(source or "")):
+        return False
+    if _title_identity(source) in _AUTHORITATIVE_TITLE_IDENTITIES:
+        return True
     host = _normalized_host(source)
     if not host:
         return False
-    if _host_matches(host, "gov.uk") or _host_matches(host, "gov.cn"):
+    if host.startswith(("blog.", "blogs.", "student.", "students.")):
+        return False
+    if re.search(r"(?:^|\.)gov\.[a-z]{2,3}$", host):
         return True
     if host.endswith(".gov") or host.endswith(".mil"):
+        return True
+    if _host_matches(host, "edu.cn") or _host_matches(host, "ac.uk"):
         return True
     return any(
         _host_matches(host, authority)
@@ -90,6 +144,8 @@ def is_primary_source(source: str) -> bool:
 
 
 def _is_low_trust_source(source: str) -> bool:
+    if _title_identity(source):
+        return False
     host = _normalized_host(source)
     if not host or host == _GROUNDING_REDIRECT_HOST:
         return True

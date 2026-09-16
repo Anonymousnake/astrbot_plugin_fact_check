@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Awaitable, Callable
 from typing import Generic, TypeVar
 
@@ -12,6 +13,7 @@ async def run_blocking_with_timeout(
     *,
     timeout: float,
     capacity: asyncio.Semaphore | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> T:
     """Bound caller wait while retaining capacity until its thread really exits."""
     budget = max(0.01, float(timeout))
@@ -38,11 +40,21 @@ async def run_blocking_with_timeout(
     worker.add_done_callback(finalize)
     try:
         return await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
+    except asyncio.TimeoutError:
+        if cancel_event is not None:
+            cancel_event.set()
+        raise
     except asyncio.CancelledError:
         # Python cannot stop a thread already running in ``to_thread``. During
         # plugin shutdown, keep the owning coroutine alive until that worker
         # exits so a reloaded instance cannot overlap its network activity.
-        await asyncio.shield(worker)
+        if cancel_event is not None:
+            cancel_event.set()
+        try:
+            await asyncio.shield(worker)
+        except Exception:
+            # Preserve cancellation when the cooperative worker exits by error.
+            pass
         raise
 
 

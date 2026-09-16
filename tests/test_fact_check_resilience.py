@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -334,7 +335,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("具体商品适用范围未明确", verdict_prompt)
         self.assertEqual(generate.call_args_list[1].kwargs["thinking_level"], "medium")
 
-    def test_text_with_image_uses_one_multimodal_preprocess_and_reuses_inline_parts(
+    def test_text_with_image_runs_both_preprocessors_and_reuses_inline_parts(
         self,
     ) -> None:
         inline_parts = [{"inline_data": {"mime_type": "image/png", "data": "AA=="}}]
@@ -349,7 +350,11 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
                 "extract_claims_from_images",
                 return_value=[fact_check.ClaimCandidate("Check image and caption.")],
             ) as extract_images,
-            patch.object(fact_check, "extract_claims_from_text") as extract_text,
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("Check image and caption.")],
+            ) as extract_text,
             patch.object(
                 fact_check,
                 "generate_with_fallback",
@@ -369,7 +374,7 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         build_images.assert_called_once()
-        extract_text.assert_not_called()
+        extract_text.assert_called_once()
         self.assertIs(extract_images.call_args.kwargs["inline_parts"], inline_parts)
         self.assertIs(generate.call_args.kwargs["extra_parts"], inline_parts)
 
@@ -409,6 +414,54 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         extract_text.assert_called_once()
         self.assertEqual(result.candidates[0].claim, "Check caption fallback.")
+
+    def test_mixed_text_and_image_claims_are_both_kept_for_review(self) -> None:
+        response = complete_fact_check_body(
+            "事实核查：混合结论\n"
+            "1. 核查点：文字断言。\n"
+            "结论：证据不足\n"
+            "依据：没有找到直接证据。\n"
+            "证据关系：无直接证据\n"
+            "2. 核查点：截图断言。\n"
+            "结论：证据不足\n"
+            "依据：没有找到直接证据。\n"
+            "证据关系：无直接证据"
+        )
+
+        with (
+            patch.object(fact_check, "build_inline_image_parts", return_value=[]),
+            patch.object(
+                fact_check,
+                "extract_claims_from_text",
+                return_value=[fact_check.ClaimCandidate("文字断言。", priority=5)],
+            ),
+            patch.object(
+                fact_check,
+                "extract_claims_from_images",
+                return_value=[fact_check.ClaimCandidate("截图断言。", priority=4)],
+            ),
+            patch.object(
+                fact_check,
+                "generate_with_fallback",
+                return_value=(response, "gemini-2.5-flash"),
+            ),
+        ):
+            result = fact_check.run_fact_check(
+                request_data=FactCheckRequest(
+                    text="文字断言。",
+                    trigger_text="/factcheck",
+                    images=[ImageInput(url="https://example.com/image.png")],
+                ),
+                api_key="test-key",
+                base_url="https://example.invalid/models",
+                pre_model="gemini-3.1-flash-lite",
+                main_models=["gemini-2.5-flash"],
+            )
+
+        self.assertEqual(
+            [candidate.claim for candidate in result.candidates],
+            ["文字断言。", "截图断言。"],
+        )
 
     def test_total_deadline_bounds_each_http_timeout_and_resets_after_call(
         self,
@@ -847,6 +900,50 @@ class FactCheckResilienceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(fact_check.IncompleteGenerationError):
             fact_check.validate_complete_followup_result(body)
+
+    def test_followup_accepts_common_change_state_aliases(self) -> None:
+        for change_state in (
+            "原结论维持不变",
+            "维持原结论",
+            "原结论保持不变",
+            "结论无需调整",
+            "原结论应修正",
+        ):
+            with self.subTest(change_state=change_state):
+                body = complete_fact_check_body(
+                    "追问结论：补充信息成立。\n"
+                    "补充依据：新增来源支持。\n"
+                    f"是否改变原结论：{change_state}。\n"
+                    "来源：示例来源"
+                )
+                fact_check.validate_complete_followup_result(body)
+
+    def test_shutdown_signal_stops_new_http_attempts_and_retries(self) -> None:
+        cancel_event = threading.Event()
+        cancel_event.set()
+        token = fact_check._REQUEST_CANCEL_EVENT.set(cancel_event)
+        try:
+            self.assertFalse(fact_check._retry_budget_available())
+            with self.assertRaises(fact_check.httpx.TimeoutException):
+                fact_check._bounded_timeout(30)
+        finally:
+            fact_check._REQUEST_CANCEL_EVENT.reset(token)
+
+    def test_followup_unchanged_alias_does_not_retry_or_discard_answer(self) -> None:
+        body = complete_fact_check_body(
+            "追问结论：此前提到的日期是公告日期。\n"
+            "补充依据：根据上次已经核实的公告说明。\n"
+            "是否改变原结论：原结论维持不变。\n来源：上次来源"
+        )
+        with patch.object(fact_check, "generate_with_fallback", return_value=(body, "test")) as generate:
+            result = fact_check.run_fact_check_followup(
+                original_text="公告日期", candidates=[], previous_reply="事实核查：可信",
+                previous_sources=[], question="日期的意思是什么？", api_key="test",
+                base_url="https://example.invalid/models", main_models=["test"],
+            )
+        generate.assert_called_once()
+        self.assertIn("此前提到的日期是公告日期", result.reply)
+        self.assertIn("原结论维持不变", result.reply)
 
     def test_expired_total_deadline_prevents_a_new_http_attempt(self) -> None:
         token = fact_check._REQUEST_DEADLINE.set(fact_check.time.monotonic() - 1)
